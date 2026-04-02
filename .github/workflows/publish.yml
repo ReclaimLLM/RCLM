@@ -1,0 +1,83 @@
+name: Publish to PyPI
+
+# Triggers when a GitHub Release is published.
+# To release:
+#   1. Bump version in pyproject.toml
+#   2. Commit and push to main
+#   3. Create a GitHub Release (tag: v0.x.y) — this workflow runs automatically.
+#
+# PyPI auth uses OIDC Trusted Publisher — no API token secret required.
+# One-time setup on PyPI:
+#   https://pypi.org/manage/project/rclm/settings/publishing/
+#   Publisher: GitHub Actions
+#   Owner:      <your-github-org>
+#   Repository: DC-hooks-proxy
+#   Workflow:   publish.yml
+#   Environment: release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  test:
+    name: Test before publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run tests
+        run: uv run pytest rclm/tests -v -p no:logfire
+
+  build:
+    name: Build distribution
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Verify dist contents
+        run: ls -lh dist/
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write  # required for OIDC trusted publishing
+
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

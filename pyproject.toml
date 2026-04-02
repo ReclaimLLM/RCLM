@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rclm"
+version = "0.1.0"
+description = "Capture and upload LLM sessions from local hooks and proxy integrations"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "ReclaimLLM" }]
+license = "Apache-2.0"
+keywords = ["llm", "ai", "hooks", "proxy", "claude-code", "gemini", "codex"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+urls = { Homepage = "https://reclaimllm.com" }
+dependencies = ["aiohttp>=3.9,<4", "build>=1.4.2,<2"]
+
+[project.optional-dependencies]
+proxy = ["litellm[proxy]>=1.40,<1.82", "prisma>=0.11,<2.0"]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-aiohttp",
+    "litellm[proxy]>=1.40,<1.82",
+    "prisma>=0.11,<2.0",
+]
+
+[project.scripts]
+rclm-proxy = "rclm.proxy.start:main"
+rclm-claude-hooks = "rclm.hooks.claude_handler:main"
+rclm-codex-hooks = "rclm.hooks.codex_handler:main"
+rclm-gemini-hooks = "rclm.hooks.gemini_handler:main"
+rclm-hooks-install = "rclm.hooks.installer:main"
+rclm-hooks-uninstall = "rclm.hooks.uninstaller:main"
+rclm-update = "rclm.update:main"
+rclm-compress = "rclm.compress.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rclm"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/architecture.md",
+    "/build.sh",
+    "/debug_proxy.py",
+    "/pyproject.toml",
+    "/rclm",
+]
+exclude = [
+    "/.git",
+    "/.venv",
+    "/.pytest_cache",
+]

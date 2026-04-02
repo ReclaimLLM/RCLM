@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 urls = { Homepage = "https://reclaimllm.com" }
-dependencies = ["aiohttp>=3.9,<4", "build>=1.4.2,<2"]
+dependencies = ["aiohttp>=3.9,<4"]
 
 [project.optional-dependencies]
 proxy = ["litellm[proxy]>=1.40,<1.82", "prisma>=0.11,<2.0"]

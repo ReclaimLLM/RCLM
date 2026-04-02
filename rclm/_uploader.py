@@ -50,7 +50,7 @@ async def upload(
     payload = _to_json(record)
     headers = {"Content-Type": "application/json"}
     # get from config first, then environment
-    api_key = cfg.get("api_key") or os.environ.get("RECLAIMLLM_API_KEY")
+    api_key = cfg.get("api_key")
     if api_key:
         headers["X-API-Key"] = api_key
 

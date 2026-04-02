@@ -37,7 +37,7 @@ rclm-hooks-install --api-key=<key>
 
 At upload time (_uploader.upload):
         env var BACKEND_SERVER          ──┐
-        env var RECLAIMLLM_API_KEY      ──┤─ env vars take precedence
+                                        ──┤─ env vars take precedence
                                           │
         _config.load()["server_url"]    ──┤─ config file fallback
         _config.load()["api_key"]       ──┘

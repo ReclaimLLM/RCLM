@@ -1,4 +1,4 @@
-# rclm — data capture
+# RCLM — data capture
 
 Every time you use an AI coding assistant, you produce something valuable: real problems solved, real reasoning applied, real code written and debugged. That data belongs to you — not to the provider running the API.
 
@@ -6,15 +6,13 @@ Every time you use an AI coding assistant, you produce something valuable: real 
 
 **Python package** (`pip install rclm`) that intercepts and records LLM sessions from two capture modes, then uploads them to the ReclaimLLM server.
 
-> **Repo:** `DC-hooks-proxy/` — one of three repos in the ReclaimLLM monorepo.
-> The other two are `DC-browser-extension/` (Chrome extension) and `ReclaimLLM-server/` (backend).
 
 ## Capture modes
 
 - **Hooks** — native integrations into Claude Code, Gemini CLI, and Codex CLI. Captures structured session data: messages, tool calls, file diffs, token counts. Upload happens at session end.
 - **Proxy** — (experimental) a local LiteLLM proxy that sits in front of provider APIs. Captures raw request/response payloads for any tool that speaks the OpenAI-compatible API. Upload happens per request.
 
-Records are POSTed as JSON to the configured ReclaimLLM server (saved in `~/.reclaimllm/config.json`, or overridden by `BACKEND_SERVER`). If the server is unreachable, failed records are quarantined to `~/.reclaimllm/failed_uploads/` with owner-only permissions.
+Records are POSTed as JSON to the configured ReclaimLLM server (saved in `~/.reclaimllm/config.json`, or `api.reclaimllm.com`). If the server is unreachable, failed records are quarantined to `~/.reclaimllm/failed_uploads/` with owner-only permissions.
 
 See [`architecture.md`](architecture.md) for data models and flow diagrams.
 
@@ -35,6 +33,8 @@ pip install 'rclm[proxy]'
 ```bash
 # Install for all providers (Claude Code + Gemini CLI + Codex CLI), global
 rclm-hooks-install
+
+#help file 
 
 # Install for a single provider
 rclm-hooks-install --claude
@@ -57,7 +57,7 @@ rclm-hooks-uninstall
 `rclm-hooks-install` opens a browser to `reclaimllm.com/settings` so you can create an API key and have it sent back automatically. The key and server URL are saved to `~/.reclaimllm/config.json` and reused on subsequent installs.
 
 ### Proxy setup
-
+**Experimental**
 ```bash
 # Interactive setup — writes ~/.reclaimllm/litellm_config.yaml
 rclm-proxy setup
@@ -144,7 +144,7 @@ Only `Bash` tool events are captured (Codex's primary tool). File diffs are extr
 
 ---
 
-## How the proxy works
+## How the proxy (experimental) works
 
 The proxy runs LiteLLM in front of any provider API. A `ReclaimLLMLogger` (LiteLLM `CustomLogger`) hooks into `async_log_success_event` and `async_log_failure_event`. Each API call — success or failure — produces one `ProxyRecord` and is uploaded immediately.
 
@@ -161,7 +161,7 @@ Each proxy call gets a fresh `session_id` (uuid4) — there is no session groupi
 
 ---
 
-## Update module
+## Update module for hooks
 
 The updater (`rclm/hooks/updater.py`) checks PyPI for a newer version of `rclm` and is called non-blockingly from `rclm-hooks-install` and `rclm-update`. All network errors are swallowed — a failed check is always silent and never crashes the caller.
 
@@ -224,7 +224,7 @@ Replace `YOUR_API_KEY` and `http://localhost:8000` with your actual key and serv
 
 ```bash
 echo '{"session_id":"00000000-0000-0000-0000-000000000001","source":"claude-code","model":"claude-sonnet-4-6","started_at":"2024-01-01T00:00:00Z","ended_at":"2024-01-01T00:01:00Z","duration_s":60,"messages":[{"role":"user","content":"hello","timestamp":"2024-01-01T00:00:00Z"},{"role":"assistant","content":"hi there","timestamp":"2024-01-01T00:00:01Z"}],"tool_calls":[],"file_diffs":[]}' \
-  | curl -s -X POST http://localhost:8000/ingest -H "Content-Type: application/json" -H "X-API-Key: --api-key=LnzdYCz27mEcMKQdHR12rFq66vRODVok9HTfRfjXpQU" -d @- | jq .
+  | curl -s -X POST http://localhost:8000/ingest -H "Content-Type: application/json" -H "X-API-Key: API_KEY -d @- | jq .
 ```
 
 ### Proxy record (OpenAI-compatible)

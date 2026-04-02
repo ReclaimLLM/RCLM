@@ -4,6 +4,7 @@ Each line of the transcript is a JSON object with the shape:
   {"type": "user"|"assistant"|"tool", "message": {...}, "timestamp": "...",
    "model": "...", "usage": {"input_tokens": N, "output_tokens": N}}
 """
+
 from __future__ import annotations
 
 import json

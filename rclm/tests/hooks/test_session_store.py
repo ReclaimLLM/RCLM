@@ -1,4 +1,5 @@
 """Tests for rclm.hooks.session_store."""
+
 import json
 
 import pytest

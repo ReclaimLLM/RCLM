@@ -1,10 +1,11 @@
 """Tests for git output filters."""
-from rclm.compress.filters.git import filter_git
 
+from rclm.compress.filters.git import filter_git
 
 # ---------------------------------------------------------------------------
 # git status
 # ---------------------------------------------------------------------------
+
 
 class TestFilterGitStatus:
     def test_clean_repo(self):
@@ -34,7 +35,7 @@ class TestFilterGitStatus:
         output = (
             "On branch main\n"
             "Changes not staged for commit:\n"
-            "  (use \"git add <file>...\" to update what will be committed)\n"
+            '  (use "git add <file>..." to update what will be committed)\n'
             "\n"
             "\tmodified:   src/main.py\n"
             "\tmodified:   src/utils.py\n"
@@ -53,6 +54,7 @@ class TestFilterGitStatus:
 # ---------------------------------------------------------------------------
 # git diff
 # ---------------------------------------------------------------------------
+
 
 class TestFilterGitDiff:
     def test_no_changes(self):
@@ -87,6 +89,7 @@ class TestFilterGitDiff:
 # git log
 # ---------------------------------------------------------------------------
 
+
 class TestFilterGitLog:
     def test_no_commits(self):
         result = filter_git("log", "")
@@ -117,12 +120,10 @@ class TestFilterGitLog:
 # git action commands
 # ---------------------------------------------------------------------------
 
+
 class TestFilterGitAction:
     def test_commit_extracts_summary(self):
-        output = (
-            "[main abc1234] Fix the bug\n"
-            " 1 file changed, 2 insertions(+), 1 deletion(-)\n"
-        )
+        output = "[main abc1234] Fix the bug\n 1 file changed, 2 insertions(+), 1 deletion(-)\n"
         result = filter_git("commit", output)
         assert "[main abc1234]" in result
 
@@ -149,6 +150,7 @@ class TestFilterGitAction:
 # ---------------------------------------------------------------------------
 # Unknown subcommands
 # ---------------------------------------------------------------------------
+
 
 def test_unknown_subcommand_returns_none():
     assert filter_git("unknown-subcommand", "some output") is None

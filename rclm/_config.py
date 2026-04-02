@@ -3,6 +3,7 @@
 Written by rclm-hooks-install; read by the uploader at upload time.
 Env vars RECLAIMLLM_SERVER_URL / RECLAIMLLM_API_KEY always take precedence.
 """
+
 from __future__ import annotations
 
 import json

@@ -3,6 +3,7 @@
 Decides whether to modify tool input to reduce context window bloat.
 Returns an updatedInput dict for Claude Code's hookSpecificOutput, or None.
 """
+
 from __future__ import annotations
 
 import os
@@ -19,10 +20,13 @@ GREP_DEFAULT_HEAD_LIMIT = 50
 # Patterns: base command → True (rewrite the full command).
 _BASH_REWRITE_COMMANDS = {
     "git",
-    "pytest", "python",
-    "npm", "npx",
+    "pytest",
+    "python",
+    "npm",
+    "npx",
     "cargo",
-    "ls", "find",
+    "ls",
+    "find",
 }
 
 
@@ -48,7 +52,7 @@ def _compress_read(tool_input: dict) -> dict | None:
 
     try:
         line_count = _count_lines(file_path)
-    except (OSError, IOError):
+    except OSError:
         return None
 
     if line_count <= READ_LINE_THRESHOLD:
@@ -92,9 +96,8 @@ def _compress_bash(tool_input: dict) -> dict | None:
         return None
 
     # For npm/npx, only rewrite test-related commands
-    if base_cmd in ("npm", "npx"):
-        if not any(kw in command for kw in ("test", "jest", "vitest")):
-            return None
+    if base_cmd in ("npm", "npx") and not any(kw in command for kw in ("test", "jest", "vitest")):
+        return None
 
     return {"command": f"rclm-compress {command}"}
 

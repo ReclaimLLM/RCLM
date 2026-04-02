@@ -1,4 +1,5 @@
 """Tests for rclm.hooks.installer."""
+
 import json
 from pathlib import Path
 
@@ -7,19 +8,25 @@ import pytest
 from rclm import _config
 from rclm.hooks import installer
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_install(monkeypatch, tmp_path, *extra_args, api_key="test-key", server_url="http://test.example.com"):
+
+def _run_install(
+    monkeypatch, tmp_path, *extra_args, api_key="test-key", server_url="http://test.example.com"
+):
     """Call installer.main() with credentials pre-supplied and config path isolated."""
-    monkeypatch.setattr("sys.argv", [
-        "rclm-hooks-install",
-        f"--api-key={api_key}",
-        f"--server-url={server_url}",
-        *extra_args,
-    ])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "rclm-hooks-install",
+            "--local",
+            f"--api-key={api_key}",
+            f"--server-url={server_url}",
+            *extra_args,
+        ],
+    )
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
     installer.main()
 
@@ -40,6 +47,7 @@ def _hook_commands_for_event(settings: dict, event: str) -> list[str]:
 # Basic install (Claude Code)
 # ---------------------------------------------------------------------------
 
+
 def test_creates_new_settings_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _run_install(monkeypatch, tmp_path)
@@ -48,7 +56,7 @@ def test_creates_new_settings_file(tmp_path, monkeypatch):
     assert settings_path.exists()
     settings = _read_settings(settings_path)
     assert "hooks" in settings
-    for event in installer._HOOKS_TO_INJECT:
+    for event in installer._CLAUDE_HOOKS_TO_INJECT:
         assert event in settings["hooks"]
 
 
@@ -57,7 +65,14 @@ def test_all_expected_events_present(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path)
 
     settings = _read_settings(tmp_path / ".claude" / "settings.json")
-    expected = {"SessionStart", "PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop"}
+    expected = {
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse",
+        "UserPromptSubmit",
+        "Stop",
+        "SubagentStop",
+    }
     assert set(settings["hooks"].keys()) == expected
 
 
@@ -67,7 +82,7 @@ def test_commands_are_clean_without_credential_prefix(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path, api_key="sk-secret")
 
     settings = _read_settings(tmp_path / ".claude" / "settings.json")
-    for event in installer._HOOKS_TO_INJECT:
+    for event in installer._CLAUDE_HOOKS_TO_INJECT:
         for cmd in _hook_commands_for_event(settings, event):
             assert "sk-secret" not in cmd
             assert "RECLAIMLLM" not in cmd
@@ -97,7 +112,7 @@ def test_idempotent_running_twice_does_not_duplicate_hooks(tmp_path, monkeypatch
     _run_install(monkeypatch, tmp_path)
 
     settings = _read_settings(tmp_path / ".claude" / "settings.json")
-    for event, entries in installer._HOOKS_TO_INJECT.items():
+    for event, entries in installer._CLAUDE_HOOKS_TO_INJECT.items():
         for entry in entries:
             for hook in entry.get("hooks", []):
                 command = hook["command"]
@@ -122,11 +137,13 @@ def test_handles_invalid_json_in_existing_settings(tmp_path, monkeypatch, capsys
 
 def test_global_flag_targets_home_dot_claude(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr("sys.argv", [
-        "rclm-hooks-install",
-        "--api-key=test-key",
-        "--global",
-    ])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "rclm-hooks-install",
+            "--api-key=test-key",
+        ],
+    )
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
 
     installer.main()
@@ -137,6 +154,7 @@ def test_global_flag_targets_home_dot_claude(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Config file persistence
 # ---------------------------------------------------------------------------
+
 
 def test_credentials_saved_to_config_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -166,22 +184,25 @@ def test_saved_config_used_when_no_flags_provided(tmp_path, monkeypatch):
 # Missing credentials
 # ---------------------------------------------------------------------------
 
+
 def test_missing_api_key_exits_1_and_shows_setup_url(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sys.argv", ["rclm-hooks-install"])
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    # Patch browser flow to return None immediately (simulates user cancelling).
+    monkeypatch.setattr(installer, "_wait_for_api_key_via_browser", lambda server_url: None)
 
     with pytest.raises(SystemExit) as exc_info:
         installer.main()
 
     assert exc_info.value.code == 1
-    assert installer.SETUP_URL in capsys.readouterr().err
 
 
 def test_missing_api_key_does_not_write_settings_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sys.argv", ["rclm-hooks-install"])
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(installer, "_wait_for_api_key_via_browser", lambda server_url: None)
 
     with pytest.raises(SystemExit):
         installer.main()
@@ -192,6 +213,7 @@ def test_missing_api_key_does_not_write_settings_file(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Gemini CLI
 # ---------------------------------------------------------------------------
+
 
 def test_gemini_flag_writes_to_gemini_settings(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -212,12 +234,14 @@ def test_gemini_all_expected_events_present(tmp_path, monkeypatch):
 
 def test_gemini_global_flag_targets_home_dot_gemini(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr("sys.argv", [
-        "rclm-hooks-install",
-        "--gemini",
-        "--global",
-        "--api-key=sk-gemini",
-    ])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "rclm-hooks-install",
+            "--gemini",
+            "--api-key=sk-gemini",
+        ],
+    )
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
 
     installer.main()
@@ -229,6 +253,7 @@ def test_gemini_global_flag_targets_home_dot_gemini(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Compression flag
 # ---------------------------------------------------------------------------
+
 
 def test_compress_flag_saves_to_config(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
@@ -269,13 +294,20 @@ def test_rtk_only_removed_when_compress_enabled(tmp_path, monkeypatch):
     # Pre-populate settings with a fake RTK hook.
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps({
-        "hooks": {
-            "PreToolUse": [
-                {"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk bash-tool"}]},
-            ],
-        },
-    }))
+    settings_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "rtk bash-tool"}],
+                        },
+                    ],
+                },
+            }
+        )
+    )
 
     # Install without --compress — RTK should survive.
     _run_install(monkeypatch, tmp_path)

@@ -16,8 +16,8 @@ class ProxyRecord:
     model: str | None  # fully-qualified e.g. "anthropic/claude-sonnet-4-5"
     # Synthesised from request_body/response_body at build time for blob consistency
     messages: list[dict] = field(default_factory=list)  # [{role, content, timestamp}]
-    tool_calls: list["ToolCall"] = field(default_factory=list)  # always empty for proxy
-    file_diffs: list["FileDiff"] = field(default_factory=list)  # always empty for proxy
+    tool_calls: list[ToolCall] = field(default_factory=list)  # always empty for proxy
+    file_diffs: list[FileDiff] = field(default_factory=list)  # always empty for proxy
     provider: str | None = None  # inferred from model prefix
     response_cost: float | None = None
     total_input_tokens: int | None = None
@@ -73,9 +73,7 @@ class HookSessionRecord:
     duration_s: float
     transcript_path: str | None
     model: str | None
-    messages: list[dict] = field(
-        default_factory=list
-    )  # [{role, content, timestamp}]
+    messages: list[dict] = field(default_factory=list)  # [{role, content, timestamp}]
     tool_calls: list[ToolCall] = field(default_factory=list)
     file_diffs: list[FileDiff] = field(default_factory=list)
     total_input_tokens: int | None = None

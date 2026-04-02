@@ -1,12 +1,13 @@
 """Tests for rclm.hooks.compress (PreToolUse compression engine)."""
+
 from unittest.mock import patch
 
 from rclm.hooks.compress import maybe_compress
 
-
 # ---------------------------------------------------------------------------
 # Read compression
 # ---------------------------------------------------------------------------
+
 
 class TestCompressRead:
     def test_no_limit_set_small_file(self, tmp_path):
@@ -42,6 +43,7 @@ class TestCompressRead:
 # Grep compression
 # ---------------------------------------------------------------------------
 
+
 class TestCompressGrep:
     def test_no_head_limit_injects_default(self):
         result = maybe_compress("Grep", {"pattern": "foo"})
@@ -56,6 +58,7 @@ class TestCompressGrep:
 # ---------------------------------------------------------------------------
 # Bash compression
 # ---------------------------------------------------------------------------
+
 
 class TestCompressBash:
     @patch("rclm.hooks.compress._compress_available", return_value=True)
@@ -126,6 +129,7 @@ class TestCompressBash:
 # ---------------------------------------------------------------------------
 # Other tools
 # ---------------------------------------------------------------------------
+
 
 def test_unknown_tool_returns_none():
     assert maybe_compress("Write", {"file_path": "/foo"}) is None

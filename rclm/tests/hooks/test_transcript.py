@@ -1,4 +1,5 @@
 """Tests for rclm.hooks.transcript."""
+
 import json
 from pathlib import Path
 
@@ -109,7 +110,12 @@ def test_tool_use_without_matching_result_has_none_result(tmp_path):
             "message": {
                 "role": "assistant",
                 "content": [
-                    {"type": "tool_use", "id": "tu-999", "name": "Read", "input": {"file_path": "/a"}}
+                    {
+                        "type": "tool_use",
+                        "id": "tu-999",
+                        "name": "Read",
+                        "input": {"file_path": "/a"},
+                    }
                 ],
             },
             "timestamp": "2024-01-01T00:00:01Z",

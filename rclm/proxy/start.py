@@ -5,6 +5,7 @@ Subcommands:
   rclm-proxy start        — launch LiteLLM proxy with that config (default)
   rclm-proxy <anything>   — passed through to the litellm CLI directly
 """
+
 from __future__ import annotations
 
 import getpass
@@ -24,9 +25,7 @@ _TEMPLATE = Path(__file__).parent / "config_template.yaml"
 def _require_litellm() -> None:
     if shutil.which("litellm") is None:
         print(
-            "error: litellm not found.\n"
-            "Install the proxy extra with:\n"
-            "  pip install 'rclm[proxy]'",
+            "error: litellm not found.\nInstall the proxy extra with:\n  pip install 'rclm[proxy]'",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -48,7 +47,7 @@ def cmd_setup() -> None:
 
     if server_url and api_key:
         _config.save(server_url, api_key)
-        print(f"  Saved credentials → ~/.reclaimllm/config.json")
+        print("  Saved credentials → ~/.reclaimllm/config.json")
 
     _LITELLM_CONFIG.write_text(_TEMPLATE.read_text())
     print(f"  Wrote proxy config → {_LITELLM_CONFIG}")
@@ -78,8 +77,7 @@ def cmd_start(extra_args: list[str]) -> None:
 
     if not _LITELLM_CONFIG.exists():
         print(
-            f"error: no proxy config found at {_LITELLM_CONFIG}\n"
-            "Run 'rclm-proxy setup' first.",
+            f"error: no proxy config found at {_LITELLM_CONFIG}\nRun 'rclm-proxy setup' first.",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -41,9 +41,7 @@ _T0 = datetime(2026, 3, 14, 12, 0, 0, tzinfo=timezone.utc)
 _T1 = datetime(2026, 3, 14, 12, 0, 1, tzinfo=timezone.utc)  # 1 000 ms later
 
 
-def _make_kwargs(
-    model="anthropic/claude-opus-4-5", stream=False, exception=None
-):
+def _make_kwargs(model="anthropic/claude-opus-4-5", stream=False, exception=None):
     return {
         "model": model,
         "messages": [{"role": "user", "content": "hello"}],
@@ -63,9 +61,7 @@ def _make_kwargs(
 
 
 def test_build_record_success():
-    record = _build_record(
-        _make_kwargs(), response_obj=None, start_time=_T0, end_time=_T1
-    )
+    record = _build_record(_make_kwargs(), response_obj=None, start_time=_T0, end_time=_T1)
 
     assert isinstance(record, ProxyRecord)
     assert record.model == "anthropic/claude-opus-4-5"
@@ -74,9 +70,7 @@ def test_build_record_success():
     assert record.duration_ms == pytest.approx(1000.0)
     assert record.is_streaming is False
     assert isinstance(record.request_body, dict)
-    assert record.request_body["messages"] == [
-        {"role": "user", "content": "hello"}
-    ]
+    assert record.request_body["messages"] == [{"role": "user", "content": "hello"}]
 
 
 def test_build_record_streaming_flag():

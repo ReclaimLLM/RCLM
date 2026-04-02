@@ -25,7 +25,6 @@ from pathlib import Path
 
 from rclm import _config
 
-
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -87,10 +86,7 @@ def _is_rclm_hook(entry: dict) -> bool:
     hooks = entry.get("hooks", [])
     if not hooks:
         return False
-    return all(
-        hook.get("command", "").strip().startswith(("rclm-", "rclm-"))
-        for hook in hooks
-    )
+    return all(hook.get("command", "").strip().startswith(("rclm-", "rclm-")) for hook in hooks)
 
 
 def _remove_from_settings(settings: dict) -> tuple[dict, int]:

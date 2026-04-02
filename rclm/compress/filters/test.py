@@ -1,4 +1,5 @@
 """Filters for test runner output (pytest, npm test, cargo test)."""
+
 from __future__ import annotations
 
 import re
@@ -9,7 +10,12 @@ def filter_test(command: str, output: str) -> str | None:
     cmd_lower = command.lower()
     if "pytest" in cmd_lower or "python -m pytest" in cmd_lower:
         return _filter_pytest(output)
-    if "npm test" in cmd_lower or "npm run test" in cmd_lower or "npx jest" in cmd_lower or "npx vitest" in cmd_lower:
+    if (
+        "npm test" in cmd_lower
+        or "npm run test" in cmd_lower
+        or "npx jest" in cmd_lower
+        or "npx vitest" in cmd_lower
+    ):
         return _filter_js_test(output)
     if "cargo test" in cmd_lower:
         return _filter_cargo_test(output)
@@ -31,10 +37,7 @@ def _filter_pytest(output: str) -> str:
 
         # Keep failure detail blocks
         if line.startswith("____") or line.startswith("===="):
-            if "FAILURES" in line or "ERRORS" in line:
-                in_failure = True
-                result.append(line)
-            elif "short test summary" in line:
+            if "FAILURES" in line or "ERRORS" in line or "short test summary" in line:
                 in_failure = True
                 result.append(line)
             elif in_failure:
@@ -74,7 +77,12 @@ def _filter_js_test(output: str) -> str:
         stripped = line.strip()
 
         # Jest/Vitest failure markers
-        if stripped.startswith("● ") or stripped.startswith("✕ ") or stripped.startswith("× ") or "FAIL " in line:
+        if (
+            stripped.startswith("● ")
+            or stripped.startswith("✕ ")
+            or stripped.startswith("× ")
+            or "FAIL " in line
+        ):
             in_failure = True
             result.append(line)
             continue

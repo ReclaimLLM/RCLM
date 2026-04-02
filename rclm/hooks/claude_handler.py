@@ -17,17 +17,21 @@ from datetime import datetime, timezone
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import session_store
-from rclm.hooks import transcript  # noqa: E402
-from rclm.hooks.compress import maybe_compress
-from rclm.hooks._analytics import (
-    compute_session_analytics,
-    aggregate_compression_savings,
+from rclm.hooks import (
+    session_store,
+    transcript,  # noqa: E402
 )
+from rclm.hooks._analytics import (
+    aggregate_compression_savings,
+    compute_session_analytics,
+)
+from rclm.hooks.compress import maybe_compress
 
 logger = logging.getLogger(__name__)
 
-THRESHOLD_ZERO_DURATION = 5.0  # seconds; if session duration is below this, treat as zero and omit timestamps
+THRESHOLD_ZERO_DURATION = (
+    5.0  # seconds; if session duration is below this, treat as zero and omit timestamps
+)
 
 
 def _now() -> str:
@@ -66,9 +70,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         try:
             updated = maybe_compress(tool_name, tool_input)
             if updated:
-                output = json.dumps(
-                    {"hookSpecificOutput": {"updatedInput": updated}}
-                )
+                output = json.dumps({"hookSpecificOutput": {"updatedInput": updated}})
                 print(output)
         except Exception:
             pass  # Never let compression disrupt Claude Code
@@ -193,8 +195,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     ended_at = payload.get("timestamp", now)
     try:
         duration_s = (
-            datetime.fromisoformat(ended_at)
-            - datetime.fromisoformat(started_at)
+            datetime.fromisoformat(ended_at) - datetime.fromisoformat(started_at)
         ).total_seconds()
     except (ValueError, TypeError):
         duration_s = 0.0
@@ -207,9 +208,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     file_diffs = _extract_file_diffs_from_tool_calls(transcript_data.tool_calls)
 
     # Compute analytics from tool calls and file diffs.
-    analytics = compute_session_analytics(
-        transcript_data.tool_calls, file_diffs
-    )
+    analytics = compute_session_analytics(transcript_data.tool_calls, file_diffs)
     compression = aggregate_compression_savings(events)
 
     record = HookSessionRecord(

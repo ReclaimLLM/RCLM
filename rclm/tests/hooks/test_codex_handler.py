@@ -53,9 +53,7 @@ def test_codex_transcript_parses_messages_tools_and_diffs(tmp_path):
                         "payload": {
                             "type": "message",
                             "role": "assistant",
-                            "content": [
-                                {"type": "output_text", "text": "Looking now."}
-                            ],
+                            "content": [{"type": "output_text", "text": "Looking now."}],
                         },
                     }
                 ),
@@ -154,9 +152,7 @@ def test_codex_stop_prefers_transcript_data(monkeypatch, tmp_path):
     async def fake_upload_single(record):
         uploaded_records.append(record)
 
-    monkeypatch.setattr(
-        "rclm.hooks.codex_handler.upload_single", fake_upload_single
-    )
+    monkeypatch.setattr("rclm.hooks.codex_handler.upload_single", fake_upload_single)
     monkeypatch.setattr(
         "rclm.hooks.codex_handler.codex_transcript.parse_transcript",
         lambda path: codex_transcript.CodexTranscriptData(
@@ -227,9 +223,7 @@ def test_codex_stop_falls_back_when_transcript_empty(monkeypatch, tmp_path):
     async def fake_upload_single(record):
         uploaded_records.append(record)
 
-    monkeypatch.setattr(
-        "rclm.hooks.codex_handler.upload_single", fake_upload_single
-    )
+    monkeypatch.setattr("rclm.hooks.codex_handler.upload_single", fake_upload_single)
     monkeypatch.setattr(
         "rclm.hooks.codex_handler.codex_transcript.parse_transcript",
         lambda path: codex_transcript.CodexTranscriptData(),

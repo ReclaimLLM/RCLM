@@ -1,4 +1,5 @@
 """LiteLLM CustomLogger that maps StandardLoggingPayload → ProxyRecord and uploads it."""
+
 from __future__ import annotations
 
 import logging
@@ -78,18 +79,22 @@ def _synthesise_messages(
     # ── new assistant turn from the response ─────────────────────────────────
     if isinstance(response_body, dict):
         if response_body.get("error"):
-            messages.append({
-                "role": "assistant",
-                "content": f"[error] {response_body['error']}",
-                "timestamp": timestamp,
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"[error] {response_body['error']}",
+                    "timestamp": timestamp,
+                }
+            )
         else:
             choices = response_body.get("choices") or []
             if choices and isinstance(choices[0], dict):
                 msg_obj = choices[0].get("message") or {}
                 content = _extract_text_content(msg_obj.get("content"))
                 if content:
-                    messages.append({"role": "assistant", "content": content, "timestamp": timestamp})
+                    messages.append(
+                        {"role": "assistant", "content": content, "timestamp": timestamp}
+                    )
 
     return messages
 

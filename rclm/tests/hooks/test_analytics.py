@@ -1,4 +1,5 @@
 """Tests for rclm.hooks._analytics."""
+
 from rclm._models import FileDiff, ToolCall
 from rclm.hooks._analytics import (
     aggregate_compression_savings,
@@ -6,10 +7,10 @@ from rclm.hooks._analytics import (
     estimate_tokens,
 )
 
-
 # ---------------------------------------------------------------------------
 # estimate_tokens
 # ---------------------------------------------------------------------------
+
 
 class TestEstimateTokens:
     def test_none_returns_zero(self):
@@ -37,6 +38,7 @@ class TestEstimateTokens:
 # ---------------------------------------------------------------------------
 # compute_session_analytics
 # ---------------------------------------------------------------------------
+
 
 class TestComputeSessionAnalytics:
     def test_empty_inputs(self):
@@ -69,8 +71,13 @@ class TestComputeSessionAnalytics:
 
     def test_uses_existing_token_estimates(self):
         tc = ToolCall(
-            "t1", "Bash", {"command": "ls"}, "output", "2024-01-01T00:00:00Z",
-            input_token_estimate=10, output_token_estimate=20,
+            "t1",
+            "Bash",
+            {"command": "ls"},
+            "output",
+            "2024-01-01T00:00:00Z",
+            input_token_estimate=10,
+            output_token_estimate=20,
         )
         result = compute_session_analytics([tc], [])
         assert result["tool_token_stats"]["Bash"]["input_tokens"] == 10
@@ -80,6 +87,7 @@ class TestComputeSessionAnalytics:
 # ---------------------------------------------------------------------------
 # aggregate_compression_savings
 # ---------------------------------------------------------------------------
+
 
 class TestAggregateCompressionSavings:
     def test_no_savings_events(self):

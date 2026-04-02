@@ -8,6 +8,7 @@ Usage:
     rclm-update          # check and upgrade if needed
     rclm-update --check  # print status only, do not upgrade
 """
+
 from __future__ import annotations
 
 import argparse
@@ -47,7 +48,7 @@ def main() -> None:
     print(f"Current: {current}  →  Latest: {latest}")
 
     if args.check:
-        print(f"\nRun rclm-update to upgrade.")
+        print("\nRun rclm-update to upgrade.")
         return
 
     print()
@@ -76,9 +77,10 @@ def main() -> None:
     try:
         from rclm.hooks.installer import (
             _install_claude,
-            _install_gemini,
             _install_codex,
+            _install_gemini,
         )
+
         print("Re-installing hooks (global)...")
         _install_claude(use_global=True, compress_enabled=compress)
         _install_gemini(use_global=True)

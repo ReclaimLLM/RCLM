@@ -1,4 +1,5 @@
 """Token estimation and session analytics for hook records."""
+
 from __future__ import annotations
 
 import json
@@ -58,9 +59,7 @@ def compute_session_analytics(
 
 def aggregate_compression_savings(events: list[dict]) -> dict | None:
     """Aggregate CompressionSaving events from session JSONL."""
-    savings_events = [
-        e for e in events if e.get("event_type") == "CompressionSaving"
-    ]
+    savings_events = [e for e in events if e.get("event_type") == "CompressionSaving"]
     if not savings_events:
         return None
 
@@ -70,8 +69,8 @@ def aggregate_compression_savings(events: list[dict]) -> dict | None:
     return {
         "total_original_chars": total_original,
         "total_compressed_chars": total_compressed,
-        "savings_pct": round(
-            (1 - total_compressed / total_original) * 100, 1
-        ) if total_original > 0 else 0.0,
+        "savings_pct": round((1 - total_compressed / total_original) * 100, 1)
+        if total_original > 0
+        else 0.0,
         "command_count": len(savings_events),
     }

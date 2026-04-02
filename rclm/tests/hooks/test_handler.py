@@ -1,16 +1,16 @@
-"""Tests for rclm.hooks.handler."""
+"""Tests for rclm.hooks.claude_handler."""
+
 import json
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from rclm._models import HookSessionRecord
-from rclm.hooks import handler
-
+from rclm.hooks import claude_handler as handler
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _run_handler(event_name: str, payload: dict, monkeypatch) -> None:
     """Call handler.main() with event_name as argv[1] and payload as stdin."""
@@ -23,6 +23,7 @@ def _run_handler(event_name: str, payload: dict, monkeypatch) -> None:
 
 def _make_stdin(text: str):
     from io import StringIO
+
     return StringIO(text)
 
 
@@ -30,8 +31,10 @@ def _make_stdin(text: str):
 # SessionStart
 # ---------------------------------------------------------------------------
 
+
 def test_session_start_appends_event(monkeypatch, tmp_path):
     from rclm.hooks import session_store
+
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     payload = {
@@ -51,14 +54,18 @@ def test_session_start_appends_event(monkeypatch, tmp_path):
 # PreToolUse — compression gating
 # ---------------------------------------------------------------------------
 
+
 def test_pre_tool_use_no_compression_by_default(monkeypatch, tmp_path, capsys):
     """With compress=False (default), PreToolUse should NOT print updatedInput."""
-    from rclm.hooks import session_store
     from rclm import _config
+    from rclm.hooks import session_store
+
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
 
-    session_store.append_event("sid-c1", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"})
+    session_store.append_event(
+        "sid-c1", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"}
+    )
 
     payload = {
         "session_id": "sid-c1",
@@ -74,14 +81,17 @@ def test_pre_tool_use_no_compression_by_default(monkeypatch, tmp_path, capsys):
 
 def test_pre_tool_use_compression_when_enabled(monkeypatch, tmp_path, capsys):
     """With compress=True in config, PreToolUse should print updatedInput for Grep."""
-    from rclm.hooks import session_store
     from rclm import _config
+    from rclm.hooks import session_store
+
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"compress": True}))
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
 
-    session_store.append_event("sid-c2", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"})
+    session_store.append_event(
+        "sid-c2", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"}
+    )
 
     payload = {
         "session_id": "sid-c2",
@@ -100,12 +110,16 @@ def test_pre_tool_use_compression_when_enabled(monkeypatch, tmp_path, capsys):
 # PostToolUse
 # ---------------------------------------------------------------------------
 
+
 def test_post_tool_use_appends_tool_event(monkeypatch, tmp_path):
     from rclm.hooks import session_store
+
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     # First set up a SessionStart so the session file exists.
-    session_store.append_event("sid-2", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"})
+    session_store.append_event(
+        "sid-2", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"}
+    )
 
     payload = {
         "session_id": "sid-2",
@@ -126,8 +140,10 @@ def test_post_tool_use_appends_tool_event(monkeypatch, tmp_path):
 # Stop
 # ---------------------------------------------------------------------------
 
+
 def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
-    from rclm.hooks import session_store, transcript
+    from rclm.hooks import session_store
+
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     # Pre-populate session events.
@@ -142,12 +158,13 @@ def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
         uploaded_records.append(record)
 
     from rclm.hooks.transcript import TranscriptData
+
     monkeypatch.setattr(
-        "rclm.hooks.handler.upload_single",
+        "rclm.hooks.claude_handler.upload_single",
         fake_upload_single,
     )
     monkeypatch.setattr(
-        "rclm.hooks.handler.transcript.parse_transcript",
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
         lambda path: TranscriptData(
             messages=[{"role": "user", "content": "hi", "timestamp": ""}],
             tool_calls=[],
@@ -182,6 +199,7 @@ def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
 def test_stop_without_prior_session_start_uses_fallback(monkeypatch, tmp_path):
     """Stop event with no SessionStart in store must not crash."""
     from rclm.hooks import session_store
+
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     uploaded_records = []
@@ -190,9 +208,10 @@ def test_stop_without_prior_session_start_uses_fallback(monkeypatch, tmp_path):
         uploaded_records.append(record)
 
     from rclm.hooks.transcript import TranscriptData
-    monkeypatch.setattr("rclm.hooks.handler.upload_single", fake_upload_single)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
     monkeypatch.setattr(
-        "rclm.hooks.handler.transcript.parse_transcript",
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
         lambda path: TranscriptData(),
     )
 
@@ -213,9 +232,11 @@ def test_stop_without_prior_session_start_uses_fallback(monkeypatch, tmp_path):
 # Error handling
 # ---------------------------------------------------------------------------
 
+
 def test_handler_exits_0_on_exception(monkeypatch, tmp_path):
     """Any exception in a handler must be swallowed; process exits 0."""
     from rclm.hooks import session_store
+
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     def boom(session_id, payload):

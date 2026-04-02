@@ -1,4 +1,5 @@
 """Filters for shell commands (ls, find, generic truncation)."""
+
 from __future__ import annotations
 
 
@@ -20,7 +21,7 @@ def _filter_listing(output: str) -> str:
     if not output.strip():
         return "(empty)"
 
-    lines = [l.rstrip() for l in output.splitlines() if l.strip()]
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
 
     if len(lines) <= 30:
         return output  # Small enough, keep as-is

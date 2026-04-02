@@ -1,10 +1,11 @@
 """Tests for test runner output filters."""
-from rclm.compress.filters.test import filter_test
 
+from rclm.compress.filters.test import filter_test
 
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------
+
 
 class TestFilterPytest:
     def test_all_passing(self):
@@ -49,6 +50,7 @@ class TestFilterPytest:
 # npm test / jest
 # ---------------------------------------------------------------------------
 
+
 class TestFilterJsTest:
     def test_all_passing(self):
         output = (
@@ -88,6 +90,7 @@ class TestFilterJsTest:
 # ---------------------------------------------------------------------------
 # cargo test
 # ---------------------------------------------------------------------------
+
 
 class TestFilterCargoTest:
     def test_all_passing(self):

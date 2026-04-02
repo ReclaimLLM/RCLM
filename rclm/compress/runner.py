@@ -1,4 +1,5 @@
 """Execute a command, apply output filter, and track compression savings."""
+
 from __future__ import annotations
 
 import json
@@ -8,9 +9,8 @@ import subprocess
 from pathlib import Path
 
 from rclm.compress.filters.git import filter_git
-from rclm.compress.filters.test import filter_test
 from rclm.compress.filters.shell import filter_shell
-
+from rclm.compress.filters.test import filter_test
 
 _SESSIONS_DIR = Path.home() / ".reclaimllm" / "sessions"
 
@@ -87,9 +87,9 @@ def track_savings(
         "command": command[:200],  # truncate long commands
         "original_chars": original_chars,
         "compressed_chars": compressed_chars,
-        "savings_pct": round(
-            (1 - compressed_chars / original_chars) * 100, 1
-        ) if original_chars > 0 else 0.0,
+        "savings_pct": round((1 - compressed_chars / original_chars) * 100, 1)
+        if original_chars > 0
+        else 0.0,
     }
 
     _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)

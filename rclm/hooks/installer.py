@@ -34,8 +34,9 @@ from rclm import _config
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_APP_URL = "https://rclm.com"
-DEFAULT_SERVER_URL = "http://localhost:8676"
+DEFAULT_APP_URL = "https://reclaimllm.com"
+DEFAULT_SERVER_URL = "http://api.reclaimllm.com:8676"
+SETUP_URL = DEFAULT_APP_URL + "/settings"
 _CALLBACK_TIMEOUT_S = 300  # 5 minutes
 
 # ---------------------------------------------------------------------------
@@ -44,8 +45,14 @@ _CALLBACK_TIMEOUT_S = 300  # 5 minutes
 
 _CLAUDE_HOOKS_TO_INJECT: dict[str, list[dict]] = {
     "SessionStart": [
-        {"matcher": "startup", "hooks": [{"type": "command", "command": "rclm-claude-hooks SessionStart"}]},
-        {"matcher": "resume", "hooks": [{"type": "command", "command": "rclm-claude-hooks SessionStart"}]},
+        {
+            "matcher": "startup",
+            "hooks": [{"type": "command", "command": "rclm-claude-hooks SessionStart"}],
+        },
+        {
+            "matcher": "resume",
+            "hooks": [{"type": "command", "command": "rclm-claude-hooks SessionStart"}],
+        },
     ],
     "PreToolUse": [
         {
@@ -60,42 +67,44 @@ _CLAUDE_HOOKS_TO_INJECT: dict[str, list[dict]] = {
         }
     ],
     "UserPromptSubmit": [
-        {"hooks": [{"type": "command", "command": "rclm-claude-hooks UserPromptSubmit"}]}
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "rclm-claude-hooks UserPromptSubmit",
+                }
+            ]
+        }
     ],
     "Stop": [{"hooks": [{"type": "command", "command": "rclm-claude-hooks Stop"}]}],
-    "SubagentStop": [
-        {"hooks": [{"type": "command", "command": "rclm-claude-hooks SubagentStop"}]}
-    ],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "rclm-claude-hooks SubagentStop"}]}],
 }
 
 _GEMINI_HOOKS_TO_INJECT: dict[str, list[dict]] = {
-    "SessionStart": [
-        {"hooks": [{"type": "command", "command": "rclm-gemini-hooks SessionStart"}]}
-    ],
-    "BeforeAgent": [
-        {"hooks": [{"type": "command", "command": "rclm-gemini-hooks BeforeAgent"}]}
-    ],
-    "AfterAgent": [
-        {"hooks": [{"type": "command", "command": "rclm-gemini-hooks AfterAgent"}]}
-    ],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks SessionStart"}]}],
+    "BeforeAgent": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks BeforeAgent"}]}],
+    "AfterAgent": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks AfterAgent"}]}],
     "AfterTool": [
         {
             "matcher": "",
             "hooks": [{"type": "command", "command": "rclm-gemini-hooks AfterTool"}],
         }
     ],
-    "SessionEnd": [
-        {"hooks": [{"type": "command", "command": "rclm-gemini-hooks SessionEnd"}]}
-    ],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks SessionEnd"}]}],
 }
 
 # Codex hooks.json uses the same nested format as Claude Code settings.json.
 _CODEX_HOOKS_TO_INJECT: dict[str, list[dict]] = {
-    "SessionStart": [
-        {"hooks": [{"type": "command", "command": "rclm-codex-hooks SessionStart"}]}
-    ],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "rclm-codex-hooks SessionStart"}]}],
     "UserPromptSubmit": [
-        {"hooks": [{"type": "command", "command": "rclm-codex-hooks UserPromptSubmit"}]}
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "rclm-codex-hooks UserPromptSubmit",
+                }
+            ]
+        }
     ],
     "PreToolUse": [
         {
@@ -109,9 +118,7 @@ _CODEX_HOOKS_TO_INJECT: dict[str, list[dict]] = {
             "hooks": [{"type": "command", "command": "rclm-codex-hooks PostToolUse"}],
         }
     ],
-    "Stop": [
-        {"hooks": [{"type": "command", "command": "rclm-codex-hooks Stop"}]}
-    ],
+    "Stop": [{"hooks": [{"type": "command", "command": "rclm-codex-hooks Stop"}]}],
 }
 
 # ---------------------------------------------------------------------------
@@ -256,11 +263,7 @@ def _install_gemini(use_global: bool) -> None:
 
 
 def _install_codex(use_global: bool) -> None:
-    path = (
-        Path.home() / ".codex" / "hooks.json"
-        if use_global
-        else Path(".codex") / "hooks.json"
-    )
+    path = Path.home() / ".codex" / "hooks.json" if use_global else Path(".codex") / "hooks.json"
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = _load_json(path)
@@ -439,6 +442,7 @@ def main() -> None:
     # Non-blocking update check — print a notice if a newer version exists.
     try:
         from rclm.hooks.updater import check_for_update, installed_version
+
         latest = check_for_update()
         if latest:
             current = installed_version()

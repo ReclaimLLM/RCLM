@@ -1,4 +1,5 @@
 """Tests for rclm.hooks.gemini_handler."""
+
 import json
 from io import StringIO
 
@@ -7,10 +8,10 @@ import pytest
 from rclm._models import HookSessionRecord
 from rclm.hooks import gemini_handler, session_store
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _run_handler(event_name: str, payload: dict, monkeypatch, *, capsys=None) -> str:
     """Call gemini_handler.main() with event_name as argv[1] and payload on stdin.
@@ -30,6 +31,7 @@ def _run_handler(event_name: str, payload: dict, monkeypatch, *, capsys=None) ->
 # ---------------------------------------------------------------------------
 # SessionStart
 # ---------------------------------------------------------------------------
+
 
 def test_session_start_appends_event(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
@@ -51,6 +53,7 @@ def test_session_start_appends_event(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # BeforeAgent / AfterAgent
 # ---------------------------------------------------------------------------
+
 
 def test_before_agent_appends_user_prompt(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
@@ -87,6 +90,7 @@ def test_after_agent_appends_assistant_response(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # AfterTool — response normalisation
 # ---------------------------------------------------------------------------
+
 
 def test_after_tool_normalises_dict_response_prefer_return_display(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
@@ -136,7 +140,11 @@ def test_after_tool_normalises_error_in_response(monkeypatch, tmp_path):
         "session_id": "gsid-6",
         "tool_name": "write_file",
         "tool_input": {"file_path": "/ro/file.txt", "content": "data"},
-        "tool_response": {"llmContent": "", "returnDisplay": "", "error": "Permission denied"},
+        "tool_response": {
+            "llmContent": "",
+            "returnDisplay": "",
+            "error": "Permission denied",
+        },
         "timestamp": "2024-01-01T00:00:05Z",
         "hook_event_name": "AfterTool",
     }
@@ -150,21 +158,34 @@ def test_after_tool_normalises_error_in_response(monkeypatch, tmp_path):
 # SessionEnd — record assembly
 # ---------------------------------------------------------------------------
 
+
 def test_session_end_builds_and_uploads_record(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     # Pre-populate with events from a complete session.
     session_store.append_event(
         "gsid-7",
-        {"event_type": "SessionStart", "cwd": "/work", "timestamp": "2024-01-01T00:00:00Z"},
+        {
+            "event_type": "SessionStart",
+            "cwd": "/work",
+            "timestamp": "2024-01-01T00:00:00Z",
+        },
     )
     session_store.append_event(
         "gsid-7",
-        {"event_type": "BeforeAgent", "prompt": "write a test", "timestamp": "2024-01-01T00:00:01Z"},
+        {
+            "event_type": "BeforeAgent",
+            "prompt": "write a test",
+            "timestamp": "2024-01-01T00:00:01Z",
+        },
     )
     session_store.append_event(
         "gsid-7",
-        {"event_type": "AfterAgent", "prompt_response": "Sure!", "timestamp": "2024-01-01T00:00:10Z"},
+        {
+            "event_type": "AfterAgent",
+            "prompt_response": "Sure!",
+            "timestamp": "2024-01-01T00:00:10Z",
+        },
     )
 
     uploaded: list[HookSessionRecord] = []
@@ -193,10 +214,18 @@ def test_session_end_builds_and_uploads_record(monkeypatch, tmp_path):
     assert rec.ended_at == "2024-01-01T00:01:00Z"
     assert rec.duration_s == 60.0
     assert rec.transcript_path == "/tmp/gemini-transcript.json"
-    assert rec.model is None  # not set without BeforeModel hook
+    assert rec.model == "gemini-unknown"  # not set without BeforeModel hook
     assert len(rec.messages) == 2
-    assert rec.messages[0] == {"role": "user", "content": "write a test", "timestamp": "2024-01-01T00:00:01Z"}
-    assert rec.messages[1] == {"role": "assistant", "content": "Sure!", "timestamp": "2024-01-01T00:00:10Z"}
+    assert rec.messages[0] == {
+        "role": "user",
+        "content": "write a test",
+        "timestamp": "2024-01-01T00:00:01Z",
+    }
+    assert rec.messages[1] == {
+        "role": "assistant",
+        "content": "Sure!",
+        "timestamp": "2024-01-01T00:00:10Z",
+    }
     assert rec.tool_calls == []
     assert rec.file_diffs == []
 
@@ -232,19 +261,27 @@ def test_session_end_without_session_start_uses_fallback_cwd(monkeypatch, tmp_pa
 # SessionEnd — file diff extraction
 # ---------------------------------------------------------------------------
 
+
 def test_session_end_extracts_write_file_diff(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     session_store.append_event(
         "gsid-9",
-        {"event_type": "SessionStart", "cwd": "/w", "timestamp": "2024-01-01T00:00:00Z"},
+        {
+            "event_type": "SessionStart",
+            "cwd": "/w",
+            "timestamp": "2024-01-01T00:00:00Z",
+        },
     )
     session_store.append_event(
         "gsid-9",
         {
             "event_type": "AfterTool",
             "tool_name": "write_file",
-            "tool_input": {"file_path": "src/hello.py", "content": "print('hello')\n"},
+            "tool_input": {
+                "file_path": "src/hello.py",
+                "content": "print('hello')\n",
+            },
             "tool_response": "File written.",
             "timestamp": "2024-01-01T00:00:05Z",
         },
@@ -259,7 +296,12 @@ def test_session_end_extracts_write_file_diff(monkeypatch, tmp_path):
 
     _run_handler(
         "SessionEnd",
-        {"session_id": "gsid-9", "cwd": "/w", "transcript_path": None, "timestamp": "2024-01-01T00:01:00Z"},
+        {
+            "session_id": "gsid-9",
+            "cwd": "/w",
+            "transcript_path": None,
+            "timestamp": "2024-01-01T00:01:00Z",
+        },
         monkeypatch,
     )
 
@@ -277,7 +319,11 @@ def test_session_end_extracts_replace_diff(monkeypatch, tmp_path):
 
     session_store.append_event(
         "gsid-10",
-        {"event_type": "SessionStart", "cwd": "/w", "timestamp": "2024-01-01T00:00:00Z"},
+        {
+            "event_type": "SessionStart",
+            "cwd": "/w",
+            "timestamp": "2024-01-01T00:00:00Z",
+        },
     )
     session_store.append_event(
         "gsid-10",
@@ -303,7 +349,12 @@ def test_session_end_extracts_replace_diff(monkeypatch, tmp_path):
 
     _run_handler(
         "SessionEnd",
-        {"session_id": "gsid-10", "cwd": "/w", "transcript_path": None, "timestamp": "2024-01-01T00:01:00Z"},
+        {
+            "session_id": "gsid-10",
+            "cwd": "/w",
+            "transcript_path": None,
+            "timestamp": "2024-01-01T00:01:00Z",
+        },
         monkeypatch,
     )
 
@@ -321,12 +372,17 @@ def test_session_end_extracts_replace_diff(monkeypatch, tmp_path):
 # Tool calls captured via AfterTool
 # ---------------------------------------------------------------------------
 
+
 def test_session_end_includes_tool_calls(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
 
     session_store.append_event(
         "gsid-11",
-        {"event_type": "SessionStart", "cwd": "/w", "timestamp": "2024-01-01T00:00:00Z"},
+        {
+            "event_type": "SessionStart",
+            "cwd": "/w",
+            "timestamp": "2024-01-01T00:00:00Z",
+        },
     )
     session_store.append_event(
         "gsid-11",
@@ -348,7 +404,12 @@ def test_session_end_includes_tool_calls(monkeypatch, tmp_path):
 
     _run_handler(
         "SessionEnd",
-        {"session_id": "gsid-11", "cwd": "/w", "transcript_path": None, "timestamp": "2024-01-01T00:01:00Z"},
+        {
+            "session_id": "gsid-11",
+            "cwd": "/w",
+            "transcript_path": None,
+            "timestamp": "2024-01-01T00:01:00Z",
+        },
         monkeypatch,
     )
 
@@ -365,13 +426,20 @@ def test_session_end_includes_tool_calls(monkeypatch, tmp_path):
 # Stdout is always valid JSON (Gemini requirement)
 # ---------------------------------------------------------------------------
 
+
 def test_main_always_outputs_json_on_stdout(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     monkeypatch.setattr("sys.argv", ["rclm-gemini-hooks", "SessionStart"])
     monkeypatch.setattr(
         "sys.stdin",
         __import__("io").StringIO(
-            json.dumps({"session_id": "x", "cwd": "/", "timestamp": "2024-01-01T00:00:00Z"})
+            json.dumps(
+                {
+                    "session_id": "x",
+                    "cwd": "/",
+                    "timestamp": "2024-01-01T00:00:00Z",
+                }
+            )
         ),
     )
     with pytest.raises(SystemExit):
@@ -402,6 +470,7 @@ def test_main_outputs_json_on_missing_argv(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
+
 
 def test_handler_exits_0_on_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")

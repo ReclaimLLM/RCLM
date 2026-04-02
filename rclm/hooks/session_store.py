@@ -2,8 +2,10 @@
 
 Claude Code runs hooks sequentially per session, so no file locking is needed.
 """
+
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -46,7 +48,5 @@ def read_events(session_id: str) -> list[dict]:
 def cleanup(session_id: str) -> None:
     """Delete the session file. No-ops if already gone."""
     path = _session_path(session_id)
-    try:
+    with contextlib.suppress(FileNotFoundError):
         path.unlink()
-    except FileNotFoundError:
-        pass

@@ -88,9 +88,7 @@ def _handle_after_tool(session_id: str, payload: dict) -> None:
             "event_type": "AfterTool",
             "tool_name": payload.get("tool_name", ""),
             "tool_input": payload.get("tool_input", {}),
-            "tool_response": _normalise_tool_response(
-                payload.get("tool_response")
-            ),
+            "tool_response": _normalise_tool_response(payload.get("tool_response")),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
@@ -260,8 +258,7 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
     ended_at = payload.get("timestamp", now)
     try:
         duration_s = (
-            datetime.fromisoformat(ended_at)
-            - datetime.fromisoformat(started_at)
+            datetime.fromisoformat(ended_at) - datetime.fromisoformat(started_at)
         ).total_seconds()
     except (ValueError, TypeError):
         duration_s = 0.0

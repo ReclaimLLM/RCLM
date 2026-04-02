@@ -62,9 +62,7 @@ def _extract(entries: list[dict]) -> CodexTranscriptData:
 
         if entry_type == "session_meta":
             model = (
-                payload.get("model")
-                or payload.get("rollout_model")
-                or payload.get("model_slug")
+                payload.get("model") or payload.get("rollout_model") or payload.get("model_slug")
             )
             if model and data.model is None:
                 data.model = model
@@ -252,14 +250,10 @@ def _parse_apply_patch(patch_text: str) -> list[FileDiff]:
 
     for path, op, content in files:
         if op == "add":
-            after = "\n".join(l[1:] for l in content if l.startswith("+"))
-            diffs.append(
-                FileDiff(path=path, before=None, after=after, unified_diff="")
-            )
+            after = "\n".join(line[1:] for line in content if line.startswith("+"))
+            diffs.append(FileDiff(path=path, before=None, after=after, unified_diff=""))
         elif op == "delete":
-            diffs.append(
-                FileDiff(path=path, before=None, after=None, unified_diff="")
-            )
+            diffs.append(FileDiff(path=path, before=None, after=None, unified_diff=""))
         else:
             before_parts: list[str] = []
             after_parts: list[str] = []

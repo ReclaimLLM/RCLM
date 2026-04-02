@@ -6,6 +6,7 @@ caching the result in ~/.reclaimllm/config.json.
 
 All network errors are swallowed — a failed check is always silent.
 """
+
 from __future__ import annotations
 
 import json
@@ -33,6 +34,7 @@ def installed_version() -> str:
 
 def _is_newer(candidate: str, installed: str) -> bool:
     """Return True if candidate is strictly newer than installed (simple tuple compare)."""
+
     def _parse(v: str) -> tuple[int, ...]:
         parts = []
         for part in v.split("."):

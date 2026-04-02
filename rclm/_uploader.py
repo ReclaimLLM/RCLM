@@ -14,8 +14,8 @@ import aiohttp
 
 _FAILED_UPLOADS_DIR = Path.home() / ".reclaimllm" / "failed_uploads"
 
-from rclm import _config
-from rclm._models import HookSessionRecord, ProxyRecord, SessionRecord
+from rclm import _config  # noqa: E402
+from rclm._models import HookSessionRecord, ProxyRecord, SessionRecord  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +82,7 @@ async def upload(
             )
         await asyncio.sleep(delay)
 
-    logger.error(
-        "rclm upload failed after all retries; quarantining record locally"
-    )
+    logger.error("rclm upload failed after all retries; quarantining record locally")
     _quarantine(record)
 
 

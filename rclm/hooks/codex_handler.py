@@ -36,6 +36,7 @@ Codex records file edits as ``apply_patch`` tool calls in the transcript
     *** Delete File: /path/to/file
     *** End Patch
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -44,10 +45,9 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from rclm._models import FileDiff, HookSessionRecord, ToolCall
+from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import codex_transcript
-from rclm.hooks import session_store
+from rclm.hooks import codex_transcript, session_store
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,9 @@ def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
             turn_id = ev.get("turn_id")
             pre = pre_events.pop(turn_id, None)
             tool_input = pre.get("tool_input", {}) if pre else {}
-            timestamp = pre.get("timestamp", ev.get("timestamp", "")) if pre else ev.get("timestamp", "")
+            timestamp = (
+                pre.get("timestamp", ev.get("timestamp", "")) if pre else ev.get("timestamp", "")
+            )
             tool_calls.append(
                 ToolCall(
                     tool_use_id=f"codex-tool-{counter}",
@@ -270,9 +272,7 @@ def main() -> None:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
-        logger.warning(
-            "rclm-codex-hooks: could not parse stdin JSON for event %s", event_name
-        )
+        logger.warning("rclm-codex-hooks: could not parse stdin JSON for event %s", event_name)
         sys.exit(0)
 
     session_id = payload.get("session_id", "unknown")

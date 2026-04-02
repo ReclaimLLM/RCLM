@@ -1,4 +1,5 @@
 """Filters for git command output."""
+
 from __future__ import annotations
 
 import re
@@ -36,9 +37,7 @@ def _filter_status(output: str) -> str:
             counts["untracked"].append(line[3:].strip())
         elif line.startswith("A ") or line.startswith(" A"):
             counts["added"].append(line[2:].strip())
-        elif line.startswith("M ") or line.startswith(" M"):
-            counts["modified"].append(line[2:].strip())
-        elif line.startswith("MM"):
+        elif line.startswith("M ") or line.startswith(" M") or line.startswith("MM"):
             counts["modified"].append(line[2:].strip())
         elif line.startswith("D ") or line.startswith(" D"):
             counts["deleted"].append(line[2:].strip())
@@ -87,10 +86,12 @@ def _filter_diff(output: str) -> str:
 
     for line in lines:
         # Always keep diff headers and stat lines
-        if line.startswith("diff --git") or line.startswith("---") or line.startswith("+++"):
-            result.append(line)
-            hunk_lines = 0
-        elif line.startswith("@@"):
+        if (
+            line.startswith("diff --git")
+            or line.startswith("---")
+            or line.startswith("+++")
+            or line.startswith("@@")
+        ):
             result.append(line)
             hunk_lines = 0
         elif line.startswith("+") or line.startswith("-"):
@@ -148,7 +149,7 @@ def _filter_log(output: str) -> str:
 
     # If output already looks one-line-per-commit, just truncate
     if not commits:
-        commits = [l.strip() for l in lines if l.strip()]
+        commits = [line.strip() for line in lines if line.strip()]
 
     if len(commits) > 20:
         commits = commits[:20]
@@ -162,7 +163,7 @@ def _filter_action(output: str) -> str:
     if not output.strip():
         return "ok"
 
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
 
     # For commit: look for the summary line like "[branch hash] message"
     for line in lines:

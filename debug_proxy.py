@@ -12,6 +12,7 @@ Manual:
     cd ReclaimLLM-data-capture
     ANTHROPIC_API_KEY=... python debug_proxy.py
 """
+
 from __future__ import annotations
 
 import sys
@@ -27,8 +28,7 @@ if str(_src) not in sys.path:
 _config = Path.home() / ".reclaimllm" / "litellm_config.yaml"
 if not _config.exists():
     print(
-        f"error: config not found at {_config}\n"
-        "Run 'rclm-proxy setup' first.",
+        f"error: config not found at {_config}\nRun 'rclm-proxy setup' first.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -45,8 +45,11 @@ from importlib.metadata import entry_points  # noqa: E402
 _eps = entry_points(group="console_scripts")
 _litellm_eps = [ep for ep in _eps if ep.name == "litellm"]
 if not _litellm_eps:
-    print("error: 'litellm' console_script entry point not found.\n"
-          "Install litellm: pip install 'rclm[proxy]'", file=sys.stderr)
+    print(
+        "error: 'litellm' console_script entry point not found.\n"
+        "Install litellm: pip install 'rclm[proxy]'",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 _litellm_eps[0].load()()

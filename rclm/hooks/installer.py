@@ -35,7 +35,7 @@ from rclm import _config
 # Constants
 # ---------------------------------------------------------------------------
 DEFAULT_APP_URL = "https://reclaimllm.com"
-DEFAULT_SERVER_URL = "http://api.reclaimllm.com:8676"
+DEFAULT_SERVER_URL = "https://api.reclaimllm.com:8676"
 SETUP_URL = DEFAULT_APP_URL + "/settings"
 _CALLBACK_TIMEOUT_S = 300  # 5 minutes
 
@@ -47,23 +47,31 @@ _CLAUDE_HOOKS_TO_INJECT: dict[str, list[dict]] = {
     "SessionStart": [
         {
             "matcher": "startup",
-            "hooks": [{"type": "command", "command": "rclm-claude-hooks SessionStart"}],
+            "hooks": [
+                {"type": "command", "command": "rclm-claude-hooks SessionStart"}
+            ],
         },
         {
             "matcher": "resume",
-            "hooks": [{"type": "command", "command": "rclm-claude-hooks SessionStart"}],
+            "hooks": [
+                {"type": "command", "command": "rclm-claude-hooks SessionStart"}
+            ],
         },
     ],
     "PreToolUse": [
         {
             "matcher": "",
-            "hooks": [{"type": "command", "command": "rclm-claude-hooks PreToolUse"}],
+            "hooks": [
+                {"type": "command", "command": "rclm-claude-hooks PreToolUse"}
+            ],
         }
     ],
     "PostToolUse": [
         {
             "matcher": "",
-            "hooks": [{"type": "command", "command": "rclm-claude-hooks PostToolUse"}],
+            "hooks": [
+                {"type": "command", "command": "rclm-claude-hooks PostToolUse"}
+            ],
         }
     ],
     "UserPromptSubmit": [
@@ -76,26 +84,66 @@ _CLAUDE_HOOKS_TO_INJECT: dict[str, list[dict]] = {
             ]
         }
     ],
-    "Stop": [{"hooks": [{"type": "command", "command": "rclm-claude-hooks Stop"}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": "rclm-claude-hooks SubagentStop"}]}],
+    "Stop": [
+        {"hooks": [{"type": "command", "command": "rclm-claude-hooks Stop"}]}
+    ],
+    "SubagentStop": [
+        {
+            "hooks": [
+                {"type": "command", "command": "rclm-claude-hooks SubagentStop"}
+            ]
+        }
+    ],
 }
 
 _GEMINI_HOOKS_TO_INJECT: dict[str, list[dict]] = {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks SessionStart"}]}],
-    "BeforeAgent": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks BeforeAgent"}]}],
-    "AfterAgent": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks AfterAgent"}]}],
+    "SessionStart": [
+        {
+            "hooks": [
+                {"type": "command", "command": "rclm-gemini-hooks SessionStart"}
+            ]
+        }
+    ],
+    "BeforeAgent": [
+        {
+            "hooks": [
+                {"type": "command", "command": "rclm-gemini-hooks BeforeAgent"}
+            ]
+        }
+    ],
+    "AfterAgent": [
+        {
+            "hooks": [
+                {"type": "command", "command": "rclm-gemini-hooks AfterAgent"}
+            ]
+        }
+    ],
     "AfterTool": [
         {
             "matcher": "",
-            "hooks": [{"type": "command", "command": "rclm-gemini-hooks AfterTool"}],
+            "hooks": [
+                {"type": "command", "command": "rclm-gemini-hooks AfterTool"}
+            ],
         }
     ],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "rclm-gemini-hooks SessionEnd"}]}],
+    "SessionEnd": [
+        {
+            "hooks": [
+                {"type": "command", "command": "rclm-gemini-hooks SessionEnd"}
+            ]
+        }
+    ],
 }
 
 # Codex hooks.json uses the same nested format as Claude Code settings.json.
 _CODEX_HOOKS_TO_INJECT: dict[str, list[dict]] = {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "rclm-codex-hooks SessionStart"}]}],
+    "SessionStart": [
+        {
+            "hooks": [
+                {"type": "command", "command": "rclm-codex-hooks SessionStart"}
+            ]
+        }
+    ],
     "UserPromptSubmit": [
         {
             "hooks": [
@@ -109,16 +157,22 @@ _CODEX_HOOKS_TO_INJECT: dict[str, list[dict]] = {
     "PreToolUse": [
         {
             "matcher": "Bash",
-            "hooks": [{"type": "command", "command": "rclm-codex-hooks PreToolUse"}],
+            "hooks": [
+                {"type": "command", "command": "rclm-codex-hooks PreToolUse"}
+            ],
         }
     ],
     "PostToolUse": [
         {
             "matcher": "Bash",
-            "hooks": [{"type": "command", "command": "rclm-codex-hooks PostToolUse"}],
+            "hooks": [
+                {"type": "command", "command": "rclm-codex-hooks PostToolUse"}
+            ],
         }
     ],
-    "Stop": [{"hooks": [{"type": "command", "command": "rclm-codex-hooks Stop"}]}],
+    "Stop": [
+        {"hooks": [{"type": "command", "command": "rclm-codex-hooks Stop"}]}
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -186,7 +240,9 @@ Subsequent installs without --api-key reuse the saved config.""",
 # ---------------------------------------------------------------------------
 
 
-def _command_already_present(existing_entries: list[dict], command: str) -> bool:
+def _command_already_present(
+    existing_entries: list[dict], command: str
+) -> bool:
     for entry in existing_entries:
         for hook in entry.get("hooks", []):
             if hook.get("command") == command:
@@ -263,7 +319,11 @@ def _install_gemini(use_global: bool) -> None:
 
 
 def _install_codex(use_global: bool) -> None:
-    path = Path.home() / ".codex" / "hooks.json" if use_global else Path(".codex") / "hooks.json"
+    path = (
+        Path.home() / ".codex" / "hooks.json"
+        if use_global
+        else Path(".codex") / "hooks.json"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = _load_json(path)
@@ -312,7 +372,9 @@ def _write_json(path: Path, data: dict) -> None:
 
 def _app_url_from_server_url(server_url: str) -> str:
     if "api.reclaimllm.com" in server_url:
-        return server_url.replace("api.reclaimllm.com", "app.reclaimllm.com").rstrip("/")
+        return server_url.replace(
+            "api.reclaimllm.com", "app.reclaimllm.com"
+        ).rstrip("/")
     return DEFAULT_APP_URL
 
 
@@ -366,7 +428,9 @@ def _wait_for_api_key_via_browser(server_url: str) -> str | None:
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
     app_url = _app_url_from_server_url(server_url)
-    settings_url = f"{app_url}/settings?cli_callback=http://localhost:{port}/{nonce}"
+    settings_url = (
+        f"{app_url}/settings?cli_callback=http://localhost:{port}/{nonce}"
+    )
 
     print(
         "No API key configured. Opening browser to create one...\n"
@@ -418,7 +482,9 @@ def main() -> None:
     # Resolve credentials.
     saved = _config.load()
     api_key: str | None = args.api_key or saved.get("api_key")
-    server_url: str = args.server_url or saved.get("server_url") or DEFAULT_SERVER_URL
+    server_url: str = (
+        args.server_url or saved.get("server_url") or DEFAULT_SERVER_URL
+    )
 
     if not api_key:
         api_key = _wait_for_api_key_via_browser(server_url)
@@ -446,6 +512,8 @@ def main() -> None:
         latest = check_for_update()
         if latest:
             current = installed_version()
-            print(f"\n✦ rclm {latest} is available (you have {current}). Run: rclm-update")
+            print(
+                f"\n✦ rclm {latest} is available (you have {current}). Run: rclm-update"
+            )
     except Exception:
         pass

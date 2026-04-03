@@ -2,9 +2,8 @@ name: Publish to PyPI
 
 # Triggers when a GitHub Release is published.
 # To release:
-#   1. Bump version in pyproject.toml
-#   2. Commit and push to main
-#   3. Create a GitHub Release (tag: v0.x.y) — this workflow runs automatically.
+#   1. Push commits to main (no version bump needed — version comes from the git tag).
+#   2. Create a GitHub Release with tag v0.x.y — this workflow runs automatically.
 #
 # PyPI auth uses OIDC Trusted Publisher — no API token secret required.
 # One-time setup on PyPI:
@@ -26,6 +25,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs full history to resolve version from tags
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -45,6 +46,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs full history to resolve version from tags
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4

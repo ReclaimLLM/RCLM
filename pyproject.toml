@@ -7,7 +7,7 @@ name = "rclm"
 dynamic = ["version"]
 description = "Capture and upload LLM sessions from local hooks and proxy integrations"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 authors = [{ name = "ReclaimLLM" }]
 license = "Apache-2.0"
 keywords = ["llm", "ai", "hooks", "proxy", "claude-code", "gemini", "codex"]

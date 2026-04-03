@@ -4,8 +4,6 @@ Every time you use an AI coding assistant, you produce something valuable: real 
 
 **ReclaimLLM** is building the infrastructure for people to own, search, and optionally monetise their AI interaction history. `rclm` is the capture layer: a lightweight Python package that sits between you and your LLM tools and silently records every session, then ships it to your personal ReclaimLLM account.
 
-**Python package** (`pip install rclm`) that intercepts and records LLM sessions from two capture modes, then uploads them to the ReclaimLLM server.
-
 
 ## Capture modes
 
@@ -33,8 +31,6 @@ pip install 'rclm[proxy]'
 ```bash
 # Install for all providers (Claude Code + Gemini CLI + Codex CLI), global
 rclm-hooks-install
-
-#help file 
 
 # Install for a single provider
 rclm-hooks-install --claude
@@ -257,8 +253,29 @@ curl -s http://localhost:8000/sessions/00000000-0000-0000-0000-000000000001 \
 
 ---
 
+## Development
+
+```bash
+uv sync --extra dev          # install all dev dependencies (pytest, ruff, pre-commit)
+uv run pre-commit install    # register git hook — runs ruff check + format on every commit
+uv run pre-commit run --all-files  # run manually across the whole repo
+```
+
+Linting and formatting use [ruff](https://docs.astral.sh/ruff/) configured in `pyproject.toml`:
+
+```bash
+uvx ruff check .             # lint
+uvx ruff format --check .    # format check (same as CI)
+uvx ruff check --fix .       # lint + auto-fix
+uvx ruff format .            # format in place
+```
+
+CI runs both on every push and PR (`.github/workflows/ci.yml`). Publish to PyPI triggers on GitHub Release (`.github/workflows/publish.yml`).
+
+---
+
 ## Tests
 
 ```bash
-pytest rclm/tests -v
+uv run pytest rclm/tests -v -p no:logfire
 ```

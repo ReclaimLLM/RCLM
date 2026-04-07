@@ -44,6 +44,7 @@ rclm-codex-hooks = "rclm.hooks.codex_handler:main"
 rclm-gemini-hooks = "rclm.hooks.gemini_handler:main"
 rclm-hooks-install = "rclm.hooks.installer:main"
 rclm-hooks-uninstall = "rclm.hooks.uninstaller:main"
+rclm-sync = "rclm.hooks.historical_sync:sync_main"
 rclm-update = "rclm.update:main"
 rclm-compress = "rclm.compress.cli:main"
 

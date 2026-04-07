@@ -87,3 +87,4 @@ class HookSessionRecord:
     compression_savings: dict | None = (
         None  # {"total_original_chars": N, "total_compressed_chars": N, "savings_pct": float}
     )
+    is_sync: bool = False  # True for historical sync uploads; server skips if session exists

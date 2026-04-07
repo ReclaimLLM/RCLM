@@ -8,6 +8,7 @@ Every time you use an AI coding assistant, you produce something valuable: real 
 ## Capture modes
 
 - **Hooks** — native integrations into Claude Code, Gemini CLI, and Codex CLI. Captures structured session data: messages, tool calls, file diffs, token counts. Upload happens at session end.
+- **Historical sync** — one-time backfill of sessions that existed before hooks were installed. Offered interactively during `rclm-hooks-install`, or run on demand with `rclm-sync`. Never re-uploads sessions already in your account.
 - **Proxy** — (experimental) a local LiteLLM proxy that sits in front of provider APIs. Captures raw request/response payloads for any tool that speaks the OpenAI-compatible API. Upload happens per request.
 
 Records are POSTed as JSON to the configured ReclaimLLM server (saved in `~/.reclaimllm/config.json`, or `api.reclaimllm.com`). If the server is unreachable, failed records are quarantined to `~/.reclaimllm/failed_uploads/` with owner-only permissions.
@@ -51,6 +52,34 @@ rclm-hooks-uninstall
 ```
 
 `rclm-hooks-install` opens a browser to `reclaimllm.com/settings` so you can create an API key and have it sent back automatically. The key and server URL are saved to `~/.reclaimllm/config.json` and reused on subsequent installs.
+
+After installation, you will be asked whether to sync your existing sessions (Claude Code, Gemini CLI, and Codex CLI sessions that predate the installation). You can say yes to upload them immediately, or skip and run `rclm-sync` later.
+
+### Historical sync
+
+```bash
+# Sync all providers — asks before uploading
+rclm-sync
+
+# Sync specific providers
+rclm-sync --claude
+rclm-sync --gemini
+rclm-sync --codex
+rclm-sync --gemini --codex
+
+# Skip the confirmation prompt (for scripts / CI)
+rclm-sync --yes
+```
+
+`rclm-sync` discovers sessions from:
+
+| Provider | Path |
+|----------|------|
+| Claude Code | `~/.claude/projects/**/*.jsonl` |
+| Gemini CLI | `~/.gemini/tmp/**/chats/*.json` |
+| Codex CLI | `~/.codex/sessions/**/*.jsonl` |
+
+Sessions already in your ReclaimLLM account are silently skipped (idempotent — safe to run multiple times). The set of already-uploaded files is cached locally at `~/.reclaimllm/synced_sessions.json`.
 
 ### Proxy setup
 **Experimental**
@@ -195,6 +224,7 @@ rclm/
     ├── codex_handler.py    # Codex CLI hook handler (rclm-codex-hooks)
     ├── transcript.py       # Claude Code JSONL transcript parser
     ├── codex_transcript.py # Codex JSONL transcript + apply_patch diff extractor
+    ├── historical_sync.py  # rclm-sync: discover + upload pre-existing sessions
     ├── session_store.py    # per-session JSONL spool (~/.reclaimllm/sessions/)
     ├── _analytics.py       # token estimation, tool stats, compression savings
     ├── compress.py         # PreToolUse compression gate (reads config.compress flag)

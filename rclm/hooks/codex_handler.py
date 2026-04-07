@@ -45,9 +45,10 @@ import logging
 import sys
 from datetime import datetime, timezone
 
+from rclm import _config
 from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import codex_transcript, session_store
+from rclm.hooks import codex_transcript, dlp, session_store
 
 logger = logging.getLogger(__name__)
 
@@ -98,16 +99,27 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
 
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
+    tool_response = payload.get("tool_response")
+
     session_store.append_event(
         session_id,
         {
             "event_type": "PostToolUse",
             "tool_name": "Bash",
-            "tool_response": payload.get("tool_response"),
+            "tool_response": tool_response,
             "turn_id": payload.get("turn_id"),
             "timestamp": _now(),
         },
     )
+
+    if _config.load().get("dlp", False):
+        try:
+            cwd = payload.get("cwd", "")
+            scrubbed = dlp.maybe_redact_output("Bash", tool_response, cwd)
+            if scrubbed is not None:
+                print(json.dumps({"hookSpecificOutput": {"updatedResponse": scrubbed}}))
+        except Exception:
+            pass  # Never let DLP disrupt Codex CLI
 
 
 # ---------------------------------------------------------------------------

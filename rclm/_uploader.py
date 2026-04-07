@@ -32,10 +32,12 @@ def _to_json(record: AnyRecord) -> str:
 async def upload(
     record: AnyRecord,
     session: aiohttp.ClientSession,
+    *,
+    max_retries: int = len(_RETRY_DELAYS),
 ) -> None:
     """POST record as JSON to BACKEND_SERVER/api/ingest.
 
-    Retries 3x with exponential backoff.
+    Retries up to ``max_retries`` times with exponential backoff (default 3).
     Quarantines to ~/.reclaimllm/failed_uploads/ if server URL is unset or all retries fail.
     """
     cfg = _config.load()
@@ -54,7 +56,8 @@ async def upload(
     if api_key:
         headers["X-API-Key"] = api_key
 
-    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+    delays = _RETRY_DELAYS[:max_retries]
+    for attempt, delay in enumerate(delays, start=1):
         try:
             async with session.post(url, data=payload, headers=headers) as resp:
                 if resp.status < 500:
@@ -68,7 +71,7 @@ async def upload(
                 logger.warning(
                     "rclm upload attempt %d/%d got %s; retrying in %.1fs",
                     attempt,
-                    len(_RETRY_DELAYS),
+                    len(delays),
                     resp.status,
                     delay,
                 )
@@ -76,7 +79,7 @@ async def upload(
             logger.warning(
                 "rclm upload attempt %d/%d failed: %s; retrying in %.1fs",
                 attempt,
-                len(_RETRY_DELAYS),
+                len(delays),
                 exc,
                 delay,
             )
@@ -136,7 +139,7 @@ async def _get_session() -> aiohttp.ClientSession:
     return _session
 
 
-async def upload_single(record: AnyRecord) -> None:
+async def upload_single(record: AnyRecord, *, max_retries: int = len(_RETRY_DELAYS)) -> None:
     """Upload one record, reusing the module-level session."""
     session = await _get_session()
-    await upload(record, session)
+    await upload(record, session, max_retries=max_retries)

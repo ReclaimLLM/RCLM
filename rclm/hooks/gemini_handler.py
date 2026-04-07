@@ -25,9 +25,10 @@ import logging
 import sys
 from datetime import datetime, timezone
 
+from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import session_store
+from rclm.hooks import dlp, session_store
 
 logger = logging.getLogger(__name__)
 
@@ -80,18 +81,50 @@ def _normalise_tool_response(raw: object) -> str:
     return str(raw) if raw is not None else ""
 
 
-def _handle_after_tool(session_id: str, payload: dict) -> None:
-    """Fires after a tool executes; captures tool name, input, and normalised response."""
+def _resolve_cwd(session_id: str, payload: dict) -> str:
+    """Return the CWD for this session: payload first, then SessionStart event, then ''."""
+    cwd = payload.get("cwd", "")
+    if cwd:
+        return cwd
+    for ev in session_store.read_events(session_id):
+        if ev.get("event_type") == "SessionStart":
+            return ev.get("cwd", "")
+    return ""
+
+
+# Gemini tool names whose output may contain secrets.
+_DLP_SCRUB_TOOLS = {"run_shell_command", "read_file"}
+
+
+def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
+    """Fires after a tool executes; captures tool name, input, and normalised response.
+
+    Returns a hookSpecificOutput dict if DLP scrubbed the response, else None.
+    """
+    tool_name = payload.get("tool_name", "")
+    tool_response = _normalise_tool_response(payload.get("tool_response"))
+
     session_store.append_event(
         session_id,
         {
             "event_type": "AfterTool",
-            "tool_name": payload.get("tool_name", ""),
+            "tool_name": tool_name,
             "tool_input": payload.get("tool_input", {}),
-            "tool_response": _normalise_tool_response(payload.get("tool_response")),
+            "tool_response": tool_response,
             "timestamp": payload.get("timestamp", _now()),
         },
     )
+
+    if _config.load().get("dlp", False) and tool_name in _DLP_SCRUB_TOOLS:
+        try:
+            cwd = _resolve_cwd(session_id, payload)
+            scrubbed = dlp.maybe_redact_output(tool_name, tool_response, cwd)
+            if scrubbed is not None:
+                return {"hookSpecificOutput": {"updatedResponse": scrubbed}}
+        except Exception:
+            pass  # Never let DLP disrupt Gemini CLI
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -320,9 +353,12 @@ def main() -> None:
 
     session_id = payload.get("session_id", "unknown")
 
+    hook_output: dict = {}
     if handler_fn is not None:
         try:
-            handler_fn(session_id, payload)
+            result = handler_fn(session_id, payload)
+            if isinstance(result, dict):
+                hook_output = result
         except Exception:
             logger.exception(
                 "rclm-gemini-hooks: unhandled error in handler for event %s",
@@ -330,5 +366,5 @@ def main() -> None:
             )
 
     # Gemini CLI requires a JSON object on stdout for every hook invocation.
-    print("{}")
+    print(json.dumps(hook_output))
     sys.exit(0)

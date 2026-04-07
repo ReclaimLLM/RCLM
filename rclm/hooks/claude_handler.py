@@ -8,9 +8,11 @@ This process always exits 0.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -18,6 +20,7 @@ from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
 from rclm.hooks import (
+    dlp,
     session_store,
     transcript,  # noqa: E402
 )
@@ -36,6 +39,17 @@ THRESHOLD_ZERO_DURATION = (
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_cwd(session_id: str, payload: dict) -> str:
+    """Return the CWD for this session: payload first, then SessionStart event, then ''."""
+    cwd = payload.get("cwd", "")
+    if cwd:
+        return cwd
+    for ev in session_store.read_events(session_id):
+        if ev.get("event_type") == "SessionStart":
+            return ev.get("cwd", "")
+    return ""
 
 
 def _handle_session_start(session_id: str, payload: dict) -> None:
@@ -65,29 +79,63 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         },
     )
 
-    # Attempt compression if enabled — output updatedInput to stdout if applicable.
-    if _config.load().get("compress", False):
+    cfg = _config.load()
+    # Accumulate delta updates from DLP and compress.  DLP runs first (security
+    # takes priority over optimisation); compress sees the DLP-adjusted input.
+    effective_input = dict(tool_input)
+    changed = False
+
+    if cfg.get("dlp", False):
         try:
-            updated = maybe_compress(tool_name, tool_input)
-            if updated:
-                output = json.dumps({"hookSpecificOutput": {"updatedInput": updated}})
-                print(output)
+            cwd = _resolve_cwd(session_id, payload)
+
+            def _track(path: str) -> None:
+                session_store.append_event(session_id, {"event_type": "DLPTempFile", "path": path})
+
+            dlp_delta = dlp.maybe_redact_input(tool_name, effective_input, cwd, track_temp=_track)
+            if dlp_delta:
+                effective_input.update(dlp_delta)
+                changed = True
+        except Exception:
+            pass  # Never let DLP disrupt Claude Code
+
+    if cfg.get("compress", False):
+        try:
+            compress_delta = maybe_compress(tool_name, effective_input)
+            if compress_delta:
+                effective_input.update(compress_delta)
+                changed = True
         except Exception:
             pass  # Never let compression disrupt Claude Code
 
+    if changed:
+        print(json.dumps({"hookSpecificOutput": {"updatedInput": effective_input}}))
+
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
+    tool_name = payload.get("tool_name", "")
+    tool_response = payload.get("tool_response")
+
     session_store.append_event(
         session_id,
         {
             "event_type": "PostToolUse",
-            "tool_name": payload.get("tool_name", ""),
+            "tool_name": tool_name,
             "tool_input": payload.get("tool_input", {}),
-            "tool_response": payload.get("tool_response"),
+            "tool_response": tool_response,
             "tool_use_id": payload.get("tool_use_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
+
+    if _config.load().get("dlp", False):
+        try:
+            cwd = _resolve_cwd(session_id, payload)
+            scrubbed = dlp.maybe_redact_output(tool_name, tool_response, cwd)
+            if scrubbed is not None:
+                print(json.dumps({"hookSpecificOutput": {"updatedResponse": scrubbed}}))
+        except Exception:
+            pass  # Never let DLP disrupt Claude Code
 
 
 def _handle_user_prompt_submit(session_id: str, payload: dict) -> None:
@@ -232,6 +280,13 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     )
 
     asyncio.run(upload_single(record))
+
+    # Clean up any DLP temp files created during this session.
+    for ev in events:
+        if ev.get("event_type") == "DLPTempFile":
+            with contextlib.suppress(OSError):
+                os.unlink(ev["path"])
+
     session_store.cleanup(session_id)
 
 

@@ -17,6 +17,8 @@ rclm/
     ├── gemini_handler.py   # Gemini CLI lifecycle event handler, entry point: rclm-gemini-hooks
     ├── codex_handler.py    # Codex CLI lifecycle event handler, entry point: rclm-codex-hooks
     ├── codex_transcript.py # Codex transcript parser -> normalized session data
+    ├── compress.py         # PreToolUse compression engine (Read/Grep/Bash token reduction)
+    ├── dlp.py              # DLP engine (secret redaction from env files before model context)
     ├── installer.py        # writes hook config into provider settings files, entry point: rclm-hooks-install
     ├── session_store.py    # per-session JSONL accumulator (~/.reclaimllm/sessions/)
     └── transcript.py       # Claude Code JSONL transcript parser
@@ -108,7 +110,7 @@ Gemini CLI calls: rclm-gemini-hooks <EventName>   (stdin: JSON payload)
                                             └── cleanup session JSONL
 ```
 
-**Stdout requirement:** Gemini CLI expects a JSON object on stdout for every hook call. The handler always prints `{}` before exiting regardless of event or outcome.
+**Stdout requirement:** Gemini CLI expects a JSON object on stdout for every hook call. `main()` prints the return value of the handler function if it is a dict (e.g. `{"hookSpecificOutput": {...}}` from DLP), otherwise `{}`.
 
 **No transcript parsing:** Gemini's transcript format is not documented. Messages and tool calls are assembled purely from accumulated hook events.
 
@@ -121,10 +123,119 @@ Gemini CLI calls: rclm-gemini-hooks <EventName>   (stdin: JSON payload)
 
 ---
 
+## DLP (Data Loss Prevention)
+
+`hooks/dlp.py` intercepts tool calls before secret values from `.env`-style files reach
+the model context. Enabled opt-in via `rclm-hooks-install --dlp`; stored as
+`"dlp": true` in `~/.reclaimllm/config.json`.
+
+### How it works
+
+```
+PreToolUse (Read tool)
+    agent tries to read dev.env
+          │
+          ├── dlp.maybe_redact_input()
+          │       ├── detect env file by name (_is_env_file)
+          │       ├── parse all *.env / .env* files in CWD (_load_secrets)
+          │       ├── build scrub set: filter short values, safe values, pure integers
+          │       ├── write sanitised copy to /tmp/rclm_dlp_*.env  ← track path in session_store
+          │       └── return {"file_path": "/tmp/rclm_dlp_*.env"}
+          │
+          └── Claude Code sees updatedInput → reads sanitised file instead
+                  MODEL SEES: API_KEY=[REDACTED:API_KEY]
+                  MODEL NEVER SEES: actual secret values
+
+PreToolUse (Bash tool)
+    agent runs: cat dev.env
+          │
+          ├── dlp.maybe_redact_input()
+          │       ├── detect cat/less/more/head/tail targeting an env file
+          │       └── return {"command": "echo '[rclm DLP] Blocked: ...'"}
+          │
+          └── Claude Code executes the echo instead of the cat
+
+PostToolUse (Bash / shell tool output)
+    tool output contains a secret value
+          │
+          ├── dlp.maybe_redact_output()
+          │       ├── load secrets from CWD env files (re-parsed, always fresh)
+          │       ├── replace all matching secret values with [REDACTED:VAR_NAME]
+          │       └── return scrubbed string (or None if nothing changed)
+          │
+          └── handler prints hookSpecificOutput.updatedResponse → model sees scrubbed output
+
+Stop
+    ├── iterate session events for DLPTempFile entries
+    └── os.unlink() each tracked temp path
+```
+
+### Per-provider coverage
+
+| Provider | Read redirect (PreToolUse) | Bash block (PreToolUse) | Output scrub (PostToolUse) |
+|---|---|---|---|
+| Claude Code | ✓ | ✓ | ✓ |
+| Gemini CLI | — (AfterTool fires post-execution) | — | ✓ (`run_shell_command`, `read_file`) |
+| Codex CLI | — (Bash-only hooks) | — | ✓ |
+
+### Env file detection
+
+Files are matched if their **basename** satisfies any of:
+- equals `.env` or `.envrc`
+- starts with `.env.` — e.g. `.env.local`, `.env.production`
+- ends with `.env` — e.g. `dev.env`, `prod.env`, `llm.env`
+
+Scanning is non-recursive (CWD only). Re-parsed on every hook invocation
+so changes to env files mid-session are picked up immediately.
+
+### Env file parsing
+
+Supports all common formats in a single pass:
+
+| Format | Example |
+|---|---|
+| `KEY=VALUE` | `API_KEY=sk-ant-abc123` |
+| `export KEY=VALUE` | `export DB_PASS=s3cret` |
+| `KEY="quoted value"` | `URL="postgres://u:p@h/db"` |
+| `KEY='single quoted'` | `TOKEN='abc def'` |
+| `KEY VALUE` (space-sep) | `SECRET myvalue` |
+| Inline comments | `KEY=value  # note` → value is `value` |
+| Full-line comments | `# ignored entirely` |
+
+### Scrub set filtering
+
+Values are **excluded** from the scrub set (will not be redacted) if they:
+- are shorter than 5 characters
+- appear in the safe-value allowlist: `true`, `false`, `yes`, `no`, `null`, `none`,
+  `localhost`, `0.0.0.0`, `127.0.0.1`, `::1` (and case variants)
+- consist entirely of digits (e.g. `PORT=8080`)
+
+Remaining values are sorted **longest-first** before substitution to prevent
+a shorter secret from partially replacing a longer one that shares a prefix.
+
+### Temp file lifecycle
+
+| Event | Action |
+|---|---|
+| `PreToolUse` (Read on env file) | `tempfile.NamedTemporaryFile(delete=False, prefix="rclm_dlp_")` written; path stored as `{"event_type": "DLPTempFile", "path": "..."}` in session_store |
+| `Stop` / `SubagentStop` | Iterate session events; `os.unlink()` each `DLPTempFile` path |
+| Session crash (no `Stop`) | Temp files remain in `/tmp/` — pre-sanitised content only, no security risk; evicted by OS eventually |
+
+### Config key
+
+```json
+{ "dlp": true }
+```
+
+Stored in `~/.reclaimllm/config.json` alongside `compress`, `server_url`, and `api_key`.
+Persisted by `rclm-hooks-install --dlp`; can also be set manually via `rclm._config.patch(dlp=True)`.
+
+---
+
 ## rclm-hooks-install
 
 ```
-rclm-hooks-install [--claude] [--gemini] [--codex] [--local] [--api-key=<key>] [--server-url=<url>]
+rclm-hooks-install [--claude] [--gemini] [--codex] [--local] [--api-key=<key>] [--server-url=<url>] [--compress] [--dlp]
         │
         ├── resolve credentials: --api-key flag → saved config → prompt with SETUP_URL + exit 1
         ├── _config.save(server_url, api_key)     # persist for uploader + future installs

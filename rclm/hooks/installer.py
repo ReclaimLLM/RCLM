@@ -34,9 +34,9 @@ from rclm import _config
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_APP_URL = "https://reclaimllm.com"
-DEFAULT_SERVER_URL = "https://api.reclaimllm.com"
-SETUP_URL = DEFAULT_APP_URL + "/settings"
+DEFAULT_FRONTEND_URL = "https://reclaimllm.com"
+DEFAULT_BACKEND_SERVER_URL = "https://api.reclaimllm.com"
+SETUP_URL = DEFAULT_FRONTEND_URL + "/settings"
 _CALLBACK_TIMEOUT_S = 300  # 5 minutes
 
 # ---------------------------------------------------------------------------
@@ -170,12 +170,17 @@ Subsequent installs without --api-key reuse the saved config.""",
     parser.add_argument(
         "--server-url",
         default=None,
-        help=f"ReclaimLLM server URL (default: {DEFAULT_SERVER_URL})",
+        help=f"ReclaimLLM server URL (default: {DEFAULT_BACKEND_SERVER_URL})",
     )
     parser.add_argument(
         "--compress",
         action="store_true",
         help="Enable context compression for Claude Code (rewrites Bash/Read/Grep inputs to reduce tokens)",
+    )
+    parser.add_argument(
+        "--dlp",
+        action="store_true",
+        help="Enable Data Loss Prevention: redact secrets from .env files before they reach the model",
     )
 
     return parser.parse_args()
@@ -310,13 +315,7 @@ def _write_json(path: Path, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _app_url_from_server_url(server_url: str) -> str:
-    if "api.reclaimllm.com" in server_url:
-        return server_url.replace("api.reclaimllm.com", "app.reclaimllm.com").rstrip("/")
-    return DEFAULT_APP_URL
-
-
-def _wait_for_api_key_via_browser(server_url: str) -> str | None:
+def _wait_for_api_key_via_browser(app_url: str) -> str | None:
     """Open the settings page in a browser and wait for the user to POST back an API key.
 
     A one-time nonce is embedded in the callback path so that only the rclm
@@ -365,7 +364,6 @@ def _wait_for_api_key_via_browser(server_url: str) -> str | None:
 
     server = HTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
-    app_url = _app_url_from_server_url(server_url)
     settings_url = f"{app_url}/settings?cli_callback=http://localhost:{port}/{nonce}"
 
     print(
@@ -418,10 +416,10 @@ def main() -> None:
     # Resolve credentials.
     saved = _config.load()
     api_key: str | None = args.api_key or saved.get("api_key")
-    server_url: str = args.server_url or saved.get("server_url") or DEFAULT_SERVER_URL
+    server_url: str = args.server_url or saved.get("server_url") or DEFAULT_BACKEND_SERVER_URL
 
     if not api_key:
-        api_key = _wait_for_api_key_via_browser(server_url)
+        api_key = _wait_for_api_key_via_browser(DEFAULT_FRONTEND_URL)
         if not api_key:
             sys.exit(1)
 
@@ -429,7 +427,8 @@ def main() -> None:
     api_key = api_key.replace('"', "").replace("'", "").strip()
 
     compress_enabled = args.compress or saved.get("compress", False)
-    _config.save(server_url, api_key, compress=compress_enabled)
+    dlp_enabled = args.dlp or saved.get("dlp", False)
+    _config.save(server_url, api_key, compress=compress_enabled, dlp=dlp_enabled)
 
     for provider in providers:
         if provider == "claude":
@@ -438,6 +437,14 @@ def main() -> None:
             _install_gemini(use_global)
         elif provider == "codex":
             _install_codex(use_global)
+
+    # Offer to sync existing sessions from all installed providers.
+    try:
+        from rclm.hooks.historical_sync import prompt_and_run_sync
+
+        prompt_and_run_sync(providers, resync=True)
+    except Exception:
+        pass  # Never let sync failure disrupt the install.
 
     # Non-blocking update check — print a notice if a newer version exists.
     try:

@@ -1,8 +1,8 @@
 """Parse Claude Code's JSONL transcript into structured data.
 
 Each line of the transcript is a JSON object with the shape:
-  {"type": "user"|"assistant"|"tool", "message": {...}, "timestamp": "...",
-   "model": "...", "usage": {"input_tokens": N, "output_tokens": N}}
+  {"type": "user"|"assistant"|"tool", "message": {"role": "...", "model": "...",
+   "content": [...], "usage": {"input_tokens": N, "output_tokens": N}}, "timestamp": "..."}
 """
 
 from __future__ import annotations
@@ -89,11 +89,15 @@ def _extract(entries: list[dict]) -> TranscriptData:
 
         if entry_type == "assistant":
             # Extract model from first assistant entry.
-            if data.model is None and entry.get("model"):
-                data.model = entry["model"]
+            # Claude Code stores model inside message{}, not at top level.
+            if data.model is None:
+                m = entry.get("model") or msg.get("model")
+                if m:
+                    data.model = m
 
             # Accumulate token usage.
-            usage = entry.get("usage", {})
+            # Claude Code stores usage inside message{}, not at top level.
+            usage = entry.get("usage") or msg.get("usage") or {}
             if usage:
                 has_tokens = True
                 total_in += usage.get("input_tokens", 0)

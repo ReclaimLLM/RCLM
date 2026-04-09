@@ -38,6 +38,7 @@ dev = [
 ]
 
 [project.scripts]
+rclm = "rclm.cli:main"
 rclm-proxy = "rclm.proxy.start:main"
 rclm-claude-hooks = "rclm.hooks.claude_handler:main"
 rclm-codex-hooks = "rclm.hooks.codex_handler:main"

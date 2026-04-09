@@ -133,7 +133,16 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             cwd = _resolve_cwd(session_id, payload)
             scrubbed = dlp.maybe_redact_output(tool_name, tool_response, cwd)
             if scrubbed is not None:
-                print(json.dumps({"hookSpecificOutput": {"updatedResponse": scrubbed}}))
+                print(
+                    json.dumps(
+                        {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PostToolUse",
+                                "additionalContext": "[rclm DLP] Secrets were redacted from the tool response.",
+                            }
+                        }
+                    )
+                )
         except Exception:
             pass  # Never let DLP disrupt Claude Code
 

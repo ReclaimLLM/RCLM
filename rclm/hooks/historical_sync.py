@@ -28,7 +28,7 @@ from rclm._models import (
     SessionRecord,
     ToolCall,
 )
-from rclm._uploader import _FAILED_UPLOADS_DIR, AnyRecord, upload_single
+from rclm._uploader import _FAILED_UPLOADS_DIR, AnyRecord, close_session, upload_single
 from rclm.hooks import codex_transcript
 from rclm.hooks import transcript as claude_transcript
 from rclm.hooks._analytics import compute_session_analytics
@@ -767,7 +767,10 @@ def prompt_and_run_sync(
             print("Reprocessing failed uploads...")
 
             async def _run_failed() -> tuple[int, int]:
-                return await _reprocess_failed_uploads()
+                try:
+                    return await _reprocess_failed_uploads()
+                finally:
+                    await close_session()
 
             ok, bad = asyncio.run(_run_failed())
             print(f"\nDone. Reprocessed {ok} succeeded, {bad} still failing.")
@@ -807,7 +810,10 @@ def prompt_and_run_sync(
     print("Syncing historical sessions...")
 
     async def _run() -> int:
-        return await _upload_all(by_provider, already_synced)
+        try:
+            return await _upload_all(by_provider, already_synced)
+        finally:
+            await close_session()
 
     uploaded = asyncio.run(_run())
     _save_synced_index(already_synced)

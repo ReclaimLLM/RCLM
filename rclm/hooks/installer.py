@@ -358,6 +358,9 @@ def _wait_for_api_key_via_browser(app_url: str) -> str | None:
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            # Chrome 98+ (Private Network Access spec): HTTPS pages need this
+            # header in the preflight response to be allowed to POST to localhost.
+            self.send_header("Access-Control-Allow-Private-Network", "true")
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             pass

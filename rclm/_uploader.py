@@ -143,3 +143,15 @@ async def upload_single(record: AnyRecord, *, max_retries: int = len(_RETRY_DELA
     """Upload one record, reusing the module-level session."""
     session = await _get_session()
     await upload(record, session, max_retries=max_retries)
+
+
+async def close_session() -> None:
+    """Close and discard the module-level ClientSession.
+
+    Call this at the end of any asyncio.run() block that used upload_single,
+    so aiohttp does not warn about an unclosed session when the event loop exits.
+    """
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+    _session = None

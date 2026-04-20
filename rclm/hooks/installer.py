@@ -21,8 +21,10 @@ Credentials are stored in ~/.reclaimllm/config.json and reused on subsequent run
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import secrets
+import shutil
 import sys
 import time
 import webbrowser
@@ -191,8 +193,36 @@ Subsequent installs without --api-key reuse the saved config.""",
 # ---------------------------------------------------------------------------
 
 
-def _command_already_present(existing_entries: list[dict], command: str) -> bool:
+def _resolve_binary(name: str) -> str:
+    """Return absolute path of a hook binary, falling back to bare name if not found."""
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    candidate = Path(sys.executable).parent / name
+    if candidate.exists():
+        return str(candidate)
+    return name
+
+
+def _with_absolute_binary(hooks_to_inject: dict, binary_name: str, resolved: str) -> dict:
+    """Return a deep copy of hooks_to_inject with bare binary name replaced by absolute path."""
+    if resolved == binary_name:
+        return hooks_to_inject
+    result = copy.deepcopy(hooks_to_inject)
+    for entries in result.values():
+        for entry in entries:
+            for hook in entry.get("hooks", []):
+                cmd = hook.get("command", "")
+                if cmd == binary_name or cmd.startswith(binary_name + " "):
+                    hook["command"] = resolved + cmd[len(binary_name) :]
+    return result
+
+
+def _command_already_present(existing_entries: list[dict], command: str, matcher: str = "") -> bool:
+    """Check if a command is already registered for the given matcher."""
     for entry in existing_entries:
+        if entry.get("matcher", "") != matcher:
+            continue
         for hook in entry.get("hooks", []):
             if hook.get("command") == command:
                 return True
@@ -224,9 +254,10 @@ def _merge_settings_hooks(settings: dict, hooks_to_inject: dict) -> dict:
     for event_name, new_entries in hooks_to_inject.items():
         existing_entries: list[dict] = hooks_section.setdefault(event_name, [])
         for entry in new_entries:
+            matcher = entry.get("matcher", "")
             for hook in entry.get("hooks", []):
                 command = hook.get("command", "")
-                if not _command_already_present(existing_entries, command):
+                if not _command_already_present(existing_entries, command, matcher):
                     existing_entries.append(entry)
                     break
     return settings
@@ -245,10 +276,13 @@ def _install_claude(use_global: bool, compress_enabled: bool) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    binary = _resolve_binary("rclm-claude-hooks")
+    hooks = _with_absolute_binary(_CLAUDE_HOOKS_TO_INJECT, "rclm-claude-hooks", binary)
+
     settings = _load_json(path)
     if compress_enabled:
         _remove_rtk_hooks(settings)
-    _merge_settings_hooks(settings, _CLAUDE_HOOKS_TO_INJECT)
+    _merge_settings_hooks(settings, hooks)
     _write_json(path, settings)
     print(f"rclm hooks installed into {path}")
 
@@ -261,8 +295,11 @@ def _install_gemini(use_global: bool) -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    binary = _resolve_binary("rclm-gemini-hooks")
+    hooks = _with_absolute_binary(_GEMINI_HOOKS_TO_INJECT, "rclm-gemini-hooks", binary)
+
     settings = _load_json(path)
-    _merge_settings_hooks(settings, _GEMINI_HOOKS_TO_INJECT)
+    _merge_settings_hooks(settings, hooks)
     _write_json(path, settings)
     print(f"rclm hooks installed into {path}")
 
@@ -271,8 +308,11 @@ def _install_codex(use_global: bool) -> None:
     path = Path.home() / ".codex" / "hooks.json" if use_global else Path(".codex") / "hooks.json"
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    binary = _resolve_binary("rclm-codex-hooks")
+    hooks = _with_absolute_binary(_CODEX_HOOKS_TO_INJECT, "rclm-codex-hooks", binary)
+
     data = _load_json(path)
-    _merge_settings_hooks(data, _CODEX_HOOKS_TO_INJECT)
+    _merge_settings_hooks(data, hooks)
     _write_json(path, data)
     print(f"rclm hooks installed into {path}")
 

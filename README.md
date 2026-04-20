@@ -105,6 +105,34 @@ rclm-proxy start
 
 ---
 
+## rclm CLI
+
+`rclm convert-session` exports a captured session as a markdown context document so you can continue work in a different AI tool.
+
+```bash
+# Print context to stdout
+rclm convert-session <session_id> <target_tool>
+
+# Write directly to the tool's context file
+rclm convert-session <session_id> claude  -o CLAUDE.md
+rclm convert-session <session_id> gemini  -o .gemini
+rclm convert-session <session_id> codex   -o AGENTS.md
+
+# Options
+rclm convert-session <session_id> generic --no-diffs          # omit file diffs
+rclm convert-session <session_id> claude  --force-regenerate  # re-generate via LLM even if annotations exist
+rclm convert-session <session_id> gemini  --max-diff-lines 20 # truncate diffs (default 50)
+```
+
+`target_tool` choices: `claude` · `gemini` · `codex` · `generic`
+
+**Fast path (default):** assembles the document from existing AI annotations (`title`, `session_summary`, `file_diff_summary`) — instant, no LLM call.  
+**Full path (`--force-regenerate`):** makes an LLM call (Ollama on free tier; OpenAI on paid/enterprise) to produce a continuation-specific summary.
+
+Reads `server_url` and `api_key` from `~/.reclaimllm/config.json`. Override `server_url` with `RECLAIMLLM_SERVER_URL` env var.
+
+---
+
 ## How hooks work
 
 Hooks integrate directly into each CLI's lifecycle via its settings file. `rclm-hooks-install` merges hook commands into the provider's config idempotently (skips duplicates, backs up invalid JSON). Each CLI calls the relevant `rclm-*-hooks` binary for every event, passing a JSON payload on stdin. All handlers exit 0 and swallow exceptions — hook failures never disrupt the underlying CLI.

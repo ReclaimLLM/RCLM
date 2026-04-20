@@ -1,5 +1,17 @@
 # Changelog
 
+## [v0.1.9] — 2026-04-16
+
+### Added
+- Added `rclm convert-session <session_id> <target_tool>` subcommand: exports a captured session as a markdown context document for continuing work in a different AI tool. Supports `claude`, `gemini`, `codex`, and `generic` target formats; `-o/--output` for file output; `--no-diffs`; `--max-diff-lines N`; `--force-regenerate` to invoke LLM even when annotations are cached. Fast path (no LLM) used by default when existing annotations are available (`rclm/cli.py`, `rclm/convert.py`)
+- Documented `rclm convert-session` in README with full usage examples, fast/full path explanation, and config note (`README.md`)
+
+### Fixed
+- Fixed hook binaries written as bare names (e.g. `rclm-claude-hooks`) in provider config files — installer now resolves the absolute path via `shutil.which()` so hooks fire correctly when the virtualenv is not on `PATH` at hook invocation time (`rclm/hooks/installer.py`)
+- Fixed `_command_already_present()` incorrectly matching hook commands across different `matcher` values, causing duplicate-check false positives when the same binary handles multiple matchers (`rclm/hooks/installer.py`)
+
+---
+
 ## [v0.1.8] — 2026-04-09
 
 ### Fixed

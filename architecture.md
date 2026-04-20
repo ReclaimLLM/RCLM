@@ -7,6 +7,8 @@ rclm/
 ├── _config.py        # ~/.reclaimllm/config.json read/write (shared by installer + uploader)
 ├── _models.py        # shared dataclasses (ProxyRecord, HookSessionRecord, ToolCall, FileDiff)
 ├── _uploader.py      # async upload + retry logic (used by both proxy and hooks)
+├── cli.py            # top-level rclm CLI entry point (subcommands: convert-session, ...)
+├── convert.py        # convert-session: thin HTTP client → server export-context endpoint
 ├── update.py         # package update entry point
 ├── proxy/
 │   ├── start.py            # proxy CLI entry point: rclm-proxy
@@ -229,6 +231,38 @@ a shorter secret from partially replacing a longer one that shares a prefix.
 
 Stored in `~/.reclaimllm/config.json` alongside `compress`, `server_url`, and `api_key`.
 Persisted by `rclm-hooks-install --dlp`; can also be set manually via `rclm._config.patch(dlp=True)`.
+
+---
+
+## rclm convert-session
+
+```
+rclm convert-session <session_id> <target_tool> [-o FILE] [--no-diffs] [--max-diff-lines N] [--force-regenerate]
+        │
+        ├── load server_url: RECLAIMLLM_SERVER_URL env var → config file server_url
+        ├── load api_key:    RECLAIMLLM_API_KEY env var    → config file api_key
+        ├── exit 1 if either is missing
+        │
+        └── POST {server_url}/api/sessions/{session_id}/export-context
+                query params: target_tool, include_diffs, max_diff_lines, force_regenerate
+                header:       X-API-Key: {api_key}
+                        │
+                        ├── 404 → "session not found" → exit 1
+                        ├── 503 → "server error: {detail}" → exit 1
+                        ├── non-2xx → "export-context failed (HTTP {N}): {detail}" → exit 1
+                        ├── invalid JSON → "unexpected response" → exit 1
+                        └── 200 → write context_document to stdout or -o FILE
+```
+
+**Credential resolution order**: env var takes precedence over config file value. Both paths
+use the same `~/.reclaimllm/config.json` written by `rclm-hooks-install`.
+
+**Target tool formats**: `claude`, `gemini`, `codex`, `generic`. The server appends a
+tool-specific preamble comment (e.g. `<!-- Usage: claude "$(cat <id>.md)" -->`) and a
+closing instruction line. All output is valid markdown regardless of target tool.
+
+**Fast vs full path**: the server decides; the CLI always sends `force_regenerate` as a
+param so users can bypass the fast path when needed.
 
 ---
 

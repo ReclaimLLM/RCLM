@@ -108,17 +108,25 @@ def test_merges_into_existing_settings_without_overwriting(tmp_path, monkeypatch
 
 def test_idempotent_running_twice_does_not_duplicate_hooks(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
     _run_install(monkeypatch, tmp_path)
     _run_install(monkeypatch, tmp_path)
 
     settings = _read_settings(tmp_path / ".claude" / "settings.json")
     for event, entries in installer._CLAUDE_HOOKS_TO_INJECT.items():
         for entry in entries:
+            matcher = entry.get("matcher", "")
             for hook in entry.get("hooks", []):
                 command = hook["command"]
-                commands = _hook_commands_for_event(settings, event)
-                assert commands.count(command) == 1, (
-                    f"Expected exactly 1 entry for '{command}', got {commands.count(command)}"
+                count = sum(
+                    1
+                    for e in settings["hooks"].get(event, [])
+                    if e.get("matcher", "") == matcher
+                    for h in e.get("hooks", [])
+                    if h.get("command") == command
+                )
+                assert count == 1, (
+                    f"Expected exactly 1 entry for '{command}' (matcher={matcher!r}), got {count}"
                 )
 
 

@@ -120,7 +120,7 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
             cwd = _resolve_cwd(session_id, payload)
             scrubbed = dlp.maybe_redact_output(tool_name, tool_response, cwd)
             if scrubbed is not None:
-                return {"hookSpecificOutput": {"updatedResponse": scrubbed}}
+                return {"decision": "deny", "reason": scrubbed}
         except Exception:
             pass  # Never let DLP disrupt Gemini CLI
 

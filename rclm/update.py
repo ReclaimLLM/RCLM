@@ -18,6 +18,20 @@ from rclm import _config
 from rclm.hooks.updater import apply_update, check_for_update, installed_version
 
 
+def _sync_redaction_settings() -> None:
+    try:
+        from rclm.hooks.redaction import load_settings, sync_remote_settings
+
+        if sync_remote_settings():
+            settings = load_settings()
+            count = len(settings.remote_substitutions)
+            print(f"Synced redaction settings ({count} remote substitutions).")
+        else:
+            print("Redaction settings sync skipped or unavailable.")
+    except Exception as exc:
+        print(f"Redaction settings sync failed: {exc}", file=sys.stderr)
+
+
 def _parse_flags() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Upgrade rclm to the latest version from PyPI",
@@ -40,6 +54,7 @@ def main() -> None:
 
     print("Checking for updates...")
     latest = check_for_update(force=True)
+    _sync_redaction_settings()
 
     if latest is None:
         print(f"rclm is up to date ({current}).")

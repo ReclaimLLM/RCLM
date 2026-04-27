@@ -109,7 +109,16 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
             pass  # Never let compression disrupt Claude Code
 
     if changed:
-        print(json.dumps({"hookSpecificOutput": {"updatedInput": effective_input}}))
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "updatedInput": effective_input,
+                    }
+                }
+            )
+        )
 
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:

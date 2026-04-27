@@ -3,9 +3,58 @@
 import json
 
 import pytest
+from jsonschema import validate
 
 from rclm._models import HookSessionRecord
 from rclm.hooks import claude_handler as handler
+
+CLAUDE_PRE_TOOL_USE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "continue": {"type": "boolean"},
+        "stopReason": {"type": "string"},
+        "suppressOutput": {"type": "boolean"},
+        "systemMessage": {"type": "string"},
+        "hookSpecificOutput": {
+            "type": "object",
+            "additionalProperties": True,
+            "required": ["hookEventName"],
+            "properties": {
+                "hookEventName": {"const": "PreToolUse"},
+                "permissionDecision": {
+                    "enum": ["allow", "deny", "ask", "defer", "approve", "block"]
+                },
+                "permissionDecisionReason": {"type": "string"},
+                "updatedInput": {"type": "object"},
+                "additionalContext": {"type": "string"},
+            },
+        },
+    },
+}
+
+CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "continue": {"type": "boolean"},
+        "stopReason": {"type": "string"},
+        "suppressOutput": {"type": "boolean"},
+        "systemMessage": {"type": "string"},
+        "decision": {"const": "block"},
+        "reason": {"type": "string"},
+        "hookSpecificOutput": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["hookEventName"],
+            "properties": {
+                "hookEventName": {"const": "PostToolUse"},
+                "additionalContext": {"type": "string"},
+                "updatedMCPToolOutput": {},
+            },
+        },
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -103,6 +152,8 @@ def test_pre_tool_use_compression_when_enabled(monkeypatch, tmp_path, capsys):
 
     captured = capsys.readouterr()
     output = json.loads(captured.out)
+    validate(instance=output, schema=CLAUDE_PRE_TOOL_USE_OUTPUT_SCHEMA)
+    assert output["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     assert output["hookSpecificOutput"]["updatedInput"]["head_limit"] == 50
 
 
@@ -134,6 +185,39 @@ def test_post_tool_use_appends_tool_event(monkeypatch, tmp_path):
     assert events[-1]["event_type"] == "PostToolUse"
     assert events[-1]["tool_name"] == "Bash"
     assert events[-1]["tool_response"] == "file.py\n"
+
+
+def test_post_tool_use_dlp_output_matches_claude_schema(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import dlp, session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"dlp": True})
+    monkeypatch.setattr(
+        dlp,
+        "maybe_redact_output",
+        lambda tool_name, tool_response, cwd: "token=[REDACTED:TOKEN]",
+    )
+
+    payload = {
+        "session_id": "sid-dlp",
+        "transcript_path": "/tmp/claude.jsonl",
+        "cwd": "/repo",
+        "permission_mode": "default",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat .env"},
+        "tool_response": "token=secret-token",
+        "tool_use_id": "toolu_01ABC123",
+        "duration_ms": 12,
+    }
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    assert output["hookSpecificOutput"] == {
+        "hookEventName": "PostToolUse",
+        "additionalContext": "[rclm DLP] Secrets were redacted from the tool response.",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -12,10 +12,16 @@ from pathlib import Path
 
 import aiohttp
 
-_FAILED_UPLOADS_DIR = Path.home() / ".reclaimllm" / "failed_uploads"
+from rclm import _config
+from rclm._endpoints import INGEST_PATH
+from rclm._models import (
+    HookSessionRecord,
+    ProxyRecord,
+    SessionRecord,
+)
+from rclm.hooks import redaction
 
-from rclm import _config  # noqa: E402
-from rclm._models import HookSessionRecord, ProxyRecord, SessionRecord  # noqa: E402
+_FAILED_UPLOADS_DIR = Path.home() / ".reclaimllm" / "failed_uploads"
 
 logger = logging.getLogger(__name__)
 
@@ -29,27 +35,39 @@ def _to_json(record: AnyRecord) -> str:
     return json.dumps(dataclasses.asdict(record))
 
 
+def _to_redacted_json(
+    record: AnyRecord,
+    settings: redaction.RedactionSettings | None = None,
+) -> str:
+    return redaction.redact_json_payload(_to_json(record), settings)
+
+
 async def upload(
     record: AnyRecord,
     session: aiohttp.ClientSession,
     *,
     max_retries: int = len(_RETRY_DELAYS),
 ) -> None:
-    """POST record as JSON to BACKEND_SERVER/api/ingest.
+    """POST record as JSON to configured ReclaimLLM ingest endpoint.
 
     Retries up to ``max_retries`` times with exponential backoff (default 3).
     Quarantines to ~/.reclaimllm/failed_uploads/ if server URL is unset or all retries fail.
     """
     cfg = _config.load()
-    base = os.environ.get("BACKEND_SERVER") or cfg.get("server_url")
+    redaction_settings = redaction.load_settings(cfg)
+    if redaction.should_skip_record(record, redaction_settings):
+        logger.info("rclm upload skipped by local redaction exclude_folders")
+        return
+
+    base = cfg.get("server_url")
     if not base:
         _quarantine(record)
         return
-    url = base.rstrip("/") + "/api/ingest"
+    url = base.rstrip("/") + INGEST_PATH
     # if len(record.messages) == 0:
     #     logger.warning("Record has empty messages; skipping upload")
     #     return
-    payload = _to_json(record)
+    payload = _to_redacted_json(record, redaction_settings)
     headers = {"Content-Type": "application/json"}
     # get from config first, then environment
     api_key = cfg.get("api_key")
@@ -99,7 +117,7 @@ def _quarantine(record: AnyRecord) -> None:
         _FAILED_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(_FAILED_UPLOADS_DIR, 0o700)
         path = _FAILED_UPLOADS_DIR / f"{record.session_id}.json"
-        path.write_text(_to_json(record), encoding="utf-8")
+        path.write_text(_to_redacted_json(record), encoding="utf-8")
         os.chmod(path, 0o600)
         print(
             f"rclm: upload failed; record saved to {path}",

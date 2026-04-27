@@ -473,6 +473,14 @@ def main() -> None:
     dlp_enabled = args.dlp or saved.get("dlp", False)
     _config.save(server_url, api_key, compress=compress_enabled, dlp=dlp_enabled)
 
+    try:
+        from rclm.hooks.redaction import sync_remote_settings
+
+        if sync_remote_settings(server_url=server_url, api_key=api_key):
+            print("rclm redaction settings synced")
+    except Exception:
+        pass  # Never let redaction settings sync disrupt hook installation.
+
     for provider in providers:
         if provider == "claude":
             _install_claude(use_global, compress_enabled)

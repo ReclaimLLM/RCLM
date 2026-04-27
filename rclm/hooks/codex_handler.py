@@ -117,7 +117,16 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             cwd = payload.get("cwd", "")
             scrubbed = dlp.maybe_redact_output("Bash", tool_response, cwd)
             if scrubbed is not None:
-                print(json.dumps({"hookSpecificOutput": {"updatedResponse": scrubbed}}))
+                print(
+                    json.dumps(
+                        {
+                            "hookSpecificOutput": {
+                                "hookEventName": "PostToolUse",
+                                "updatedMCPToolOutput": scrubbed,
+                            }
+                        }
+                    )
+                )
         except Exception:
             pass  # Never let DLP disrupt Codex CLI
 

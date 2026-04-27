@@ -78,8 +78,8 @@ def _extract(entries: list[dict]) -> CodexTranscriptData:
         response_type = payload.get("type")
         if response_type == "message":
             _extract_response_message(payload, timestamp, data, seen_messages)
-        elif response_type == "function_call":
-            call = _build_function_call(payload, timestamp)
+        elif response_type in {"function_call", "custom_tool_call"}:
+            call = _build_tool_call(payload, timestamp)
             if call is not None:
                 pending_calls[payload.get("call_id", "")] = call
                 data.tool_calls.append(call)
@@ -181,14 +181,14 @@ def _append_message(
     )
 
 
-def _build_function_call(payload: dict, timestamp: str) -> ToolCall | None:
+def _build_tool_call(payload: dict, timestamp: str) -> ToolCall | None:
     call_id = payload.get("call_id")
     name = payload.get("name")
     if not call_id or not name:
         return None
 
-    arguments = payload.get("arguments", "")
-    tool_input = _parse_tool_input(arguments)
+    raw_input = payload.get("arguments", payload.get("input", ""))
+    tool_input = _parse_tool_input(raw_input)
     return ToolCall(
         tool_use_id=call_id,
         tool_name=name,

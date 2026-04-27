@@ -5,9 +5,93 @@ from __future__ import annotations
 import json
 
 import pytest
+from jsonschema import validate
 
 from rclm._models import HookSessionRecord
 from rclm.hooks import codex_handler, codex_transcript
+
+CODEX_POST_TOOL_USE_OUTPUT_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": False,
+    "definitions": {
+        "BlockDecisionWire": {"enum": ["block"], "type": "string"},
+        "HookEventNameWire": {
+            "enum": [
+                "PreToolUse",
+                "PermissionRequest",
+                "PostToolUse",
+                "SessionStart",
+                "UserPromptSubmit",
+                "Stop",
+            ],
+            "type": "string",
+        },
+        "PostToolUseHookSpecificOutputWire": {
+            "additionalProperties": False,
+            "properties": {
+                "additionalContext": {"default": None, "type": "string"},
+                "hookEventName": {"$ref": "#/definitions/HookEventNameWire"},
+                "updatedMCPToolOutput": {"default": None},
+            },
+            "required": ["hookEventName"],
+            "type": "object",
+        },
+    },
+    "properties": {
+        "continue": {"default": True, "type": "boolean"},
+        "decision": {
+            "allOf": [{"$ref": "#/definitions/BlockDecisionWire"}],
+            "default": None,
+        },
+        "hookSpecificOutput": {
+            "allOf": [{"$ref": "#/definitions/PostToolUseHookSpecificOutputWire"}],
+            "default": None,
+        },
+        "reason": {"default": None, "type": "string"},
+        "stopReason": {"default": None, "type": "string"},
+        "suppressOutput": {"default": False, "type": "boolean"},
+        "systemMessage": {"default": None, "type": "string"},
+    },
+    "title": "post-tool-use.command.output",
+    "type": "object",
+}
+
+CODEX_POST_TOOL_USE_INPUT_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": False,
+    "definitions": {"NullableString": {"type": ["string", "null"]}},
+    "properties": {
+        "cwd": {"type": "string"},
+        "hook_event_name": {"const": "PostToolUse", "type": "string"},
+        "model": {"type": "string"},
+        "permission_mode": {
+            "enum": ["default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"],
+            "type": "string",
+        },
+        "session_id": {"type": "string"},
+        "tool_input": True,
+        "tool_name": {"type": "string"},
+        "tool_response": True,
+        "tool_use_id": {"type": "string"},
+        "transcript_path": {"$ref": "#/definitions/NullableString"},
+        "turn_id": {"type": "string"},
+    },
+    "required": [
+        "cwd",
+        "hook_event_name",
+        "model",
+        "permission_mode",
+        "session_id",
+        "tool_input",
+        "tool_name",
+        "tool_response",
+        "tool_use_id",
+        "transcript_path",
+        "turn_id",
+    ],
+    "title": "post-tool-use.command.input",
+    "type": "object",
+}
 
 
 def _make_stdin(text: str):
@@ -121,6 +205,43 @@ def test_codex_transcript_parses_messages_tools_and_diffs(tmp_path):
     assert len(data.file_diffs) == 1
     assert data.file_diffs[0].path == "foo.txt"
     assert data.file_diffs[0].after == "hello"
+
+
+def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-04-07T12:52:34.670Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "call_id": "call-patch",
+                    "name": "apply_patch",
+                    "input": (
+                        "*** Begin Patch\n"
+                        "*** Add File: /repo/new.txt\n"
+                        "+first\n"
+                        "+second\n"
+                        "*** End Patch\n"
+                    ),
+                },
+            }
+        )
+        + "\n"
+    )
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert len(data.tool_calls) == 1
+    assert data.tool_calls[0].tool_use_id == "call-patch"
+    assert data.tool_calls[0].tool_name == "apply_patch"
+    assert data.tool_calls[0].tool_input["input"].startswith("*** Begin Patch")
+    assert len(data.file_diffs) == 1
+    assert data.file_diffs[0].path == "/repo/new.txt"
+    assert data.file_diffs[0].before is None
+    assert data.file_diffs[0].after == "first\nsecond"
 
 
 def test_codex_stop_prefers_transcript_data(monkeypatch, tmp_path):
@@ -246,3 +367,73 @@ def test_codex_stop_falls_back_when_transcript_empty(monkeypatch, tmp_path):
         "hook assistant",
     ]
     assert record.model == "hook-model"
+
+
+def test_codex_post_tool_use_dlp_output_matches_codex_schema(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import dlp, session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+
+    monkeypatch.setattr("rclm._config.load", lambda: {"dlp": True})
+
+    def mock_redact(tool_name, tool_response, cwd):
+        assert tool_name == "Bash"
+        assert tool_response == "My secret is password123"
+        assert cwd == "/repo"
+        return "My secret is [REDACTED:PASSWORD]"
+
+    monkeypatch.setattr(dlp, "maybe_redact_output", mock_redact)
+
+    payload = {
+        "session_id": "sid-codex",
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.4",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat .env"},
+        "tool_response": "My secret is password123",
+        "tool_use_id": "call-1",
+        "transcript_path": None,
+        "turn_id": "turn-1",
+    }
+    validate(instance=payload, schema=CODEX_POST_TOOL_USE_INPUT_SCHEMA)
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    output = capsys.readouterr().out.strip()
+    assert output
+    parsed = json.loads(output)
+    validate(instance=parsed, schema=CODEX_POST_TOOL_USE_OUTPUT_SCHEMA)
+
+    hso = parsed["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PostToolUse"
+    assert hso["updatedMCPToolOutput"] == "My secret is [REDACTED:PASSWORD]"
+    assert "updatedResponse" not in hso
+
+
+def test_codex_post_tool_use_no_stdout_when_dlp_finds_nothing(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import dlp, session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"dlp": True})
+    monkeypatch.setattr(dlp, "maybe_redact_output", lambda tool_name, response, cwd: None)
+
+    payload = {
+        "session_id": "sid-codex-clean",
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.4",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo ok"},
+        "tool_response": "ok",
+        "tool_use_id": "call-2",
+        "transcript_path": "/tmp/session.jsonl",
+        "turn_id": "turn-2",
+    }
+    validate(instance=payload, schema=CODEX_POST_TOOL_USE_INPUT_SCHEMA)
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    assert capsys.readouterr().out == ""

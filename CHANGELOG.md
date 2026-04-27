@@ -1,5 +1,24 @@
 # Changelog
 
+## [v0.1.10] — 2026-04-27
+
+### Added
+- Added local hook upload redaction with default-on settings, remote substitution sync, local-only substitutions, folder exclusions, and longest-first payload replacement (`rclm/hooks/redaction.py`, `rclm/_uploader.py`)
+- Added redaction settings sync during hook install and `rclm-update`, including remote substitution count output after successful sync (`rclm/hooks/installer.py`, `rclm/update.py`)
+- Added shared endpoint constants for ingest and redaction settings API paths (`rclm/_endpoints.py`)
+- Added tests for redaction sync, upload-time redaction, excluded-folder skips, provider hook schemas, Codex transcript parsing, and session conversion failure paths (`rclm/tests/**`)
+
+### Changed
+- Updated hook upload path to use saved config server URL, apply local redaction before POST, and redact quarantined failed-upload payloads (`rclm/_uploader.py`)
+- Updated Claude, Codex, and Gemini DLP hook responses to match provider-specific hook output contracts (`rclm/hooks/claude_handler.py`, `rclm/hooks/codex_handler.py`, `rclm/hooks/gemini_handler.py`)
+- Updated Codex transcript parsing to support `custom_tool_call` entries and parse tool input from either `arguments` or `input` (`rclm/hooks/codex_transcript.py`)
+- Refreshed README coverage for install, hook setup, historical sync, session conversion, compression, DLP, proxy capture, and development workflows (`README.md`)
+
+### Security
+- Redacted configured sensitive values before normal hook uploads leave the machine, with local exclusions that skip upload entirely for configured folders (`rclm/hooks/redaction.py`, `rclm/_uploader.py`)
+
+---
+
 ## [v0.1.9] — 2026-04-16
 
 ### Added

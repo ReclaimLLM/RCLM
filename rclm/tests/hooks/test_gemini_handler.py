@@ -4,9 +4,57 @@ import json
 from io import StringIO
 
 import pytest
+from jsonschema import validate
 
 from rclm._models import HookSessionRecord
 from rclm.hooks import gemini_handler, session_store
+
+GEMINI_AFTER_TOOL_INPUT_SCHEMA = {
+    "type": "object",
+    "required": [
+        "session_id",
+        "transcript_path",
+        "cwd",
+        "hook_event_name",
+        "timestamp",
+        "tool_name",
+        "tool_input",
+        "tool_response",
+    ],
+    "properties": {
+        "session_id": {"type": "string"},
+        "transcript_path": {"type": "string"},
+        "cwd": {"type": "string"},
+        "hook_event_name": {"const": "AfterTool"},
+        "timestamp": {"type": "string"},
+        "tool_name": {"type": "string"},
+        "tool_input": {"type": "object"},
+        "tool_response": {
+            "type": "object",
+            "properties": {
+                "llmContent": {"type": "string"},
+                "returnDisplay": {"type": "string"},
+                "error": {"type": ["string", "null"]},
+            },
+        },
+        "mcp_context": {"type": "object"},
+        "original_request_name": {"type": "string"},
+    },
+}
+
+GEMINI_COMMON_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "systemMessage": {"type": "string"},
+        "suppressOutput": {"type": "boolean"},
+        "continue": {"type": "boolean"},
+        "stopReason": {"type": "string"},
+        "decision": {"enum": ["allow", "deny", "block"]},
+        "reason": {"type": "string"},
+        "hookSpecificOutput": {"type": "object"},
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -152,6 +200,40 @@ def test_after_tool_normalises_error_in_response(monkeypatch, tmp_path):
 
     events = session_store.read_events("gsid-6")
     assert events[-1]["tool_response"] == "Error: Permission denied"
+
+
+def test_after_tool_dlp_output_matches_gemini_schema(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import dlp
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "load", lambda: {"dlp": True})
+    monkeypatch.setattr(
+        dlp,
+        "maybe_redact_output",
+        lambda tool_name, tool_response, cwd: "TOKEN=[REDACTED:TOKEN]",
+    )
+
+    payload = {
+        "session_id": "gsid-dlp",
+        "transcript_path": "/tmp/gemini-session.json",
+        "cwd": "/repo",
+        "hook_event_name": "AfterTool",
+        "timestamp": "2026-04-10T00:00:00Z",
+        "tool_name": "read_file",
+        "tool_input": {"file_path": "/repo/.env"},
+        "tool_response": {
+            "llmContent": "TOKEN=secret-token",
+            "returnDisplay": "TOKEN=secret-token",
+            "error": None,
+        },
+    }
+    validate(instance=payload, schema=GEMINI_AFTER_TOOL_INPUT_SCHEMA)
+
+    output = _run_handler("AfterTool", payload, monkeypatch, capsys=capsys)
+    parsed = json.loads(output)
+    validate(instance=parsed, schema=GEMINI_COMMON_OUTPUT_SCHEMA)
+    assert parsed == {"decision": "deny", "reason": "TOKEN=[REDACTED:TOKEN]"}
 
 
 # ---------------------------------------------------------------------------

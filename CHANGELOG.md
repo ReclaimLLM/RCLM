@@ -1,5 +1,17 @@
 # Changelog
 
+## [v0.1.11] — 2026-05-01
+
+### Added
+- Added OpenClaw capture support with a new `rclm-openclaw-hooks` entry point, plugin generator, and transcript parser (`rclm/hooks/openclaw_handler.py`, `rclm/hooks/openclaw_plugin.py`, `rclm/hooks/openclaw_transcript.py`, `pyproject.toml`)
+- Added OpenClaw historical sync support, including `rclm-sync --openclaw` and provider discovery for `~/.openclaw/agents/main/sessions` (`rclm/hooks/historical_sync.py`)
+- Added OpenClaw install/uninstall wiring plus tests for the new plugin and hook paths (`rclm/hooks/installer.py`, `rclm/hooks/uninstaller.py`, `rclm/tests/hooks/**`)
+
+### Changed
+- Updated installer defaults and docs so OpenClaw is treated as a first-class provider alongside Claude, Gemini, and Codex (`rclm/hooks/installer.py`, `README.md`, `architecture.md`)
+- Extended historical sync dispatch and CLI help to include OpenClaw session backfill (`rclm/hooks/historical_sync.py`)
+- Expanded architecture docs to describe the OpenClaw plugin lifecycle and config layout (`architecture.md`)
+
 ## [v0.1.10] — 2026-04-27
 
 ### Added

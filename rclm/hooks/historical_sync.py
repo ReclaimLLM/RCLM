@@ -2,8 +2,9 @@
 
 Called during install when the user opts in. Discovers existing session files from
 Claude Code (~/.claude/projects/**/*.jsonl), Gemini CLI (~/.gemini/tmp/**/chats/*.json),
-and Codex CLI (~/.codex/sessions/**/*.jsonl), parses them into HookSessionRecord
-objects, and uploads them via the same mechanism as live sessions.
+Codex CLI (~/.codex/sessions/**/*.jsonl), and OpenClaw
+(~/.openclaw/agents/main/sessions/*.jsonl*), parses them into
+HookSessionRecord objects, and uploads them via the same mechanism as live sessions.
 
 A sync index at ~/.reclaimllm/synced_sessions.json tracks which files have already
 been uploaded so re-running the installer never duplicates records.
@@ -29,7 +30,7 @@ from rclm._models import (
     ToolCall,
 )
 from rclm._uploader import _FAILED_UPLOADS_DIR, AnyRecord, close_session, upload_single
-from rclm.hooks import codex_transcript
+from rclm.hooks import codex_transcript, openclaw_transcript
 from rclm.hooks import transcript as claude_transcript
 from rclm.hooks._analytics import compute_session_analytics
 
@@ -42,6 +43,7 @@ _FAILED_UPLOAD_MAX_RETRIES = 1
 # ---------------------------------------------------------------------------
 
 _SYNCED_INDEX = Path.home() / ".reclaimllm" / "synced_sessions.json"
+_HISTORICAL_PROVIDERS = ("claude", "gemini", "codex", "openclaw")
 
 
 def _load_synced_index() -> set[str]:
@@ -100,6 +102,68 @@ def _iter_codex_sessions() -> list[Path]:
     if not base.exists():
         return []
     return [f for f in base.rglob("*.jsonl") if f.is_file()]
+
+
+def _openclaw_canonical_path(path: Path) -> Path:
+    """Return the base .jsonl path for plain and .jsonl.reset.* OpenClaw files."""
+    marker = ".jsonl.reset."
+    name = path.name
+    if marker not in name:
+        return path
+    return path.with_name(name.split(marker, 1)[0] + ".jsonl")
+
+
+def _openclaw_reset_sort_key(path: Path) -> tuple[float, str]:
+    """Return a deterministic sort key for reset suffix dates.
+
+    Accepts ISO-ish suffixes first, then compact date formats. Unknown suffixes
+    sort before parseable dates but remain deterministic by filename.
+    """
+    marker = ".jsonl.reset."
+    suffix = path.name.split(marker, 1)[1] if marker in path.name else ""
+    normalized = suffix.replace("Z", "+00:00").replace("_", "T", 1)
+    try:
+        return datetime.fromisoformat(normalized).timestamp(), suffix
+    except ValueError:
+        pass
+
+    for fmt in ("%Y%m%d%H%M%S", "%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(suffix, fmt).timestamp(), suffix
+        except ValueError:
+            pass
+    return 0.0, suffix
+
+
+def _iter_openclaw_sessions() -> list[Path]:
+    """Yield OpenClaw sessions from ~/.openclaw/agents/main/sessions.
+
+    Reset files are grouped by their base .jsonl path, and the latest reset
+    suffix wins when one or more resets exist for the same session.
+    """
+    base = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+    if not base.exists():
+        return []
+
+    grouped: dict[Path, dict[str, list[Path]]] = {}
+    for path in base.iterdir():
+        if not path.is_file():
+            continue
+        is_plain = path.name.endswith(".jsonl")
+        is_reset = ".jsonl.reset." in path.name
+        if not is_plain and not is_reset:
+            continue
+        bucket = grouped.setdefault(_openclaw_canonical_path(path), {"plain": [], "reset": []})
+        bucket["plain" if is_plain else "reset"].append(path)
+
+    selected = []
+    for canonical in sorted(grouped):
+        bucket = grouped[canonical]
+        if bucket["reset"]:
+            selected.append(max(bucket["reset"], key=_openclaw_reset_sort_key))
+        else:
+            selected.extend(sorted(bucket["plain"]))
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +606,40 @@ def _parse_codex_session(path: Path) -> HookSessionRecord | None:
 
 
 # ---------------------------------------------------------------------------
+# OpenClaw parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_openclaw_session(path: Path) -> HookSessionRecord | None:
+    """Parse an OpenClaw JSONL session file into a HookSessionRecord."""
+    transcript_data = openclaw_transcript.parse_transcript(str(path))
+    if not transcript_data.messages and not transcript_data.tool_calls:
+        return None
+
+    analytics = compute_session_analytics(transcript_data.tool_calls, [])
+
+    return HookSessionRecord(
+        session_id=transcript_data.session_id or _derive_session_id(_openclaw_canonical_path(path)),
+        cwd=transcript_data.cwd,
+        started_at=transcript_data.started_at,
+        ended_at=transcript_data.ended_at,
+        duration_s=transcript_data.duration_s,
+        transcript_path=str(path),
+        model=transcript_data.model or "openclaw-unknown",
+        messages=transcript_data.messages,
+        tool_calls=transcript_data.tool_calls,
+        file_diffs=[],
+        total_input_tokens=None,
+        total_output_tokens=None,
+        tool_token_stats=analytics.get("tool_token_stats"),
+        tool_call_count=analytics.get("tool_call_count"),
+        unique_files_modified=analytics.get("unique_files_modified"),
+        dominant_tool=analytics.get("dominant_tool"),
+        is_sync=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Failed-upload reprocessing
 # ---------------------------------------------------------------------------
 
@@ -680,6 +778,8 @@ def _discover_sessions(providers: list[str]) -> dict[str, list[Path]]:
         result["gemini"] = _iter_gemini_sessions()
     if "codex" in providers:
         result["codex"] = _iter_codex_sessions()
+    if "openclaw" in providers:
+        result["openclaw"] = _iter_openclaw_sessions()
     return result
 
 
@@ -691,6 +791,8 @@ def _parse_session(provider: str, path: Path) -> HookSessionRecord | None:
             return _parse_gemini_session(path)
         if provider == "codex":
             return _parse_codex_session(path)
+        if provider == "openclaw":
+            return _parse_openclaw_session(path)
     except Exception:
         pass
     return None
@@ -735,7 +837,7 @@ def prompt_and_run_sync(
     """Discover and upload historical sessions, prompting the user first.
 
     Args:
-        providers: Which providers to scan ("claude", "gemini", "codex").
+        providers: Which providers to scan ("claude", "gemini", "codex", "openclaw").
         force_yes: Skip the confirmation prompt (for rclm-sync --yes).
         resync: Ignore the synced-sessions index and re-upload everything,
                 including sessions already uploaded in a previous run.
@@ -827,6 +929,7 @@ def sync_main() -> None:
         rclm-sync                    # all providers, interactive prompt
         rclm-sync --claude           # Claude only
         rclm-sync --gemini --codex   # Gemini + Codex
+        rclm-sync --openclaw         # OpenClaw only
         rclm-sync --yes              # skip confirmation prompt
         rclm-sync --resync           # re-upload everything, ignoring prior sync index
         rclm-sync --failed           # reprocess quarantined failed uploads
@@ -835,12 +938,13 @@ def sync_main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Sync existing Claude/Gemini/Codex sessions to ReclaimLLM.",
+        description="Sync existing Claude/Gemini/Codex/OpenClaw sessions to ReclaimLLM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   %(prog)s                   # scan all providers, ask before uploading
   %(prog)s --claude          # Claude Code only
   %(prog)s --gemini --codex  # Gemini + Codex
+  %(prog)s --openclaw        # OpenClaw only
   %(prog)s --yes             # upload without confirmation prompt
   %(prog)s --resync          # re-upload all sessions, ignoring prior sync index
   %(prog)s --resync --yes    # resync without confirmation prompt
@@ -850,6 +954,7 @@ def sync_main() -> None:
     parser.add_argument("--claude", action="store_true", help="Sync Claude Code sessions")
     parser.add_argument("--gemini", action="store_true", help="Sync Gemini CLI sessions")
     parser.add_argument("--codex", action="store_true", help="Sync Codex CLI sessions")
+    parser.add_argument("--openclaw", action="store_true", help="Sync OpenClaw sessions")
     parser.add_argument(
         "--yes",
         "-y",
@@ -868,9 +973,9 @@ def sync_main() -> None:
     )
     args = parser.parse_args()
 
-    providers = [p for p in ("claude", "gemini", "codex") if getattr(args, p)]
+    providers = [p for p in _HISTORICAL_PROVIDERS if getattr(args, p)]
     if not providers:
-        providers = ["claude", "gemini", "codex"]
+        providers = list(_HISTORICAL_PROVIDERS)
 
     from rclm import _config
 

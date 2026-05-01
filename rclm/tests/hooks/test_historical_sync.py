@@ -10,12 +10,16 @@ import pytest
 
 from rclm._models import HookSessionRecord
 from rclm.hooks.historical_sync import (
+    _HISTORICAL_PROVIDERS,
     _derive_session_id,
     _discover_sessions,
+    _iter_openclaw_sessions,
     _load_synced_index,
     _parse_claude_session,
     _parse_codex_session,
     _parse_gemini_session,
+    _parse_openclaw_session,
+    _parse_session,
     _save_synced_index,
     _upload_all,
     prompt_and_run_sync,
@@ -106,6 +110,26 @@ def test_iter_gemini_sessions_finds_chats(tmp_path):
     results = [f for f in (tmp_path / "tmp").rglob("chats/*.json") if f.is_file()]
     assert session in results
     assert logs not in results
+
+
+def test_iter_openclaw_sessions_selects_latest_reset(tmp_path):
+    sessions = tmp_path / ".openclaw" / "agents" / "main" / "sessions"
+    sessions.mkdir(parents=True)
+    plain = sessions / "session-a.jsonl"
+    plain.touch()
+    older = sessions / "session-a.jsonl.reset.2026-04-28T10:00:00"
+    older.touch()
+    newer = sessions / "session-a.jsonl.reset.2026-04-29T10:00:00"
+    newer.touch()
+    other = sessions / "session-b.jsonl"
+    other.touch()
+    ignored = sessions / "notes.txt"
+    ignored.touch()
+
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        result = _iter_openclaw_sessions()
+
+    assert result == [newer, other]
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +502,210 @@ def test_parse_codex_session_fallback_session_id(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# OpenClaw session parsing
+# ---------------------------------------------------------------------------
+
+
+def _openclaw_jsonl_entries():
+    return [
+        {
+            "hook_name": "session_start",
+            "received_at": "2026-04-27T00:00:00+00:00",
+            "event": {
+                "sessionId": "oc-sid-1",
+                "workspaceDir": "/repo",
+                "model": {"id": "openai/gpt-5.4"},
+            },
+        },
+        {
+            "hook_name": "llm_input",
+            "received_at": "2026-04-27T00:00:01+00:00",
+            "event": {
+                "sessionId": "oc-sid-1",
+                "messages": [
+                    {"role": "system", "content": "HEARTBEAT_OK"},
+                    {"role": "user", "content": "hello"},
+                ],
+            },
+        },
+        {
+            "hook_name": "llm_output",
+            "received_at": "2026-04-27T00:00:02+00:00",
+            "event": {"sessionId": "oc-sid-1", "message": {"content": "hi back"}},
+        },
+        {
+            "hook_name": "before_tool_call",
+            "received_at": "2026-04-27T00:00:03+00:00",
+            "event": {
+                "sessionId": "oc-sid-1",
+                "toolCallId": "tool-1",
+                "toolName": "read_file",
+                "params": {"path": "README.md"},
+            },
+        },
+        {
+            "hook_name": "after_tool_call",
+            "received_at": "2026-04-27T00:00:04+00:00",
+            "event": {
+                "sessionId": "oc-sid-1",
+                "toolCallId": "tool-1",
+                "toolName": "read_file",
+                "result": "contents",
+            },
+        },
+        {
+            "hook_name": "session_end",
+            "received_at": "2026-04-27T00:01:00+00:00",
+            "event": {"sessionId": "oc-sid-1"},
+        },
+    ]
+
+
+def test_parse_openclaw_session_basic(tmp_path):
+    path = tmp_path / "session-a.jsonl"
+    _write_jsonl(path, _openclaw_jsonl_entries())
+
+    record = _parse_openclaw_session(path)
+
+    assert record is not None
+    assert record.session_id == "oc-sid-1"
+    assert record.cwd == "/repo"
+    assert record.model == "openai/gpt-5.4"
+    assert record.started_at == "2026-04-27T00:00:00+00:00"
+    assert record.ended_at == "2026-04-27T00:01:00+00:00"
+    assert record.duration_s == 60.0
+    assert [msg["content"] for msg in record.messages] == ["hello", "hi back"]
+    assert len(record.tool_calls) == 1
+    assert record.tool_calls[0].tool_input == {"path": "README.md"}
+    assert record.tool_calls[0].tool_result == "contents"
+    assert record.is_sync is True
+
+
+def test_parse_openclaw_session_fallback_session_id_and_unknown_model(tmp_path):
+    path = tmp_path / "plain-name.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "timestamp": "2026-04-27T00:00:00+00:00",
+                "role": "user",
+                "content": "direct message",
+            }
+        ],
+    )
+
+    record = _parse_openclaw_session(path)
+
+    assert record is not None
+    assert record.session_id == _derive_session_id(path)
+    assert record.model == "openclaw-unknown"
+    assert record.messages[0]["content"] == "direct message"
+
+
+def test_parse_openclaw_session_pairs_tool_calls_without_ids(tmp_path):
+    path = tmp_path / "no-tool-ids.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "hook_name": "before_tool_call",
+                "received_at": "2026-04-27T00:00:00+00:00",
+                "event": {"toolName": "shell", "params": {"cmd": "pwd"}},
+            },
+            {
+                "hook_name": "after_tool_call",
+                "received_at": "2026-04-27T00:00:01+00:00",
+                "event": {"toolName": "shell", "result": "/repo"},
+            },
+        ],
+    )
+
+    record = _parse_openclaw_session(path)
+
+    assert record is not None
+    assert len(record.tool_calls) == 1
+    assert record.tool_calls[0].tool_input == {"cmd": "pwd"}
+    assert record.tool_calls[0].tool_result == "/repo"
+
+
+def test_parse_openclaw_native_message_records(tmp_path):
+    path = tmp_path / "native-openclaw.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "type": "session",
+                "id": "native-session",
+                "timestamp": "2026-04-30T11:26:17.167Z",
+                "cwd": "/native/repo",
+            },
+            {
+                "type": "model_change",
+                "timestamp": "2026-04-30T11:26:17.176Z",
+                "provider": "openai-codex",
+                "modelId": "gpt-5.5",
+            },
+            {
+                "type": "message",
+                "id": "u1",
+                "timestamp": "2026-04-30T11:26:18.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+            },
+            {
+                "type": "message",
+                "id": "a1",
+                "timestamp": "2026-04-30T11:26:19.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "hidden"},
+                        {
+                            "type": "toolCall",
+                            "id": "tc1",
+                            "name": "exec",
+                            "arguments": {"cmd": "pwd"},
+                        },
+                        {"type": "text", "text": "I'll check."},
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "id": "tr1",
+                "timestamp": "2026-04-30T11:26:20.000Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "tc1",
+                    "toolName": "exec",
+                    "content": [{"type": "text", "text": "/native/repo"}],
+                },
+            },
+        ],
+    )
+
+    record = _parse_openclaw_session(path)
+
+    assert record is not None
+    assert record.session_id == "native-session"
+    assert record.cwd == "/native/repo"
+    assert record.model == "gpt-5.5"
+    assert [msg["content"] for msg in record.messages] == ["hello", "I'll check."]
+    assert len(record.tool_calls) == 1
+    assert record.tool_calls[0].tool_name == "exec"
+    assert record.tool_calls[0].tool_input == {"cmd": "pwd"}
+    assert record.tool_calls[0].tool_result == "/native/repo"
+
+
+def test_parse_openclaw_session_empty_returns_none(tmp_path):
+    path = tmp_path / "empty.jsonl"
+    path.write_text("")
+    assert _parse_openclaw_session(path) is None
+
+
+# ---------------------------------------------------------------------------
 # Sync index
 # ---------------------------------------------------------------------------
 
@@ -588,7 +816,7 @@ def test_is_sync_serialized_in_asdict():
 
 
 def test_historical_parsers_set_is_sync_true(tmp_path):
-    """All three parsers must produce is_sync=True."""
+    """All parsers must produce is_sync=True."""
     # Claude
     claude_path = tmp_path / "aaaaaaaa-0000-0000-0000-000000000001.jsonl"
     _write_jsonl(claude_path, _claude_entries())
@@ -605,6 +833,26 @@ def test_historical_parsers_set_is_sync_true(tmp_path):
     codex_path = tmp_path / "rollout-2026-01-01T00-00-00-019c3486-6120-75f2-90b8-860c9a21dd85.jsonl"
     _write_jsonl(codex_path, _codex_jsonl_entries())
     assert _parse_codex_session(codex_path).is_sync is True
+
+    # OpenClaw
+    openclaw_path = tmp_path / "openclaw.jsonl"
+    _write_jsonl(openclaw_path, _openclaw_jsonl_entries())
+    assert _parse_openclaw_session(openclaw_path).is_sync is True
+
+
+def test_discover_sessions_includes_openclaw_provider(tmp_path):
+    with patch("rclm.hooks.historical_sync._iter_openclaw_sessions", return_value=[tmp_path]):
+        assert _discover_sessions(["openclaw"]) == {"openclaw": [tmp_path]}
+
+
+def test_parse_session_dispatches_openclaw(tmp_path):
+    path = tmp_path / "openclaw.jsonl"
+    _write_jsonl(path, _openclaw_jsonl_entries())
+    assert _parse_session("openclaw", path).session_id == "oc-sid-1"
+
+
+def test_default_provider_list_includes_openclaw():
+    assert "openclaw" in _HISTORICAL_PROVIDERS
 
 
 # ---------------------------------------------------------------------------

@@ -258,6 +258,31 @@ def test_gemini_global_flag_targets_home_dot_gemini(tmp_path, monkeypatch):
     assert not (tmp_path / ".claude" / "settings.json").exists()
 
 
+def test_openclaw_flag_installs_only_openclaw(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    installed: list[bool] = []
+
+    def fake_install_openclaw(use_global: bool) -> None:
+        installed.append(use_global)
+
+    monkeypatch.setattr(installer, "_install_openclaw", fake_install_openclaw)
+    _run_install(monkeypatch, tmp_path, "--openclaw")
+
+    assert installed == [False]
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".gemini" / "settings.json").exists()
+    assert not (tmp_path / ".codex" / "hooks.json").exists()
+
+
+def test_local_default_does_not_install_openclaw(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "_install_openclaw", lambda use_global: pytest.fail())
+
+    _run_install(monkeypatch, tmp_path)
+
+    assert (tmp_path / ".claude" / "settings.json").exists()
+
+
 # ---------------------------------------------------------------------------
 # Compression flag
 # ---------------------------------------------------------------------------

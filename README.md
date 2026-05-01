@@ -1,10 +1,10 @@
 # RCLM — Data Capture for AI Tools
 
-Every time you use an AI coding assistant, you produce valuable reasoning and code. **RCLM** (ReclaimLLM) ensures that data belongs to you. It is a lightweight capture layer that records your AI sessions from Claude Code, Gemini CLI, and Codex CLI, shipping them to your personal ReclaimLLM account for search, analysis, and continuation.
+Every time you use an AI coding assistant, you produce valuable reasoning and code. **RCLM** (ReclaimLLM) ensures that data belongs to you. It is a lightweight capture layer that records your AI sessions from Claude Code, Gemini CLI, Codex CLI, and OpenClaw, shipping them to your personal ReclaimLLM account for search, analysis, and continuation.
 
 ## Key Features
 
-- **Native Hooks:** Zero-config integration into Claude Code, Gemini CLI, and Codex CLI.
+- **Native Hooks:** Zero-config integration into Claude Code, Gemini CLI, Codex CLI, and OpenClaw.
 - **Historical Sync:** One-command backfill for all your past AI sessions.
 - **DLP & Privacy:** Automatic redaction of secrets from `.env` files before they reach the model.
 - **Context Conversion:** Export any captured session as a Markdown context document to continue work in a different tool.
@@ -22,7 +22,7 @@ pip install rclm
 
 ### 2. Setup Hooks
 ```bash
-# Integrates with Claude Code, Gemini CLI, and Codex CLI
+# Integrates with Claude Code, Gemini CLI, Codex CLI, and OpenClaw
 rclm-hooks-install
 ```
 This will open a browser to `reclaimllm.com` to link your account. Once linked, every session is automatically captured.

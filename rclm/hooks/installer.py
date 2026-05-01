@@ -1,16 +1,17 @@
-"""Merge rclm hooks into Claude Code, Gemini CLI, and/or Codex CLI settings.
+"""Merge rclm hooks into Claude Code, Gemini CLI, Codex CLI, and/or OpenClaw settings.
 
 Installs globally (home directory) by default. Pass --local to install into
 the current project directory instead.
 
-When no provider flag is given, all three providers are installed.
+When no provider flag is given, all providers are installed.
 
 Usage:
     rclm-hooks-install                            # all providers, global
-    rclm-hooks-install --local                    # all providers, current dir
+    rclm-hooks-install --local                    # file-based providers, current dir
     rclm-hooks-install --claude                   # Claude Code only, global
     rclm-hooks-install --gemini                   # Gemini CLI only, global
     rclm-hooks-install --codex                    # Codex CLI only, global
+    rclm-hooks-install --openclaw                 # OpenClaw only, global
     rclm-hooks-install --claude --codex           # Claude + Codex, global
     rclm-hooks-install --api-key=<key>            # explicit key (skips browser)
     rclm-hooks-install --compress                 # enable compression (Claude only)
@@ -133,11 +134,12 @@ def _parse_flags() -> argparse.Namespace:
         description="Install rclm hooks (all providers by default, global by default)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  %(prog)s                          # all providers, global (~/.claude, ~/.gemini, ~/.codex)
-  %(prog)s --local                  # all providers, current project directory
+  %(prog)s                          # all providers, global (~/.claude, ~/.gemini, ~/.codex, ~/.openclaw)
+  %(prog)s --local                  # file-based providers, current project directory
   %(prog)s --claude                 # Claude Code only
   %(prog)s --gemini                 # Gemini CLI only
   %(prog)s --codex                  # Codex CLI only
+  %(prog)s --openclaw               # OpenClaw only
   %(prog)s --claude --codex         # Claude Code + Codex CLI
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
   %(prog)s --compress               # enable compression for Claude Code
@@ -159,6 +161,11 @@ Subsequent installs without --api-key reuse the saved config.""",
         "--codex",
         action="store_true",
         help="Install hooks for OpenAI Codex CLI",
+    )
+    parser.add_argument(
+        "--openclaw",
+        action="store_true",
+        help="Install plugin hooks for OpenClaw",
     )
     parser.add_argument(
         "--local",
@@ -317,6 +324,18 @@ def _install_codex(use_global: bool) -> None:
     print(f"rclm hooks installed into {path}")
 
 
+def _install_openclaw(use_global: bool) -> None:
+    if not use_global:
+        print(
+            "Warning: OpenClaw plugin hooks are installed globally; ignoring --local for OpenClaw.",
+            file=sys.stderr,
+        )
+    from rclm.hooks.openclaw_plugin import install_plugin
+
+    path = install_plugin(use_global=True)
+    print(f"rclm OpenClaw plugin installed into {path}")
+
+
 # ---------------------------------------------------------------------------
 # JSON I/O helpers
 # ---------------------------------------------------------------------------
@@ -449,10 +468,19 @@ def _wait_for_api_key_via_browser(app_url: str) -> str | None:
 def main() -> None:
     args = _parse_flags()
 
-    # Determine which providers to install. Default: all three.
-    providers = [p for p in ("claude", "gemini", "codex") if getattr(args, p)]
+    # Determine which providers to install. --local defaults to file-based providers.
+    providers = [p for p in ("claude", "gemini", "codex", "openclaw") if getattr(args, p)]
     if not providers:
-        providers = ["claude", "gemini", "codex"]
+        providers = (
+            ["claude", "gemini", "codex"]
+            if args.local
+            else [
+                "claude",
+                "gemini",
+                "codex",
+                "openclaw",
+            ]
+        )
 
     use_global = not args.local
 
@@ -488,6 +516,8 @@ def main() -> None:
             _install_gemini(use_global)
         elif provider == "codex":
             _install_codex(use_global)
+        elif provider == "openclaw":
+            _install_openclaw(use_global)
 
     # Offer to sync existing sessions from all installed providers.
     try:

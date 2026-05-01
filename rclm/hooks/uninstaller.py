@@ -1,9 +1,9 @@
-"""Remove rclm hooks from Claude Code, Gemini CLI, and/or Codex CLI settings.
+"""Remove rclm hooks from Claude Code, Gemini CLI, Codex CLI, and/or OpenClaw settings.
 
 Removes any hook entries whose command starts with ``rclm-``.
 All other hooks are left untouched.
 
-When no provider flag is given, all three providers are targeted.
+When no provider flag is given, all providers are targeted.
 Targets the global home-directory config by default; pass --local for the
 current project directory.
 
@@ -13,6 +13,7 @@ Usage:
     rclm-hooks-uninstall --claude        # Claude Code only
     rclm-hooks-uninstall --gemini        # Gemini CLI only
     rclm-hooks-uninstall --codex         # Codex CLI only
+    rclm-hooks-uninstall --openclaw      # OpenClaw only
     rclm-hooks-uninstall --purge-config  # also delete ~/.reclaimllm/config.json
 """
 
@@ -40,6 +41,7 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --claude           # Claude Code only
   %(prog)s --gemini           # Gemini CLI only
   %(prog)s --codex            # Codex CLI only
+  %(prog)s --openclaw         # OpenClaw only
   %(prog)s --purge-config     # also delete ~/.reclaimllm/config.json""",
     )
 
@@ -57,6 +59,11 @@ def _parse_flags() -> argparse.Namespace:
         "--codex",
         action="store_true",
         help="Target Codex CLI hooks.json",
+    )
+    parser.add_argument(
+        "--openclaw",
+        action="store_true",
+        help="Target OpenClaw plugin hooks",
     )
     parser.add_argument(
         "--local",
@@ -143,6 +150,21 @@ def _uninstall_codex(path: Path) -> None:
     _uninstall_settings_provider(path)
 
 
+def _uninstall_openclaw(use_global: bool) -> None:
+    if not use_global:
+        print(
+            "Warning: OpenClaw plugin hooks are installed globally; ignoring --local for OpenClaw.",
+            file=sys.stderr,
+        )
+    from rclm.hooks.openclaw_plugin import uninstall_plugin
+
+    removed_files, removed_config = uninstall_plugin(use_global=True)
+    if removed_files or removed_config:
+        print("Removed rclm OpenClaw plugin hooks.")
+    else:
+        print("No rclm OpenClaw plugin hooks found.")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -151,9 +173,18 @@ def _uninstall_codex(path: Path) -> None:
 def main() -> None:
     args = _parse_flags()
 
-    providers = [p for p in ("claude", "gemini", "codex") if getattr(args, p)]
+    providers = [p for p in ("claude", "gemini", "codex", "openclaw") if getattr(args, p)]
     if not providers:
-        providers = ["claude", "gemini", "codex"]
+        providers = (
+            ["claude", "gemini", "codex"]
+            if args.local
+            else [
+                "claude",
+                "gemini",
+                "codex",
+                "openclaw",
+            ]
+        )
 
     use_global = not args.local
 
@@ -179,6 +210,8 @@ def main() -> None:
                 else Path(".codex") / "hooks.json"
             )
             _uninstall_codex(path)
+        elif provider == "openclaw":
+            _uninstall_openclaw(use_global)
 
     if args.purge_config:
         _purge_config()

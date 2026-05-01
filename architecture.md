@@ -18,6 +18,8 @@ rclm/
     ├── claude_handler.py   # Claude Code lifecycle event handler, entry point: rclm-claude-hooks
     ├── gemini_handler.py   # Gemini CLI lifecycle event handler, entry point: rclm-gemini-hooks
     ├── codex_handler.py    # Codex CLI lifecycle event handler, entry point: rclm-codex-hooks
+    ├── openclaw_handler.py # OpenClaw plugin lifecycle event handler, entry point: rclm-openclaw-hooks
+    ├── openclaw_plugin.py  # writes OpenClaw plugin files and config, used by installer
     ├── codex_transcript.py # Codex transcript parser -> normalized session data
     ├── compress.py         # PreToolUse compression engine (Read/Grep/Bash token reduction)
     ├── dlp.py              # DLP engine (secret redaction from env files before model context)
@@ -36,7 +38,8 @@ rclm-hooks-install --api-key=<key>
         ├── saves to ~/.reclaimllm/config.json
         │       { "server_url": "...", "api_key": "..." }
         │
-        └── writes clean hook commands into .claude/settings.json or .gemini/settings.json
+        └── writes clean hook commands into .claude/settings.json, .gemini/settings.json,
+            .codex/hooks.json, or ~/.openclaw/extensions/reclaimllm/
                 "command": "rclm-claude-hooks SessionStart"   (no inline credentials)
 
 At upload time (_uploader.upload):
@@ -122,6 +125,35 @@ Gemini CLI calls: rclm-gemini-hooks <EventName>   (stdin: JSON payload)
 |---|---|---|
 | `write_file` | `Write` | `FileDiff` (before=None) |
 | `replace` | `Edit` | `FileDiff` (before/after strings) |
+
+---
+
+## rclm-openclaw-hooks (OpenClaw)
+
+```
+OpenClaw plugin calls: rclm-openclaw-hooks <HookName>   (stdin: JSON payload)
+                        │
+          ┌─────────────┼────────────────────────────────────┐
+          │             │                                    │
+    session_start   llm_input / llm_output /       session_end
+                    before_tool_call / after_tool_call      │
+          │             │                                    ├── read session JSONL
+          └─────────────┘                                    ├── build HookSessionRecord
+                │                                            ├── _uploader.upload_single(max_retries=1)
+        append event to                                      └── cleanup session JSONL
+        ~/.reclaimllm/sessions/{sid}.jsonl
+```
+
+OpenClaw integration is plugin-first. `rclm-hooks-install --openclaw`
+writes a minimal TypeScript plugin to `~/.openclaw/extensions/reclaimllm/`
+and patches `~/.openclaw/openclaw.json` when it is strict JSON. If the
+OpenClaw config uses JSON5 comments or other non-JSON syntax, RCLM writes the
+plugin files but leaves config untouched and prints a warning.
+
+OpenClaw v1 is capture-only: it observes session, LLM, message, and tool hook
+events, then uploads on `session_end`. It does not mutate tool inputs/outputs,
+run DLP blocking, or enable compression until OpenClaw response contracts are
+validated against real payloads.
 
 ---
 
@@ -269,14 +301,15 @@ param so users can bypass the fast path when needed.
 ## rclm-hooks-install
 
 ```
-rclm-hooks-install [--claude] [--gemini] [--codex] [--local] [--api-key=<key>] [--server-url=<url>] [--compress] [--dlp]
+rclm-hooks-install [--claude] [--gemini] [--codex] [--openclaw] [--local] [--api-key=<key>] [--server-url=<url>] [--compress] [--dlp]
         │
         ├── resolve credentials: --api-key flag → saved config → prompt with SETUP_URL + exit 1
         ├── _config.save(server_url, api_key)     # persist for uploader + future installs
         │
         ├── [--claude]  → target .claude/settings.json, inject rclm-claude-hooks commands
         ├── [--gemini]  → target .gemini/settings.json, inject rclm-gemini-hooks commands
-        └── [--codex]   → target .codex/hooks.json,     inject rclm-codex-hooks commands
+        ├── [--codex]   → target .codex/hooks.json,     inject rclm-codex-hooks commands
+        └── [--openclaw] → target ~/.openclaw/extensions/reclaimllm/, write plugin files
                 │
                 └── _merge_hooks(): deep-merge, skip duplicate commands (idempotent)
 ```

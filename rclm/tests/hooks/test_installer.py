@@ -274,6 +274,18 @@ def test_openclaw_flag_installs_only_openclaw(tmp_path, monkeypatch):
     assert not (tmp_path / ".codex" / "hooks.json").exists()
 
 
+def test_cursor_all_expected_events_present(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
+
+    _run_install(monkeypatch, tmp_path, "--cursor")
+
+    settings = _read_settings(tmp_path / ".cursor" / "hooks.json")
+    assert set(settings["hooks"]) == set(installer._CURSOR_HOOKS_TO_INJECT)
+    for event, entries in installer._CURSOR_HOOKS_TO_INJECT.items():
+        assert settings["hooks"][event] == entries
+
+
 def test_local_default_does_not_install_openclaw(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(installer, "_install_openclaw", lambda use_global: pytest.fail())

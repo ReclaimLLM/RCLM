@@ -29,8 +29,13 @@ from rclm._models import (
     SessionRecord,
     ToolCall,
 )
-from rclm._uploader import _FAILED_UPLOADS_DIR, AnyRecord, close_session, upload_single
-from rclm.hooks import codex_transcript, openclaw_transcript
+from rclm._uploader import (
+    _FAILED_UPLOADS_DIR,
+    AnyRecord,
+    close_session,
+    upload_single,
+)
+from rclm.hooks import codex_transcript, cursor_transcript, openclaw_transcript
 from rclm.hooks import transcript as claude_transcript
 from rclm.hooks._analytics import compute_session_analytics
 
@@ -43,7 +48,8 @@ _FAILED_UPLOAD_MAX_RETRIES = 1
 # ---------------------------------------------------------------------------
 
 _SYNCED_INDEX = Path.home() / ".reclaimllm" / "synced_sessions.json"
-_HISTORICAL_PROVIDERS = ("claude", "gemini", "codex", "openclaw")
+_HISTORICAL_PROVIDERS = ("claude", "gemini", "codex", "cursor", "openclaw")
+CURSOR_MODEL_DEFAULT = "cursor-unknown"
 
 
 def _load_synced_index() -> set[str]:
@@ -102,6 +108,37 @@ def _iter_codex_sessions() -> list[Path]:
     if not base.exists():
         return []
     return [f for f in base.rglob("*.jsonl") if f.is_file()]
+
+
+def _iter_cursor_sessions() -> list[Path]:
+    """Yield Cursor agent transcript files.
+
+    Pattern: ~/.cursor/projects/[project]/agent-transcripts/[session-id]/[session-id].jsonl
+    """
+    base = Path.home() / ".cursor" / "projects"
+    if not base.exists():
+        return []
+
+    files = []
+    # Cursor organizes by project first
+    for project_dir in base.iterdir():
+        if not project_dir.is_dir():
+            continue
+        # Then agent-transcripts
+        transcripts_dir = project_dir / "agent-transcripts"
+        if not transcripts_dir.exists():
+            continue
+
+        # Then by session-id directory
+        for session_dir in transcripts_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            # Finally the jsonl file named after the session-id
+            session_id = session_dir.name
+            f = session_dir / f"{session_id}.jsonl"
+            if f.is_file():
+                files.append(f)
+    return files
 
 
 def _openclaw_canonical_path(path: Path) -> Path:
@@ -605,6 +642,44 @@ def _parse_codex_session(path: Path) -> HookSessionRecord | None:
     )
 
 
+def _parse_cursor_session(path: Path) -> HookSessionRecord | None:
+    """Parse a Cursor JSONL transcript file into a HookSessionRecord."""
+    transcript_data = cursor_transcript.parse_transcript(str(path))
+    if not transcript_data.messages and not transcript_data.tool_calls:
+        return None
+
+    session_id = transcript_data.session_id or _derive_session_id(path)
+
+    # Cursor transcripts should have timestamps in messages
+    timestamps = [msg["timestamp"] for msg in transcript_data.messages if msg.get("timestamp")]
+    started_at = min(timestamps) if timestamps else None
+    ended_at = max(timestamps) if timestamps else None
+    duration_s = _timestamps_to_duration(started_at, ended_at)
+
+    analytics = compute_session_analytics(transcript_data.tool_calls, [])
+
+    return HookSessionRecord(
+        session_id=session_id,
+        cwd=transcript_data.cwd
+        or path.parent.parent.parent.name,  # ~/.cursor/projects/<project>/agent-transcripts/id/id.jsonl
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_s=duration_s,
+        transcript_path=str(path),
+        model=transcript_data.model or CURSOR_MODEL_DEFAULT,
+        messages=transcript_data.messages,
+        tool_calls=transcript_data.tool_calls,
+        file_diffs=[],
+        total_input_tokens=transcript_data.total_input_tokens,
+        total_output_tokens=transcript_data.total_output_tokens,
+        tool_token_stats=analytics.get("tool_token_stats"),
+        tool_call_count=analytics.get("tool_call_count"),
+        unique_files_modified=analytics.get("unique_files_modified"),
+        dominant_tool=analytics.get("dominant_tool"),
+        is_sync=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # OpenClaw parsing
 # ---------------------------------------------------------------------------
@@ -778,6 +853,8 @@ def _discover_sessions(providers: list[str]) -> dict[str, list[Path]]:
         result["gemini"] = _iter_gemini_sessions()
     if "codex" in providers:
         result["codex"] = _iter_codex_sessions()
+    if "cursor" in providers:
+        result["cursor"] = _iter_cursor_sessions()
     if "openclaw" in providers:
         result["openclaw"] = _iter_openclaw_sessions()
     return result
@@ -791,6 +868,8 @@ def _parse_session(provider: str, path: Path) -> HookSessionRecord | None:
             return _parse_gemini_session(path)
         if provider == "codex":
             return _parse_codex_session(path)
+        if provider == "cursor":
+            return _parse_cursor_session(path)
         if provider == "openclaw":
             return _parse_openclaw_session(path)
     except Exception:
@@ -955,6 +1034,7 @@ def sync_main() -> None:
     parser.add_argument("--gemini", action="store_true", help="Sync Gemini CLI sessions")
     parser.add_argument("--codex", action="store_true", help="Sync Codex CLI sessions")
     parser.add_argument("--openclaw", action="store_true", help="Sync OpenClaw sessions")
+    parser.add_argument("--cursor", action="store_true", help="Sync Cursor sessions")
     parser.add_argument(
         "--yes",
         "-y",

@@ -1,5 +1,22 @@
 # Changelog
 
+## [v0.1.12] — 2026-05-05
+
+### Added
+- Added Cursor hook CLI entry point and installer support for `.cursor/hooks.json` (`pyproject.toml`, `rclm/hooks/installer.py`)
+- Added registration for all documented Cursor hook events, including agent, tool, shell, MCP, file edit, Tab edit, session, and compaction hooks (`rclm/hooks/installer.py`)
+- Added Cursor historical sync discovery and parsing for `~/.cursor/projects/*/agent-transcripts/*/*.jsonl` (`rclm/hooks/historical_sync.py`)
+
+### Changed
+- Updated default hook installation and CLI help to include Cursor alongside Claude, Gemini, Codex, and OpenClaw (`rclm/hooks/installer.py`)
+- Extended hook command absolute-path rewriting and merge logic to support Cursor's flat hook schema (`rclm/hooks/installer.py`)
+- Extended historical sync provider dispatch and CLI flags to include `--cursor` (`rclm/hooks/historical_sync.py`)
+
+### Fixed
+- Fixed Cursor historical sync fallback model to use `cursor-unknown` instead of a Claude-derived default (`rclm/hooks/historical_sync.py`)
+
+---
+
 ## [v0.1.11] — 2026-05-01
 
 ### Added

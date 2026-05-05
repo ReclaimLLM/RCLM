@@ -124,6 +124,30 @@ _CODEX_HOOKS_TO_INJECT: dict[str, list[dict]] = {
     "Stop": [{"hooks": [{"type": "command", "command": "rclm-codex-hooks Stop"}]}],
 }
 
+# Cursor hooks.json format: {"version": 1, "hooks": {"event": [{"command": "..."}]}}
+_CURSOR_HOOKS_TO_INJECT: dict[str, list[dict]] = {
+    "preToolUse": [{"command": "rclm-cursor-hooks preToolUse"}],
+    "postToolUse": [{"command": "rclm-cursor-hooks postToolUse"}],
+    "postToolUseFailure": [{"command": "rclm-cursor-hooks postToolUseFailure"}],
+    "subagentStart": [{"command": "rclm-cursor-hooks subagentStart"}],
+    "subagentStop": [{"command": "rclm-cursor-hooks subagentStop"}],
+    "beforeSubmitPrompt": [{"command": "rclm-cursor-hooks beforeSubmitPrompt"}],
+    "beforeShellExecution": [{"command": "rclm-cursor-hooks beforeShellExecution"}],
+    "beforeMCPExecution": [{"command": "rclm-cursor-hooks beforeMCPExecution"}],
+    "afterShellExecution": [{"command": "rclm-cursor-hooks afterShellExecution"}],
+    "afterMCPExecution": [{"command": "rclm-cursor-hooks afterMCPExecution"}],
+    "afterFileEdit": [{"command": "rclm-cursor-hooks afterFileEdit"}],
+    "beforeReadFile": [{"command": "rclm-cursor-hooks beforeReadFile"}],
+    "beforeTabFileRead": [{"command": "rclm-cursor-hooks beforeTabFileRead"}],
+    "afterTabFileEdit": [{"command": "rclm-cursor-hooks afterTabFileEdit"}],
+    "afterAgentResponse": [{"command": "rclm-cursor-hooks afterAgentResponse"}],
+    "afterAgentThought": [{"command": "rclm-cursor-hooks afterAgentThought"}],
+    "stop": [{"command": "rclm-cursor-hooks stop"}],
+    "sessionStart": [{"command": "rclm-cursor-hooks sessionStart"}],
+    "sessionEnd": [{"command": "rclm-cursor-hooks sessionEnd"}],
+    "preCompact": [{"command": "rclm-cursor-hooks preCompact"}],
+}
+
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -134,13 +158,14 @@ def _parse_flags() -> argparse.Namespace:
         description="Install rclm hooks (all providers by default, global by default)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  %(prog)s                          # all providers, global (~/.claude, ~/.gemini, ~/.codex, ~/.openclaw)
+  %(prog)s                          # all providers, global (~/.claude, ~/.gemini, ~/.codex, ~/.openclaw, ~/.cursor)
   %(prog)s --local                  # file-based providers, current project directory
   %(prog)s --claude                 # Claude Code only
-  %(prog)s --gemini                 # Gemini CLI only
+  %(prog)s --gemini                   # Gemini CLI only
   %(prog)s --codex                  # Codex CLI only
+  %(prog)s --cursor                 # Cursor only
   %(prog)s --openclaw               # OpenClaw only
-  %(prog)s --claude --codex         # Claude Code + Codex CLI
+  %(prog)s --claude --cursor         # Claude Code + Cursor
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
   %(prog)s --compress               # enable compression for Claude Code
 
@@ -161,6 +186,11 @@ Subsequent installs without --api-key reuse the saved config.""",
         "--codex",
         action="store_true",
         help="Install hooks for OpenAI Codex CLI",
+    )
+    parser.add_argument(
+        "--cursor",
+        action="store_true",
+        help="Install hooks for Cursor IDE",
     )
     parser.add_argument(
         "--openclaw",
@@ -211,17 +241,26 @@ def _resolve_binary(name: str) -> str:
     return name
 
 
-def _with_absolute_binary(hooks_to_inject: dict, binary_name: str, resolved: str) -> dict:
+def _with_absolute_binary(
+    hooks_to_inject: dict, binary_name: str, resolved: str, is_cursor: bool = False
+) -> dict:
     """Return a deep copy of hooks_to_inject with bare binary name replaced by absolute path."""
     if resolved == binary_name:
         return hooks_to_inject
     result = copy.deepcopy(hooks_to_inject)
-    for entries in result.values():
-        for entry in entries:
-            for hook in entry.get("hooks", []):
+    if is_cursor:
+        for entries in result.values():
+            for hook in entries:
                 cmd = hook.get("command", "")
                 if cmd == binary_name or cmd.startswith(binary_name + " "):
                     hook["command"] = resolved + cmd[len(binary_name) :]
+    else:
+        for entries in result.values():
+            for entry in entries:
+                for hook in entry.get("hooks", []):
+                    cmd = hook.get("command", "")
+                    if cmd == binary_name or cmd.startswith(binary_name + " "):
+                        hook["command"] = resolved + cmd[len(binary_name) :]
     return result
 
 
@@ -268,6 +307,19 @@ def _merge_settings_hooks(settings: dict, hooks_to_inject: dict) -> dict:
                     existing_entries.append(entry)
                     break
     return settings
+
+
+def _merge_cursor_hooks(data: dict, hooks_to_inject: dict) -> dict:
+    """Merge hooks into a Cursor hooks.json dict, skipping duplicates."""
+    data.setdefault("version", 1)
+    hooks_section: dict = data.setdefault("hooks", {})
+    for event_name, new_entries in hooks_to_inject.items():
+        existing_entries: list[dict] = hooks_section.setdefault(event_name, [])
+        for new_hook in new_entries:
+            cmd = new_hook.get("command", "")
+            if not any(h.get("command") == cmd for h in existing_entries):
+                existing_entries.append(new_hook)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +372,21 @@ def _install_codex(use_global: bool) -> None:
 
     data = _load_json(path)
     _merge_settings_hooks(data, hooks)
+    _write_json(path, data)
+    print(f"rclm hooks installed into {path}")
+
+
+def _install_cursor(use_global: bool) -> None:
+    path = Path.home() / ".cursor" / "hooks.json" if use_global else Path(".cursor") / "hooks.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    binary = _resolve_binary("rclm-cursor-hooks")
+    hooks = _with_absolute_binary(
+        _CURSOR_HOOKS_TO_INJECT, "rclm-cursor-hooks", binary, is_cursor=True
+    )
+
+    data = _load_json(path)
+    _merge_cursor_hooks(data, hooks)
     _write_json(path, data)
     print(f"rclm hooks installed into {path}")
 
@@ -469,15 +536,16 @@ def main() -> None:
     args = _parse_flags()
 
     # Determine which providers to install. --local defaults to file-based providers.
-    providers = [p for p in ("claude", "gemini", "codex", "openclaw") if getattr(args, p)]
+    providers = [p for p in ("claude", "gemini", "codex", "cursor", "openclaw") if getattr(args, p)]
     if not providers:
         providers = (
-            ["claude", "gemini", "codex"]
+            ["claude", "gemini", "codex", "cursor"]
             if args.local
             else [
                 "claude",
                 "gemini",
                 "codex",
+                "cursor",
                 "openclaw",
             ]
         )
@@ -516,6 +584,8 @@ def main() -> None:
             _install_gemini(use_global)
         elif provider == "codex":
             _install_codex(use_global)
+        elif provider == "cursor":
+            _install_cursor(use_global)
         elif provider == "openclaw":
             _install_openclaw(use_global)
 

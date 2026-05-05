@@ -13,10 +13,12 @@ from rclm.hooks.historical_sync import (
     _HISTORICAL_PROVIDERS,
     _derive_session_id,
     _discover_sessions,
+    _iter_cursor_sessions,
     _iter_openclaw_sessions,
     _load_synced_index,
     _parse_claude_session,
     _parse_codex_session,
+    _parse_cursor_session,
     _parse_gemini_session,
     _parse_openclaw_session,
     _parse_session,
@@ -130,6 +132,26 @@ def test_iter_openclaw_sessions_selects_latest_reset(tmp_path):
         result = _iter_openclaw_sessions()
 
     assert result == [newer, other]
+
+
+def test_iter_cursor_sessions(tmp_path):
+    # ~/.cursor/projects/[project]/agent-transcripts/[session-id]/[session-id].jsonl
+    cursor = tmp_path / ".cursor" / "projects"
+    project = cursor / "my-project"
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+    session_dir = project / "agent-transcripts" / session_id
+    session_dir.mkdir(parents=True)
+    f = session_dir / f"{session_id}.jsonl"
+    f.touch()
+
+    with patch("rclm.hooks.historical_sync.Path") as MockPath:
+        # Patch both Path.home() and Path.rglob if needed, but here we just need home
+        MockPath.home.return_value = tmp_path
+        MockPath.side_effect = lambda *a, **kw: Path(*a, **kw)
+        result = _iter_cursor_sessions()
+
+    assert len(result) == 1
+    assert result[0] == f
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +521,66 @@ def test_parse_codex_session_fallback_session_id(tmp_path):
     record = _parse_codex_session(path)
     assert record is not None
     assert record.session_id == "019c3486-6120-75f2-90b8-860c9a21dd85"
+
+
+# ---------------------------------------------------------------------------
+# Cursor session parsing
+# ---------------------------------------------------------------------------
+
+
+def _cursor_jsonl_entries():
+    return [
+        {
+            "type": "session_meta",
+            "conversation_id": "cursor-sid-1",
+            "cwd": "/repo",
+            "model": "claude-3-opus",
+        },
+        {
+            "type": "user",
+            "text": "hello",
+            "timestamp": "2024-01-01T00:00:00Z",
+        },
+        {
+            "type": "assistant",
+            "text": "hi back",
+            "timestamp": "2024-01-01T00:00:01Z",
+            "usage": {"input": 10, "output": 5},
+        },
+    ]
+
+
+def test_parse_cursor_session_basic(tmp_path):
+    path = tmp_path / "cursor-sid-1.jsonl"
+    _write_jsonl(path, _cursor_jsonl_entries())
+    record = _parse_cursor_session(path)
+    assert record is not None
+    assert record.session_id == "cursor-sid-1"
+    assert record.cwd == "/repo"
+    assert record.model == "claude-3-opus"
+    assert len(record.messages) == 2
+    assert record.total_input_tokens == 10
+    assert record.total_output_tokens == 5
+    assert record.is_sync is True
+
+
+def test_parse_cursor_session_uses_cursor_unknown_fallback_model(tmp_path):
+    path = tmp_path / "cursor-no-model.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "type": "user",
+                "text": "hello",
+                "timestamp": "2024-01-01T00:00:00Z",
+            }
+        ],
+    )
+
+    record = _parse_cursor_session(path)
+
+    assert record is not None
+    assert record.model == "cursor-unknown"
 
 
 # ---------------------------------------------------------------------------

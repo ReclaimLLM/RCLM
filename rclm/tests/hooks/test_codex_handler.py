@@ -205,6 +205,7 @@ def test_codex_transcript_parses_messages_tools_and_diffs(tmp_path):
     assert len(data.file_diffs) == 1
     assert data.file_diffs[0].path == "foo.txt"
     assert data.file_diffs[0].after == "hello"
+    assert data.file_diffs[0].timestamp == "2026-03-30T12:00:05Z"
 
 
 def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
@@ -242,6 +243,7 @@ def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
     assert data.file_diffs[0].path == "/repo/new.txt"
     assert data.file_diffs[0].before is None
     assert data.file_diffs[0].after == "first\nsecond"
+    assert data.file_diffs[0].timestamp == "2026-04-07T12:52:34.670Z"
 
 
 def test_codex_stop_prefers_transcript_data(monkeypatch, tmp_path):

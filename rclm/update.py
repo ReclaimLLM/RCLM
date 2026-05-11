@@ -7,6 +7,7 @@ any new hook commands take effect immediately.
 Usage:
     rclm-update          # check and upgrade if needed
     rclm-update --check  # print status only, do not upgrade
+    rclm-update --with-mcp  # upgrade if needed and install MCP config
 """
 
 from __future__ import annotations
@@ -38,14 +39,29 @@ def _parse_flags() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   %(prog)s           # upgrade if a newer version is available
-  %(prog)s --check   # print status only, do not upgrade""",
+  %(prog)s --check   # print status only, do not upgrade
+  %(prog)s --with-mcp # also install ReclaimLLM MCP server config""",
     )
     parser.add_argument(
         "--check",
         action="store_true",
         help="Print the current and latest version without upgrading",
     )
+    parser.add_argument(
+        "--with-mcp",
+        action="store_true",
+        help="Install ReclaimLLM MCP server config after update check/upgrade",
+    )
     return parser.parse_args()
+
+
+def _install_mcp_config() -> None:
+    try:
+        from rclm.mcp_install import install_mcp
+
+        install_mcp(use_global=True)
+    except Exception as exc:
+        print(f"MCP install failed: {exc}", file=sys.stderr)
 
 
 def main() -> None:
@@ -58,12 +74,16 @@ def main() -> None:
 
     if latest is None:
         print(f"rclm is up to date ({current}).")
+        if args.with_mcp:
+            _install_mcp_config()
         return
 
     print(f"Current: {current}  →  Latest: {latest}")
 
     if args.check:
         print("\nRun rclm-update to upgrade.")
+        if args.with_mcp:
+            print("Skipping MCP install because --check was used.")
         return
 
     print()
@@ -107,3 +127,6 @@ def main() -> None:
             "Run rclm-hooks-install to refresh hook configs manually.",
             file=sys.stderr,
         )
+
+    if args.with_mcp:
+        _install_mcp_config()

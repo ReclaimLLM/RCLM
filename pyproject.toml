@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 urls = { Homepage = "https://reclaimllm.com" }
-dependencies = ["aiohttp>=3.9,<4"]
+dependencies = ["aiohttp>=3.9,<4", "mcp>=1.0,<2"]
 
 [project.optional-dependencies]
 proxy = ["litellm[proxy]>=1.40,<1.82", "prisma>=0.11,<2.0"]
@@ -50,6 +50,7 @@ rclm-hooks-uninstall = "rclm.hooks.uninstaller:main"
 rclm-sync = "rclm.hooks.historical_sync:sync_main"
 rclm-update = "rclm.update:main"
 rclm-compress = "rclm.compress.cli:main"
+rclm-mcp = "rclm.mcp_server:main"
 
 [tool.ruff]
 line-length = 100

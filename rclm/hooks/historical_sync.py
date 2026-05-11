@@ -272,6 +272,7 @@ def _extract_claude_file_diffs(tool_calls: list[ToolCall]) -> list[FileDiff]:
                     before=None,
                     after=content,
                     unified_diff=unified,
+                    timestamp=tc.timestamp,
                 )
             )
         elif name == "Edit":
@@ -286,7 +287,15 @@ def _extract_claude_file_diffs(tool_calls: list[ToolCall]) -> list[FileDiff]:
                     tofile=f"b/{file_path}",
                 )
             )
-            diffs.append(FileDiff(path=file_path, before=old, after=new, unified_diff=unified))
+            diffs.append(
+                FileDiff(
+                    path=file_path,
+                    before=old,
+                    after=new,
+                    unified_diff=unified,
+                    timestamp=tc.timestamp,
+                )
+            )
         elif name == "MultiEdit":
             file_path = inp.get("file_path", "")
             for edit in inp.get("edits", []):
@@ -306,6 +315,7 @@ def _extract_claude_file_diffs(tool_calls: list[ToolCall]) -> list[FileDiff]:
                         before=old,
                         after=new,
                         unified_diff=unified,
+                        timestamp=tc.timestamp,
                     )
                 )
     return diffs
@@ -437,7 +447,7 @@ def _extract_gemini_tool_result(result: object) -> str | None:
     return None
 
 
-def _extract_gemini_file_diffs(tool_name: str, args: object) -> list[FileDiff]:
+def _extract_gemini_file_diffs(tool_name: str, args: object, timestamp: str = "") -> list[FileDiff]:
     if not isinstance(args, dict):
         return []
     diffs: list[FileDiff] = []
@@ -452,7 +462,15 @@ def _extract_gemini_file_diffs(tool_name: str, args: object) -> list[FileDiff]:
                 tofile=f"b/{file_path}",
             )
         )
-        diffs.append(FileDiff(path=file_path, before=None, after=content, unified_diff=unified))
+        diffs.append(
+            FileDiff(
+                path=file_path,
+                before=None,
+                after=content,
+                unified_diff=unified,
+                timestamp=timestamp,
+            )
+        )
     elif tool_name == "replace":
         file_path = args.get("file_path", "")
         old = args.get("old_string", "")
@@ -465,7 +483,15 @@ def _extract_gemini_file_diffs(tool_name: str, args: object) -> list[FileDiff]:
                 tofile=f"b/{file_path}",
             )
         )
-        diffs.append(FileDiff(path=file_path, before=old, after=new, unified_diff=unified))
+        diffs.append(
+            FileDiff(
+                path=file_path,
+                before=old,
+                after=new,
+                unified_diff=unified,
+                timestamp=timestamp,
+            )
+        )
     return diffs
 
 
@@ -546,7 +572,7 @@ def _parse_gemini_session(path: Path) -> HookSessionRecord | None:
                         timestamp=tc_timestamp,
                     )
                 )
-                file_diffs.extend(_extract_gemini_file_diffs(tool_name, args))
+                file_diffs.extend(_extract_gemini_file_diffs(tool_name, args, tc_timestamp))
                 tool_counter += 1
 
     if not messages and not tool_calls:

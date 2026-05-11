@@ -88,7 +88,7 @@ def _extract(entries: list[dict]) -> CodexTranscriptData:
                     # at parse time instead of leaking raw Codex patch text upward.
                     patch_text = call.tool_input.get("input", "")
                     if isinstance(patch_text, str) and patch_text:
-                        data.file_diffs.extend(_parse_apply_patch(patch_text))
+                        data.file_diffs.extend(_parse_apply_patch(patch_text, timestamp))
         elif response_type == "function_call_output":
             call_id = payload.get("call_id", "")
             call = pending_calls.get(call_id)
@@ -213,7 +213,7 @@ def _parse_tool_input(arguments: object) -> dict:
     return parsed if isinstance(parsed, dict) else {"input": parsed}
 
 
-def _parse_apply_patch(patch_text: str) -> list[FileDiff]:
+def _parse_apply_patch(patch_text: str, timestamp: str = "") -> list[FileDiff]:
     """Parse one Codex ``apply_patch`` input string into FileDiff objects."""
     diffs: list[FileDiff] = []
     files: list[tuple[str, str, list[str]]] = []
@@ -251,9 +251,25 @@ def _parse_apply_patch(patch_text: str) -> list[FileDiff]:
     for path, op, content in files:
         if op == "add":
             after = "\n".join(line[1:] for line in content if line.startswith("+"))
-            diffs.append(FileDiff(path=path, before=None, after=after, unified_diff=""))
+            diffs.append(
+                FileDiff(
+                    path=path,
+                    before=None,
+                    after=after,
+                    unified_diff="",
+                    timestamp=timestamp,
+                )
+            )
         elif op == "delete":
-            diffs.append(FileDiff(path=path, before=None, after=None, unified_diff=""))
+            diffs.append(
+                FileDiff(
+                    path=path,
+                    before=None,
+                    after=None,
+                    unified_diff="",
+                    timestamp=timestamp,
+                )
+            )
         else:
             before_parts: list[str] = []
             after_parts: list[str] = []
@@ -271,6 +287,7 @@ def _parse_apply_patch(patch_text: str) -> list[FileDiff]:
                     before="\n".join(before_parts),
                     after="\n".join(after_parts),
                     unified_diff="",
+                    timestamp=timestamp,
                 )
             )
 

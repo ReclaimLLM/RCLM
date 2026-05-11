@@ -15,6 +15,7 @@ Usage:
     rclm-hooks-install --claude --codex           # Claude + Codex, global
     rclm-hooks-install --api-key=<key>            # explicit key (skips browser)
     rclm-hooks-install --compress                 # enable compression (Claude only)
+    rclm-hooks-install --with-mcp                 # also install ReclaimLLM MCP server
 
 Credentials are stored in ~/.reclaimllm/config.json and reused on subsequent runs.
 """
@@ -168,6 +169,7 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --claude --cursor         # Claude Code + Cursor
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
   %(prog)s --compress               # enable compression for Claude Code
+  %(prog)s --with-mcp               # also register the ReclaimLLM MCP server
 
 Subsequent installs without --api-key reuse the saved config.""",
     )
@@ -221,6 +223,11 @@ Subsequent installs without --api-key reuse the saved config.""",
         action="store_true",
         help="Enable Data Loss Prevention: redact secrets from .env files before they reach the model",
     )
+    parser.add_argument(
+        "--with-mcp",
+        action="store_true",
+        help="Also install the ReclaimLLM MCP server into supported local MCP clients",
+    )
 
     return parser.parse_args()
 
@@ -264,6 +271,17 @@ def _with_absolute_binary(
     return result
 
 
+def _is_rclm_command(command: str) -> bool:
+    """Check if a command is an rclm hook command, regardless of path or spaces."""
+    if not command:
+        return False
+    # More robust check that handles spaces in paths by looking for the known binary names.
+    for name in ["rclm-claude-hooks", "rclm-gemini-hooks", "rclm-codex-hooks", "rclm-cursor-hooks"]:
+        if name in command:
+            return True
+    return False
+
+
 def _command_already_present(existing_entries: list[dict], command: str, matcher: str = "") -> bool:
     """Check if a command is already registered for the given matcher."""
     for entry in existing_entries:
@@ -295,29 +313,61 @@ def _remove_rtk_hooks(settings: dict) -> dict:
 
 
 def _merge_settings_hooks(settings: dict, hooks_to_inject: dict) -> dict:
-    """Merge hooks into a settings.json dict (Claude Code / Gemini format), skipping duplicates."""
+    """Merge hooks into a settings.json dict (Claude Code / Gemini format), replacing ALL existing rclm hooks for a matcher."""
     hooks_section: dict = settings.setdefault("hooks", {})
     for event_name, new_entries in hooks_to_inject.items():
         existing_entries: list[dict] = hooks_section.setdefault(event_name, [])
-        for entry in new_entries:
-            matcher = entry.get("matcher", "")
-            for hook in entry.get("hooks", []):
-                command = hook.get("command", "")
-                if not _command_already_present(existing_entries, command, matcher):
-                    existing_entries.append(entry)
-                    break
+        for new_entry in new_entries:
+            matcher = new_entry.get("matcher", "")
+            # Assume each rclm entry has exactly one hook in the list based on definitions above.
+            new_hook = new_entry.get("hooks", [{}])[0]
+            new_command = new_hook.get("command", "")
+
+            # 1. Identify all entries that contain rclm commands for this matcher
+            rclm_indices = []
+            for i, entry in enumerate(existing_entries):
+                if entry.get("matcher", "") != matcher:
+                    continue
+                if any(_is_rclm_command(h.get("command", "")) for h in entry.get("hooks", [])):
+                    rclm_indices.append(i)
+
+            if rclm_indices:
+                # Update the FIRST one found with the new command/path
+                first_idx = rclm_indices[0]
+                for hook in existing_entries[first_idx].get("hooks", []):
+                    if _is_rclm_command(hook.get("command", "")):
+                        hook["command"] = new_command
+
+                # REMOVE any subsequent rclm entries for the same matcher to clean up duplicates
+                for idx in reversed(rclm_indices[1:]):
+                    existing_entries.pop(idx)
+            else:
+                # Add new if none existed
+                existing_entries.append(new_entry)
     return settings
 
 
 def _merge_cursor_hooks(data: dict, hooks_to_inject: dict) -> dict:
-    """Merge hooks into a Cursor hooks.json dict, skipping duplicates."""
+    """Merge hooks into a Cursor hooks.json dict, replacing ALL existing rclm hooks for an event."""
     data.setdefault("version", 1)
     hooks_section: dict = data.setdefault("hooks", {})
     for event_name, new_entries in hooks_to_inject.items():
         existing_entries: list[dict] = hooks_section.setdefault(event_name, [])
         for new_hook in new_entries:
-            cmd = new_hook.get("command", "")
-            if not any(h.get("command") == cmd for h in existing_entries):
+            new_command = new_hook.get("command", "")
+
+            # Identify all existing rclm hooks for this event
+            rclm_indices = [
+                i for i, h in enumerate(existing_entries) if _is_rclm_command(h.get("command", ""))
+            ]
+
+            if rclm_indices:
+                # Update the first one
+                existing_entries[rclm_indices[0]]["command"] = new_command
+                # Remove any duplicates
+                for idx in reversed(rclm_indices[1:]):
+                    existing_entries.pop(idx)
+            else:
                 existing_entries.append(new_hook)
     return data
 
@@ -588,6 +638,17 @@ def main() -> None:
             _install_cursor(use_global)
         elif provider == "openclaw":
             _install_openclaw(use_global)
+
+    if args.with_mcp:
+        try:
+            from rclm.mcp_install import install_mcp
+
+            install_mcp(use_global=use_global)
+        except Exception as exc:
+            print(
+                f"Warning: MCP install failed ({exc}). Hooks were installed.",
+                file=sys.stderr,
+            )
 
     # Offer to sync existing sessions from all installed providers.
     try:

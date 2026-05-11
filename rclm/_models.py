@@ -38,6 +38,7 @@ class FileDiff:
     before: str | None  # None if file didn't exist before
     after: str | None  # None if file deleted
     unified_diff: str  # output of difflib.unified_diff
+    timestamp: str = ""  # ISO-8601 timestamp for the edit/tool event
 
 
 @dataclass

@@ -1,5 +1,28 @@
 # Changelog
 
+All notable changes to this project are documented here.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+## [v0.1.13] — 2026-05-11
+
+### Added
+- Added ReclaimLLM MCP server (`rclm-mcp`) providing `search_sessions`, `search_by_filename`, `get_session`, `summarize_session`, and `list_projects` tools for AI session recall (`rclm/mcp_server.py`, `pyproject.toml`)
+- Added MCP server installation and registration logic for Claude, Gemini, Cursor, and Codex CLI clients (`rclm/mcp_install.py`)
+- Added `--with-mcp` flag to `rclm-hooks-install` and `rclm-update` to automate MCP server registration (`rclm/hooks/installer.py`, `rclm/update.py`)
+- Added `timestamp` field to `FileDiff` model to capture exact timing of file edits across all supported providers (`rclm/_models.py`, `rclm/hooks/**`)
+
+### Changed
+- Refactored hook installer to replace ALL existing rclm hook entries for a given matcher/event instead of appending, preventing duplicate registrations during re-installs (`rclm/hooks/installer.py`)
+- Improved rclm command detection in the installer to handle absolute paths and spaces more robustly (`rclm/hooks/installer.py`)
+
+### Fixed
+- Fixed duplicate rclm hook commands being registered when the installer was run multiple times or with different path styles (`rclm/hooks/installer.py`)
+
+### Deps
+- Added `mcp>=1.0,<2` dependency to support the ReclaimLLM MCP server (`pyproject.toml`, `uv.lock`)
+
+---
+
 ## [v0.1.12] — 2026-05-05
 
 ### Added

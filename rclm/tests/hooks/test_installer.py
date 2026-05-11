@@ -188,6 +188,33 @@ def test_saved_config_used_when_no_flags_provided(tmp_path, monkeypatch):
     assert "SessionStart" in settings["hooks"]
 
 
+def test_with_mcp_reuses_saved_api_key_without_browser_prompt(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _config.save("http://saved.com", "sk-saved")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "rclm-hooks-install",
+            "--local",
+            "--with-mcp",
+        ],
+    )
+    monkeypatch.setattr(
+        installer,
+        "_wait_for_api_key_via_browser",
+        lambda _url: pytest.fail("browser API-key flow should not run"),
+    )
+    monkeypatch.setattr("rclm.mcp_install._resolve_binary", lambda: "/bin/rclm-mcp")
+
+    installer.main()
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["api_key"] == "sk-saved"
+    assert config["server_url"] == "http://saved.com"
+    assert (tmp_path / ".codex" / "config.toml").exists()
+
+
 # ---------------------------------------------------------------------------
 # Missing credentials
 # ---------------------------------------------------------------------------
@@ -293,6 +320,36 @@ def test_local_default_does_not_install_openclaw(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path)
 
     assert (tmp_path / ".claude" / "settings.json").exists()
+
+
+def test_with_mcp_installs_local_mcp_configs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("rclm.mcp_install._resolve_binary", lambda: "/bin/rclm-mcp")
+
+    _run_install(monkeypatch, tmp_path, "--with-mcp")
+
+    claude = _read_settings(tmp_path / ".claude" / "settings.json")
+    assert claude["mcpServers"]["reclaimllm"] == {
+        "command": "/bin/rclm-mcp",
+        "args": [],
+    }
+
+    cursor = _read_settings(tmp_path / ".cursor" / "mcp.json")
+    assert cursor["mcpServers"]["reclaimllm"] == {
+        "command": "/bin/rclm-mcp",
+        "args": [],
+    }
+
+    gemini = _read_settings(tmp_path / ".gemini" / "settings.json")
+    assert gemini["mcpServers"]["reclaimllm"] == {
+        "command": "/bin/rclm-mcp",
+        "args": [],
+    }
+
+    codex = (tmp_path / ".codex" / "config.toml").read_text()
+    assert "[mcp_servers.reclaimllm]" in codex
+    assert 'command = "/bin/rclm-mcp"' in codex
+    assert "args = []" in codex
 
 
 # ---------------------------------------------------------------------------

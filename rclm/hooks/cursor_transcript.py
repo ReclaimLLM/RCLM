@@ -198,5 +198,6 @@ def _process_tool_use(block: dict, data: CursorTranscriptData, timestamp: str | 
                     unified_diff=f"--- {path}\n+++ {path}\n@@ -0,0 +1 @@\n+{content}"
                     if content
                     else "",
+                    timestamp=timestamp or "",
                 )
             )

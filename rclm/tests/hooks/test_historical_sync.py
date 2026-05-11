@@ -282,6 +282,7 @@ def test_parse_claude_session_write_tool_produces_diff(tmp_path):
     assert len(record.file_diffs) == 1
     assert record.file_diffs[0].path == "hello.py"
     assert record.file_diffs[0].after == "print('hi')"
+    assert record.file_diffs[0].timestamp == "2024-01-01T00:00:01Z"
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +449,7 @@ def test_parse_gemini_session_write_file_diff(tmp_path):
     assert len(record.file_diffs) == 1
     assert record.file_diffs[0].path == "hello.py"
     assert record.file_diffs[0].after == "print('hi')"
+    assert record.file_diffs[0].timestamp == "2024-01-01T00:00:02.000+00:00"
 
 
 # ---------------------------------------------------------------------------

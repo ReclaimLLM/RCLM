@@ -194,6 +194,7 @@ def _extract_file_diffs_from_tool_calls(
                     before=None,
                     after=content,
                     unified_diff=unified,
+                    timestamp=tc.timestamp,
                 )
             )
 
@@ -215,6 +216,7 @@ def _extract_file_diffs_from_tool_calls(
                     before=old_string,
                     after=new_string,
                     unified_diff=unified,
+                    timestamp=tc.timestamp,
                 )
             )
 
@@ -237,6 +239,7 @@ def _extract_file_diffs_from_tool_calls(
                         before=old_string,
                         after=new_string,
                         unified_diff=unified,
+                        timestamp=tc.timestamp,
                     )
                 )
 

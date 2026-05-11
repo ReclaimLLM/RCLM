@@ -95,6 +95,7 @@ def test_after_file_edit(monkeypatch, tmp_path):
     assert diffs[0].after == "new\n"
     assert "-old" in diffs[0].unified_diff
     assert "+new" in diffs[0].unified_diff
+    assert diffs[0].timestamp == "2024-01-01T00:00:02Z"
 
 
 def test_after_tab_file_edit(monkeypatch, tmp_path):

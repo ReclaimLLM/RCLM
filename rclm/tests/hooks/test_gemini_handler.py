@@ -394,6 +394,7 @@ def test_session_end_extracts_write_file_diff(monkeypatch, tmp_path):
     assert diff.before is None
     assert diff.after == "print('hello')\n"
     assert "b/src/hello.py" in diff.unified_diff
+    assert diff.timestamp == "2024-01-01T00:00:05Z"
 
 
 def test_session_end_extracts_replace_diff(monkeypatch, tmp_path):
@@ -448,6 +449,7 @@ def test_session_end_extracts_replace_diff(monkeypatch, tmp_path):
     assert diff.after == "def foo():\n    return 42\n"
     assert "-    pass" in diff.unified_diff
     assert "+    return 42" in diff.unified_diff
+    assert diff.timestamp == "2024-01-01T00:00:06Z"
 
 
 # ---------------------------------------------------------------------------

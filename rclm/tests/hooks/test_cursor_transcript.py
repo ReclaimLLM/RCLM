@@ -162,6 +162,7 @@ def test_parses_nested_content_and_write_tool(tmp_path):
     assert data.file_diffs[0].path == "test.py"
     assert data.file_diffs[0].after == "print('hello')"
     assert "+++" in data.file_diffs[0].unified_diff
+    assert data.file_diffs[0].timestamp == "2024-01-01T00:00:10Z"
 
 
 def test_drops_assistant_message_that_is_only_redacted_text(tmp_path):

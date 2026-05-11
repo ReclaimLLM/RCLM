@@ -1700,6 +1700,7 @@ name = "rclm"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "mcp" },
 ]
 
 [package.optional-dependencies]
@@ -1722,6 +1723,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9,<4" },
     { name = "litellm", extras = ["proxy"], marker = "extra == 'dev'", specifier = ">=1.40,<1.82" },
     { name = "litellm", extras = ["proxy"], marker = "extra == 'proxy'", specifier = ">=1.40,<1.82" },
+    { name = "mcp", specifier = ">=1.0,<2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.5.1" },
     { name = "prisma", marker = "extra == 'dev'", specifier = ">=0.11,<2.0" },
     { name = "prisma", marker = "extra == 'proxy'", specifier = ">=0.11,<2.0" },

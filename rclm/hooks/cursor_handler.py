@@ -130,6 +130,7 @@ def _unified_diff(path: str, before: str | None, after: str | None) -> str:
 
 def _extract_file_diffs_from_payload(payload: dict) -> list[FileDiff]:
     path = payload.get("file_path") or payload.get("filepath") or payload.get("path") or "unknown"
+    timestamp = payload.get("timestamp", "")
 
     edits = payload.get("edits")
     if isinstance(edits, list):
@@ -145,13 +146,22 @@ def _extract_file_diffs_from_payload(payload: dict) -> list[FileDiff]:
                     before=before,
                     after=after,
                     unified_diff=_unified_diff(path, before, after),
+                    timestamp=timestamp,
                 )
             )
         return diffs
 
     diff = payload.get("diff")
     if isinstance(diff, str) and diff:
-        return [FileDiff(path=path, before=None, after=None, unified_diff=diff)]
+        return [
+            FileDiff(
+                path=path,
+                before=None,
+                after=None,
+                unified_diff=diff,
+                timestamp=timestamp,
+            )
+        ]
 
     return []
 

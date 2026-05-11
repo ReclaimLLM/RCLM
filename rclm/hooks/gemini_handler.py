@@ -232,6 +232,7 @@ def _extract_file_diffs(events: list[dict]) -> list[FileDiff]:
             continue
         name = ev.get("tool_name", "")
         inp = ev.get("tool_input", {})
+        timestamp = ev.get("timestamp", "")
 
         if name == "write_file":
             file_path = inp.get("file_path", "")
@@ -250,6 +251,7 @@ def _extract_file_diffs(events: list[dict]) -> list[FileDiff]:
                     before=None,
                     after=content,
                     unified_diff=unified,
+                    timestamp=timestamp,
                 )
             )
 
@@ -271,6 +273,7 @@ def _extract_file_diffs(events: list[dict]) -> list[FileDiff]:
                     before=old_string,
                     after=new_string,
                     unified_diff=unified,
+                    timestamp=timestamp,
                 )
             )
     return diffs

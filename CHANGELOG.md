@@ -3,6 +3,20 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.14] — 2026-06-10
+
+### Added
+- Added ReclaimLLM plugin marketplace catalogs for Codex, Claude, and Cursor, plus a root marketplace catalog for sharing the `reclaimllm` plugin from `DC-hooks-proxy` (`.agents/plugins/marketplace.json`, `.codex-plugin/marketplace.json`, `.claude-plugin/marketplace.json`, `.cursor-plugin/marketplace.json`, `marketplace.json`)
+- Added the `reclaimllm` agent plugin with Codex, Claude, and Cursor manifests, local MCP server configuration, and a ReclaimLLM memory skill for persistent captured-session search (`plugins/reclaimllm/**`)
+
+### Changed
+- Documented agent plugin installation and MCP authentication workflow in the package README (`README.md`)
+
+### Removed
+- Removed obsolete standalone debug/reproduction scripts for proxy and Codex hook experiments (`debug_proxy.py`, `repro_codex.py`, `test_codex_schema.py`, `test_main_codex.py`)
+
+---
+
 ## [v0.1.13] — 2026-05-11
 
 ### Added

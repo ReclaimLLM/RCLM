@@ -1,0 +1,18 @@
+{
+  "name": "reclaimllm-plugins",
+  "owner": {
+    "name": "ReclaimLLM",
+    "email": "support@reclaimllm.com"
+  },
+  "metadata": {
+    "description": "ReclaimLLM plugins for Claude"
+  },
+  "plugins": [
+    {
+      "name": "reclaimllm",
+      "source": "./plugins/reclaimllm",
+      "description": "ReclaimLLM persistent memory for AI applications. Search captured sessions, recover prior decisions, and export reusable context through the local rclm MCP server.",
+      "version": "0.1.0"
+    }
+  ]
+}

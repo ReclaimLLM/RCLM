@@ -1,0 +1,33 @@
+{
+  "name": "reclaimllm",
+  "version": "0.1.0",
+  "description": "Persistent memory for Claude Code. Search captured ReclaimLLM sessions, recover prior decisions, and export reusable context.",
+  "author": {
+    "name": "ReclaimLLM",
+    "email": "support@reclaimllm.com"
+  },
+  "homepage": "https://reclaimllm.com",
+  "license": "Apache-2.0",
+  "keywords": [
+    "memory",
+    "persistent-memory",
+    "mcp",
+    "semantic-search",
+    "session-recall"
+  ],
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "ReclaimLLM API Key",
+      "description": "Your ReclaimLLM API key. You can also authenticate with `rclm-hooks-install --with-mcp`, which stores credentials in ~/.reclaimllm/config.json.",
+      "sensitive": true,
+      "required": false
+    },
+    "server_url": {
+      "type": "string",
+      "title": "ReclaimLLM Server URL",
+      "description": "Optional ReclaimLLM API base URL. Defaults to https://api.reclaimllm.com when using the rclm installer.",
+      "required": false
+    }
+  }
+}

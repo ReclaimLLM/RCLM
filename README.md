@@ -54,14 +54,19 @@ rclm convert-session <session_id> claude  --force-regenerate  # Use LLM for a fr
 
 ---
 
-## Codex Plugin
+## Agent Plugins
 
-RCLM includes a local Codex plugin marketplace entry that exposes ReclaimLLM as persistent memory for AI agents through the bundled `rclm-mcp` server.
+RCLM includes local plugin marketplace entries for Codex, Claude, and Cursor. Each plugin exposes ReclaimLLM as persistent memory for AI agents through the bundled `rclm-mcp` server.
 
 ```bash
 codex plugin marketplace add /path/to/DC-hooks-proxy
-codex plugin add reclaimllm@reclaimllm-local
+codex plugin add reclaimllm@reclaimllm-plugins
 ```
+
+For Claude and Cursor, add the matching marketplace file from this repo:
+
+- `DC-hooks-proxy/.claude-plugin/marketplace.json`
+- `DC-hooks-proxy/.cursor-plugin/marketplace.json`
 
 Then authenticate the local MCP server if you have not already:
 
@@ -69,7 +74,7 @@ Then authenticate the local MCP server if you have not already:
 rclm-hooks-install --with-mcp
 ```
 
-Start a new Codex thread and use `/plugins` or `/mcp` to confirm `reclaimllm` is enabled.
+Start a new agent thread and confirm the `reclaimllm` plugin and MCP server are enabled.
 
 ---
 

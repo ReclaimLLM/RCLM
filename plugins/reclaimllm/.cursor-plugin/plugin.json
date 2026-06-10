@@ -1,0 +1,21 @@
+{
+  "name": "reclaimllm",
+  "version": "0.1.0",
+  "description": "ReclaimLLM memory layer for AI applications. Add persistent memory, arbitrary captured-session search, and context export using the local rclm MCP server.",
+  "author": {
+    "name": "ReclaimLLM",
+    "email": "support@reclaimllm.com"
+  },
+  "homepage": "https://reclaimllm.com",
+  "license": "Apache-2.0",
+  "keywords": [
+    "reclaimllm",
+    "memory",
+    "persistent-memory",
+    "mcp",
+    "semantic-search",
+    "session-recall"
+  ],
+  "skills": "./skills/",
+  "mcpServers": ".cursor-mcp.json"
+}

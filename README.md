@@ -54,6 +54,25 @@ rclm convert-session <session_id> claude  --force-regenerate  # Use LLM for a fr
 
 ---
 
+## Codex Plugin
+
+RCLM includes a local Codex plugin marketplace entry that exposes ReclaimLLM as persistent memory for AI agents through the bundled `rclm-mcp` server.
+
+```bash
+codex plugin marketplace add /path/to/DC-hooks-proxy
+codex plugin add reclaimllm@reclaimllm-local
+```
+
+Then authenticate the local MCP server if you have not already:
+
+```bash
+rclm-hooks-install --with-mcp
+```
+
+Start a new Codex thread and use `/plugins` or `/mcp` to confirm `reclaimllm` is enabled.
+
+---
+
 ## CLI Reference
 
 | Command | Description |

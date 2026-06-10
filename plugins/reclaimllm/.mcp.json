@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "reclaimllm": {
+      "command": "rclm-mcp",
+      "args": [],
+      "note": "Local ReclaimLLM MCP server for persistent AI-application memory and arbitrary memory search. Install and authenticate the rclm package first with `pip install rclm` and `rclm-hooks-install --with-mcp`; credentials are read from ~/.reclaimllm/config.json with RECLAIMLLM_SERVER_URL and RECLAIMLLM_API_KEY as fallback."
+    }
+  }
+}

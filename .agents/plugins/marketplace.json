@@ -1,0 +1,20 @@
+{
+  "name": "reclaimllm-local",
+  "interface": {
+    "displayName": "ReclaimLLM Local"
+  },
+  "plugins": [
+    {
+      "name": "reclaimllm",
+      "source": {
+        "source": "local",
+        "path": "./plugins/reclaimllm"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

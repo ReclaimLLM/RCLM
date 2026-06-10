@@ -1,0 +1,42 @@
+{
+  "name": "reclaimllm",
+  "version": "0.1.0",
+  "description": "Add persistent ReclaimLLM memory to AI applications and search captured sessions from any MCP-capable agent.",
+  "author": {
+    "name": "ReclaimLLM",
+    "url": "https://reclaimllm.com"
+  },
+  "homepage": "https://reclaimllm.com",
+  "license": "Apache-2.0",
+  "keywords": [
+    "memory",
+    "persistent-memory",
+    "mcp",
+    "agent-context",
+    "session-recall",
+    "semantic-search",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ReclaimLLM",
+    "shortDescription": "Persistent memory and arbitrary session search for AI agents.",
+    "longDescription": "ReclaimLLM adds persistent memory to AI applications by capturing AI sessions across Codex CLI, Claude Code, Gemini CLI, Cursor, OpenClaw, browser chat, and proxy traffic. Use the bundled MCP server to search arbitrary prior memories, inspect session metadata, list projects, and export reusable context into any MCP-capable agent.",
+    "developerName": "ReclaimLLM",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "MCP"
+    ],
+    "websiteURL": "https://reclaimllm.com",
+    "privacyPolicyURL": "https://reclaimllm.com/privacy",
+    "termsOfServiceURL": "https://reclaimllm.com/terms",
+    "defaultPrompt": [
+      "Search my ReclaimLLM memory for this topic.",
+      "Find prior sessions related to this file.",
+      "Use this ReclaimLLM session as context."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

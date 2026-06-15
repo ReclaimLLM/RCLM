@@ -13,6 +13,7 @@ from typing import Any, Literal
 import aiohttp
 
 from rclm import _config
+from rclm._http import create_tcp_connector
 
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 25
@@ -147,7 +148,9 @@ class ReclaimLLMClient:
     ) -> dict[str, Any]:
         url = f"{self.server_url}{path}"
         async with (
-            aiohttp.ClientSession(headers=self.headers) as session,
+            aiohttp.ClientSession(
+                headers=self.headers, connector=create_tcp_connector()
+            ) as session,
             session.request(method, url, params=params) as resp,
         ):
             body = await resp.text()

@@ -14,6 +14,7 @@ import aiohttp
 
 from rclm import _config
 from rclm._endpoints import INGEST_PATH
+from rclm._http import create_tcp_connector
 from rclm._models import (
     HookSessionRecord,
     ProxyRecord,
@@ -132,7 +133,7 @@ def _quarantine(record: AnyRecord) -> None:
 
 async def run_upload_worker(queue: asyncio.Queue) -> None:
     """Background asyncio task. Drains the queue and uploads each record."""
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=create_tcp_connector()) as session:
         while True:
             record = await queue.get()
             if record is None:  # sentinel: shut down
@@ -153,7 +154,7 @@ async def _get_session() -> aiohttp.ClientSession:
     """Return a persistent module-level ClientSession, creating it if needed."""
     global _session
     if _session is None or _session.closed:
-        _session = aiohttp.ClientSession()
+        _session = aiohttp.ClientSession(connector=create_tcp_connector())
     return _session
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 import aiohttp
 
 from rclm import _config
+from rclm._http import create_tcp_connector
 
 
 async def _fetch_context(
@@ -32,7 +33,7 @@ async def _fetch_context(
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
 
     async with (
-        aiohttp.ClientSession() as session,
+        aiohttp.ClientSession(connector=create_tcp_connector()) as session,
         session.post(url, params=params, headers=headers) as resp,
     ):
         body = await resp.text()

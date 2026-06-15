@@ -7,7 +7,7 @@ name = "rclm"
 dynamic = ["version"]
 description = "Capture and upload LLM sessions from local hooks and proxy integrations"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.14"
 authors = [{ name = "ReclaimLLM" }]
 license = "Apache-2.0"
 keywords = ["llm", "ai", "hooks", "proxy", "claude-code", "gemini", "codex"]
@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 urls = { Homepage = "https://reclaimllm.com" }
-dependencies = ["aiohttp>=3.9,<4", "mcp>=1.0,<2"]
+dependencies = ["aiohttp>=3.9,<4", "certifi>=2026.2.25", "mcp>=1.0,<2"]
 
 [project.optional-dependencies]
 proxy = ["litellm[proxy]>=1.40,<1.82", "prisma>=0.11,<2.0"]

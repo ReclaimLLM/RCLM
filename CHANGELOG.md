@@ -3,6 +3,27 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.15] — 2026-06-15
+
+### Added
+- Added shared aiohttp TLS helpers that build a verified SSL context, honor explicit CA bundle environment variables, and add certifi roots when local Python CA discovery is incomplete (`rclm/_http.py`)
+- Added focused tests for explicit CA bundle selection and certifi fallback behavior (`rclm/tests/test_http.py`)
+
+### Changed
+- Updated uploader, session conversion, and MCP client HTTP calls to use the shared verified TLS connector (`rclm/_uploader.py`, `rclm/convert.py`, `rclm/mcp_server.py`)
+- Expanded package Python compatibility to include Python 3.13 (`pyproject.toml`, `uv.lock`)
+
+### Fixed
+- Fixed upload failures on machines whose Python/OpenSSL environment could not find a valid local issuer certificate for `api.reclaimllm.com` (`rclm/_uploader.py`, `rclm/_http.py`)
+
+### Security
+- Preserved certificate verification while improving CA root reliability, avoiding unsafe `ssl=False` fallbacks for ReclaimLLM API calls (`rclm/_http.py`)
+
+### Deps
+- Added `certifi>=2026.2.25` and refreshed lockfile metadata with Python 3.13 wheel support (`pyproject.toml`, `uv.lock`)
+
+---
+
 ## [v0.1.14] — 2026-06-10
 
 ### Added

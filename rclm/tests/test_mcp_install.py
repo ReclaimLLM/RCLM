@@ -52,3 +52,17 @@ def test_install_mcp_adds_gemini_settings(tmp_path, monkeypatch):
         "command": "/bin/rclm-mcp",
         "args": [],
     }
+
+
+def test_install_mcp_respects_providers_filter(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mcp_install, "_resolve_binary", lambda: "/bin/rclm-mcp")
+
+    paths = mcp_install.install_mcp(use_global=False, providers=["claude"])
+
+    assert len(paths) == 1
+    assert paths[0].resolve() == (tmp_path / ".claude" / "mcp.json").resolve()
+    assert (tmp_path / ".claude" / "mcp.json").exists()
+    assert not (tmp_path / ".gemini" / "settings.json").exists()
+    assert not (tmp_path / ".cursor" / "mcp.json").exists()
+    assert not (tmp_path / ".codex" / "config.toml").exists()

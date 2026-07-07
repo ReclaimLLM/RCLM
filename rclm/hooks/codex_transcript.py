@@ -249,6 +249,7 @@ def _parse_apply_patch(patch_text: str, timestamp: str = "") -> list[FileDiff]:
         files.append((cur_path, cur_op or "update", lines))
 
     for path, op, content in files:
+        unified_diff = f"--- a/{path}\n+++ b/{path}\n@@ -1,1 +1,1 @@\n" + "\n".join(content)
         if op == "add":
             after = "\n".join(line[1:] for line in content if line.startswith("+"))
             diffs.append(
@@ -256,7 +257,7 @@ def _parse_apply_patch(patch_text: str, timestamp: str = "") -> list[FileDiff]:
                     path=path,
                     before=None,
                     after=after,
-                    unified_diff="",
+                    unified_diff=unified_diff,
                     timestamp=timestamp,
                 )
             )
@@ -266,7 +267,7 @@ def _parse_apply_patch(patch_text: str, timestamp: str = "") -> list[FileDiff]:
                     path=path,
                     before=None,
                     after=None,
-                    unified_diff="",
+                    unified_diff=unified_diff,
                     timestamp=timestamp,
                 )
             )
@@ -286,7 +287,7 @@ def _parse_apply_patch(patch_text: str, timestamp: str = "") -> list[FileDiff]:
                     path=path,
                     before="\n".join(before_parts),
                     after="\n".join(after_parts),
-                    unified_diff="",
+                    unified_diff=unified_diff,
                     timestamp=timestamp,
                 )
             )

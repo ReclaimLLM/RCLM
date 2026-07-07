@@ -3,6 +3,23 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.16] — 2026-07-07
+
+### Added
+- Added provider-scoped MCP installation so `rclm-hooks-install --with-mcp` only writes MCP configs for the selected providers (`rclm/mcp_install.py`, `rclm/hooks/installer.py`)
+
+### Changed
+- Updated the bundled ReclaimLLM plugin MCP config to expose `reclaimllm` at the top level instead of wrapping it in `mcpServers` (`plugins/reclaimllm/.mcp.json`)
+
+### Fixed
+- Fixed Claude MCP install paths to use `~/.claude.json` globally and `.claude/mcp.json` locally instead of Claude settings files ignored by Claude Code CLI (`rclm/mcp_install.py`, `rclm/tests/hooks/test_installer.py`)
+- Fixed Codex `apply_patch` parsing to retain unified diff content for added, deleted, and updated files (`rclm/hooks/codex_transcript.py`)
+
+### Deps
+- Refreshed `uv.lock` metadata and dev-extra serialization without changing project dependency declarations (`uv.lock`)
+
+---
+
 ## [v0.1.15] — 2026-06-15
 
 ### Added

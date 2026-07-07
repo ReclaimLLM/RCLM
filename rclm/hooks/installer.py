@@ -643,7 +643,7 @@ def main() -> None:
         try:
             from rclm.mcp_install import install_mcp
 
-            install_mcp(use_global=use_global)
+            install_mcp(use_global=use_global, providers=providers)
         except Exception as exc:
             print(
                 f"Warning: MCP install failed ({exc}). Hooks were installed.",

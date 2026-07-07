@@ -328,7 +328,7 @@ def test_with_mcp_installs_local_mcp_configs(tmp_path, monkeypatch):
 
     _run_install(monkeypatch, tmp_path, "--with-mcp")
 
-    claude = _read_settings(tmp_path / ".claude" / "settings.json")
+    claude = _read_settings(tmp_path / ".claude" / "mcp.json")
     assert claude["mcpServers"]["reclaimllm"] == {
         "command": "/bin/rclm-mcp",
         "args": [],

@@ -96,18 +96,32 @@ def _install_codex_mcp(path: Path, command: str) -> None:
     print(f"rclm MCP server installed into {path}")
 
 
-def install_mcp(use_global: bool = True) -> list[Path]:
-    """Install ReclaimLLM MCP config for Claude, Gemini, Cursor, and Codex."""
+def install_mcp(use_global: bool = True, providers: list[str] | None = None) -> list[Path]:
+    """Install ReclaimLLM MCP config for the given providers (default: all)."""
     command = _resolve_binary()
     root = Path.home() if use_global else Path(".")
+    if providers is None:
+        providers = ["claude", "gemini", "cursor", "codex"]
 
-    claude_path = root / ".claude" / "settings.json"
-    gemini_path = root / ".gemini" / "settings.json"
-    cursor_path = root / ".cursor" / "mcp.json"
-    codex_path = root / ".codex" / "config.toml"
+    installed: list[Path] = []
 
-    _install_json_mcp(claude_path, command)
-    _install_json_mcp(gemini_path, command)
-    _install_json_mcp(cursor_path, command)
-    _install_codex_mcp(codex_path, command)
-    return [claude_path, gemini_path, cursor_path, codex_path]
+    if "claude" in providers:
+        # Global: ~/.claude.json; local: .claude/mcp.json
+        # ~/.claude/settings.json mcpServers key is ignored by Claude Code CLI.
+        path = Path.home() / ".claude.json" if use_global else root / ".claude" / "mcp.json"
+        _install_json_mcp(path, command)
+        installed.append(path)
+    if "gemini" in providers:
+        path = root / ".gemini" / "settings.json"
+        _install_json_mcp(path, command)
+        installed.append(path)
+    if "cursor" in providers:
+        path = root / ".cursor" / "mcp.json"
+        _install_json_mcp(path, command)
+        installed.append(path)
+    if "codex" in providers:
+        path = root / ".codex" / "config.toml"
+        _install_codex_mcp(path, command)
+        installed.append(path)
+
+    return installed

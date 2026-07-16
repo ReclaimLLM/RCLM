@@ -50,6 +50,7 @@ rclm-hooks-uninstall = "rclm.hooks.uninstaller:main"
 rclm-sync = "rclm.hooks.historical_sync:sync_main"
 rclm-update = "rclm.update:main"
 rclm-compress = "rclm.compress.cli:main"
+rclm-read-cache = "rclm.compress.read_cache_cli:main"
 rclm-mcp = "rclm.mcp_server:main"
 
 [tool.ruff]

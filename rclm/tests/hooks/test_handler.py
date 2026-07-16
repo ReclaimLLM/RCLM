@@ -50,7 +50,7 @@ CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA = {
             "properties": {
                 "hookEventName": {"const": "PostToolUse"},
                 "additionalContext": {"type": "string"},
-                "updatedMCPToolOutput": {},
+                "updatedToolOutput": {"type": "string"},
             },
         },
     },
@@ -76,6 +76,10 @@ def _make_stdin(text: str):
     return StringIO(text)
 
 
+async def _noop_async(*args, **kwargs) -> None:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # SessionStart
 # ---------------------------------------------------------------------------
@@ -97,6 +101,203 @@ def test_session_start_appends_event(monkeypatch, tmp_path):
     assert len(events) == 1
     assert events[0]["event_type"] == "SessionStart"
     assert events[0]["cwd"] == "/projects/foo"
+
+
+# ---------------------------------------------------------------------------
+# SessionStart — context pack
+# ---------------------------------------------------------------------------
+
+
+def test_context_pack_off_by_default(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "key"}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = {"session_id": "sid-cp1", "cwd": "/repo", "timestamp": "2024-01-01T00:00:00Z"}
+    _run_handler("SessionStart", payload, monkeypatch)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_context_pack_injects_highlights_when_enabled(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"server_url": "https://api.test", "api_key": "key", "context_pack": True})
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    async def fake_request(self, method, path, *, params=None):
+        assert path == "/api/sessions/search"
+        assert (params or {})["file_path"] == "/repo"
+        return {
+            "sessions": [
+                {"session_id": "s1", "title": "Fixed auth", "session_summary": "Fixed the bug."}
+            ]
+        }
+
+    monkeypatch.setattr(handler.ReclaimLLMClient, "_request", fake_request)
+
+    payload = {"session_id": "sid-cp2", "cwd": "/repo", "timestamp": "2024-01-01T00:00:00Z"}
+    _run_handler("SessionStart", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "Fixed auth" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_context_pack_no_sessions_found_prints_nothing(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"server_url": "https://api.test", "api_key": "key", "context_pack": True})
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    async def fake_request(self, method, path, *, params=None):
+        return {"sessions": []}
+
+    monkeypatch.setattr(handler.ReclaimLLMClient, "_request", fake_request)
+
+    payload = {"session_id": "sid-cp3", "cwd": "/repo", "timestamp": "2024-01-01T00:00:00Z"}
+    _run_handler("SessionStart", payload, monkeypatch)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_context_pack_missing_credentials_skips_silently(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"context_pack": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.delenv("RECLAIMLLM_SERVER_URL", raising=False)
+    monkeypatch.delenv("RECLAIMLLM_API_KEY", raising=False)
+
+    payload = {"session_id": "sid-cp4", "cwd": "/repo", "timestamp": "2024-01-01T00:00:00Z"}
+    _run_handler("SessionStart", payload, monkeypatch)
+
+    assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# Stop — handoff advisor
+# ---------------------------------------------------------------------------
+
+
+def _stub_transcript(monkeypatch, *, total_input_tokens, total_output_tokens, tool_call_count):
+    from rclm._models import ToolCall
+    from rclm.hooks.transcript import TranscriptData
+
+    tool_calls = [
+        ToolCall(
+            tool_use_id=f"tc-{i}",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            tool_result="",
+            timestamp="2024-01-01T00:00:00Z",
+        )
+        for i in range(tool_call_count)
+    ]
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda path: TranscriptData(
+            messages=[],
+            tool_calls=tool_calls,
+            model="claude-sonnet-4-6",
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+        ),
+    )
+
+
+def test_handoff_advisor_off_by_default(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    _stub_transcript(
+        monkeypatch, total_input_tokens=200_000, total_output_tokens=50_000, tool_call_count=100
+    )
+
+    payload = {"session_id": "sid-ha1", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
+    _run_handler("Stop", payload, monkeypatch)
+
+    assert "handoff" not in capsys.readouterr().out
+
+
+def test_handoff_advisor_small_session_no_advisory(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"handoff_advisor": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    _stub_transcript(
+        monkeypatch, total_input_tokens=1000, total_output_tokens=500, tool_call_count=5
+    )
+
+    payload = {"session_id": "sid-ha2", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
+    _run_handler("Stop", payload, monkeypatch)
+
+    assert "handoff" not in capsys.readouterr().out
+
+
+def test_handoff_advisor_fires_on_large_session(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"handoff_advisor": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    _stub_transcript(
+        monkeypatch, total_input_tokens=200_000, total_output_tokens=50_000, tool_call_count=100
+    )
+
+    payload = {"session_id": "sid-ha3", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
+    _run_handler("Stop", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "Stop"
+    assert "handoff" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_handoff_advisor_fires_on_high_tool_call_count(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"handoff_advisor": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    _stub_transcript(
+        monkeypatch, total_input_tokens=100, total_output_tokens=100, tool_call_count=75
+    )
+
+    payload = {"session_id": "sid-ha4", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
+    _run_handler("Stop", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    assert "handoff" in output["hookSpecificOutput"]["additionalContext"]
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +359,355 @@ def test_pre_tool_use_compression_when_enabled(monkeypatch, tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# PreToolUse — loop-breaker gating
+# ---------------------------------------------------------------------------
+
+
+def test_loop_breaker_off_by_default(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+
+    for _ in range(4):
+        payload = {
+            "session_id": "sid-lb1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "timestamp": "2024-01-01T00:00:00Z",
+        }
+        _run_handler("PreToolUse", payload, monkeypatch)
+
+    captured = capsys.readouterr()
+    assert "loop-breaker" not in captured.out
+
+
+def test_loop_breaker_warns_on_repeated_calls_when_enabled(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"loop_breaker": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = {
+        "session_id": "sid-lb2",
+        "tool_name": "Bash",
+        "tool_input": {"command": "npm test"},
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    # First two calls: no signal yet (need 2 prior identical calls to warn).
+    _run_handler("PreToolUse", payload, monkeypatch)
+    capsys.readouterr()
+    _run_handler("PreToolUse", payload, monkeypatch)
+    capsys.readouterr()
+
+    # Third call: two prior identical calls now on record -> warn.
+    _run_handler("PreToolUse", payload, monkeypatch)
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_PRE_TOOL_USE_OUTPUT_SCHEMA)
+    assert "loop-breaker" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_loop_breaker_shadow_mode_records_but_does_not_warn(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"loop_breaker": True, "shadow_mode": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = {
+        "session_id": "sid-lb-shadow",
+        "tool_name": "Bash",
+        "tool_input": {"command": "npm test"},
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PreToolUse", payload, monkeypatch)
+    capsys.readouterr()
+    _run_handler("PreToolUse", payload, monkeypatch)
+    capsys.readouterr()
+
+    # Third call would normally warn — in shadow mode, nothing is printed.
+    _run_handler("PreToolUse", payload, monkeypatch)
+    assert capsys.readouterr().out == ""
+
+    events = session_store.read_events("sid-lb-shadow")
+    saving_events = [e for e in events if e.get("event_type") == "MechanismSaving"]
+    assert len(saving_events) == 1
+    assert saving_events[0]["mechanism"] == "H4_loop_breaker"
+    assert saving_events[0]["applied"] is False
+
+
+def test_loop_breaker_asks_after_repeated_failures(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"loop_breaker": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    edit_input = {"file_path": "src/app.ts", "old_string": "x", "new_string": "y"}
+    for _ in range(4):
+        failure_payload = {
+            "session_id": "sid-lb3",
+            "tool_name": "Edit",
+            "tool_input": edit_input,
+            "tool_output": "Error: old_string not found",
+            "timestamp": "2024-01-01T00:00:00Z",
+        }
+        _run_handler("PostToolUseFailure", failure_payload, monkeypatch)
+
+    payload = {
+        "session_id": "sid-lb3",
+        "tool_name": "Edit",
+        "tool_input": edit_input,
+        "timestamp": "2024-01-01T00:00:01Z",
+    }
+    _run_handler("PreToolUse", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_PRE_TOOL_USE_OUTPUT_SCHEMA)
+    assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
+    assert "src/app.ts" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# ---------------------------------------------------------------------------
+# PostToolUseFailure
+# ---------------------------------------------------------------------------
+
+
+def test_post_tool_use_failure_appends_event(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+
+    payload = {
+        "session_id": "sid-fail1",
+        "tool_name": "Bash",
+        "tool_input": {"command": "pytest"},
+        "tool_output": "exit code 1",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUseFailure", payload, monkeypatch)
+
+    events = session_store.read_events("sid-fail1")
+    assert events[-1]["event_type"] == "ToolFailure"
+    assert events[-1]["tool_name"] == "Bash"
+    assert events[-1]["tool_output"] == "exit code 1"
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse — read-cache gating
+# ---------------------------------------------------------------------------
+
+
+def test_read_cache_off_by_default(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+
+    payload = {
+        "session_id": "sid-rc1",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py"},
+        "tool_response": "def foo(): pass\n",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUse", payload, monkeypatch)
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    captured = capsys.readouterr()
+    assert "read-cache" not in captured.out
+
+
+def test_read_cache_first_read_no_output(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = {
+        "session_id": "sid-rc2",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py"},
+        "tool_response": "def foo(): pass\n",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    assert capsys.readouterr().out == ""
+    events = session_store.read_events("sid-rc2")
+    assert events[-1]["event_type"] == "ReadSnapshot"
+    assert events[-1]["file_path"] == "/repo/a.py"
+
+
+def test_read_cache_unchanged_reread_replaces_output(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = {
+        "session_id": "sid-rc3",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py"},
+        "tool_response": "def foo(): pass\n",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUse", payload, monkeypatch)
+    capsys.readouterr()
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    assert (
+        "Unchanged since the last read of /repo/a.py"
+        in output["hookSpecificOutput"]["updatedToolOutput"]
+    )
+
+    events = session_store.read_events("sid-rc3")
+    saving_events = [e for e in events if e.get("event_type") == "MechanismSaving"]
+    assert len(saving_events) == 1
+    assert saving_events[0]["mechanism"] == "H1_read_cache"
+    assert saving_events[0]["applied"] is True
+
+
+def test_read_cache_shadow_mode_records_but_does_not_replace_output(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True, "shadow_mode": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = {
+        "session_id": "sid-rc-shadow",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py"},
+        "tool_response": "def foo(): pass\n",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUse", payload, monkeypatch)
+    capsys.readouterr()
+
+    # Second identical read would normally be replaced — in shadow mode, nothing prints.
+    _run_handler("PostToolUse", payload, monkeypatch)
+    assert capsys.readouterr().out == ""
+
+    events = session_store.read_events("sid-rc-shadow")
+    saving_events = [e for e in events if e.get("event_type") == "MechanismSaving"]
+    assert len(saving_events) == 1
+    assert saving_events[0]["mechanism"] == "H1_read_cache"
+    assert saving_events[0]["applied"] is False
+
+
+def test_read_cache_changed_reread_returns_diff(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    first_payload = {
+        "session_id": "sid-rc4",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py"},
+        "tool_response": "line1\nline2\n",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUse", first_payload, monkeypatch)
+    capsys.readouterr()
+
+    second_payload = dict(first_payload, tool_response="line1\nCHANGED\n")
+    _run_handler("PostToolUse", second_payload, monkeypatch)
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    assert "changed since the last read" in output["hookSpecificOutput"]["updatedToolOutput"]
+
+
+def test_read_cache_scoped_to_offset_limit(monkeypatch, tmp_path, capsys):
+    """Reading a different range of the same file is not treated as a repeat."""
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    first_payload = {
+        "session_id": "sid-rc5",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py", "offset": 0, "limit": 50},
+        "tool_response": "chunk one\n",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUse", first_payload, monkeypatch)
+    capsys.readouterr()
+
+    second_payload = {
+        "session_id": "sid-rc5",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py", "offset": 50, "limit": 50},
+        "tool_response": "chunk two\n",
+        "timestamp": "2024-01-01T00:00:01Z",
+    }
+    _run_handler("PostToolUse", second_payload, monkeypatch)
+    assert capsys.readouterr().out == ""
+
+
+def test_read_cache_and_dlp_compose_scrubbed_content_is_diffed(monkeypatch, tmp_path, capsys):
+    """DLP must scrub before read-cache diffs, so a diff can never embed a raw secret."""
+    from rclm import _config
+    from rclm.hooks import dlp, session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True, "dlp": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(
+        dlp,
+        "maybe_redact_output",
+        lambda tool_name, tool_response, cwd: tool_response.replace(
+            "secret-token", "[REDACTED:TOKEN]"
+        ),
+    )
+
+    first_payload = {
+        "session_id": "sid-rc6",
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/repo/a.py"},
+        "tool_response": "token=secret-token\nline2\n",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+    _run_handler("PostToolUse", first_payload, monkeypatch)
+    capsys.readouterr()
+
+    second_payload = dict(first_payload, tool_response="token=secret-token\nline2 changed\n")
+    _run_handler("PostToolUse", second_payload, monkeypatch)
+    output = json.loads(capsys.readouterr().out)
+    diff = output["hookSpecificOutput"]["updatedToolOutput"]
+    assert "secret-token" not in diff
+    assert "[REDACTED:TOKEN]" in diff
+
+
+# ---------------------------------------------------------------------------
 # PostToolUse
 # ---------------------------------------------------------------------------
 
@@ -216,6 +766,7 @@ def test_post_tool_use_dlp_output_matches_claude_schema(monkeypatch, tmp_path, c
     validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
     assert output["hookSpecificOutput"] == {
         "hookEventName": "PostToolUse",
+        "updatedToolOutput": "token=[REDACTED:TOKEN]",
         "additionalContext": "[rclm DLP] Secrets were redacted from the tool response.",
     }
 
@@ -255,6 +806,9 @@ def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
             model="claude-sonnet-4-6",
             total_input_tokens=10,
             total_output_tokens=5,
+            cache_read_tokens=4000,
+            cache_creation_tokens=200,
+            usage_source="provider",
         ),
     )
 
@@ -274,6 +828,9 @@ def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
     assert record.model == "claude-sonnet-4-6"
     assert record.total_input_tokens == 10
     assert record.total_output_tokens == 5
+    assert record.cache_read_tokens == 4000
+    assert record.cache_creation_tokens == 200
+    assert record.usage_source == "provider"
     assert len(record.messages) == 1
 
     # Cleanup should have removed the session file.

@@ -1,18 +1,26 @@
-"""Execute a command, apply output filter, and track compression savings."""
+"""Execute a command, apply output filter, and track mechanism savings."""
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
-from pathlib import Path
+from dataclasses import dataclass
 
 from rclm.compress.filters.git import filter_git
-from rclm.compress.filters.shell import filter_shell
+from rclm.compress.filters.search import filter_search
+from rclm.compress.filters.shell import filter_generic, filter_shell, strip_ansi
 from rclm.compress.filters.test import filter_test
+from rclm.hooks._analytics import mechanism_saving_event
+from rclm.hooks.session_store import append_event
 
-_SESSIONS_DIR = Path.home() / ".reclaimllm" / "sessions"
+
+@dataclass
+class FilterResult:
+    text: str
+    # Which mechanism produced `text`, or None if nothing changed the output.
+    # See PRD_project_cost_analytics.md §5 for the H1-H4/legacy_compress vocabulary.
+    mechanism: str | None
 
 
 def execute(command: str) -> tuple[str, str, int]:
@@ -27,30 +35,41 @@ def execute(command: str) -> tuple[str, str, int]:
     return result.stdout, result.stderr, result.returncode
 
 
-def apply_filter(command: str, stdout: str, stderr: str) -> str:
-    """Route command to appropriate filter. Returns filtered output."""
+def apply_filter(command: str, stdout: str, stderr: str) -> FilterResult:
+    """Route command to appropriate filter. Returns the (possibly) filtered output
+    tagged with which mechanism produced it, for savings telemetry."""
+    combined = strip_ansi(stdout + stderr)
+
     parts = _parse_command(command)
     if not parts:
-        return stdout + stderr
+        return FilterResult(combined, None)
 
     base_cmd = parts[0]
 
     if base_cmd == "git" and len(parts) >= 2:
         subcommand = parts[1]
-        filtered = filter_git(subcommand, stdout + stderr)
+        filtered = filter_git(subcommand, combined)
         if filtered is not None:
-            return filtered
+            return FilterResult(filtered, "legacy_compress")
 
-    filtered = filter_test(command, stdout + stderr)
+    filtered = filter_search(command, combined)
     if filtered is not None:
-        return filtered
+        return FilterResult(filtered, "H2_search_shaping")
 
-    filtered = filter_shell(command, stdout + stderr)
+    filtered = filter_test(command, combined)
     if filtered is not None:
-        return filtered
+        return FilterResult(filtered, "legacy_compress")
 
-    # No filter matched — return original output
-    return stdout + stderr
+    filtered = filter_shell(command, combined)
+    if filtered is not None:
+        return FilterResult(filtered, "legacy_compress")
+
+    # No dedicated filter matched — generic repeat-collapse + head/tail cap.
+    filtered = filter_generic(combined)
+    if filtered is not None:
+        return FilterResult(filtered, "H3_exec_compaction")
+
+    return FilterResult(combined, None)
 
 
 def _parse_command(command: str) -> list[str]:
@@ -68,31 +87,29 @@ def _parse_command(command: str) -> list[str]:
 
 
 def track_savings(
-    command: str,
     original: str,
     compressed: str,
+    mechanism: str | None,
+    *,
+    applied: bool,
     session_id: str | None = None,
 ) -> None:
-    """Append compression stats to the active session JSONL."""
+    """Append a MechanismSaving event to the active session JSONL.
+
+    No-ops if nothing changed (mechanism is None) or no session is known —
+    those aren't measurements worth recording.
+    """
+    if mechanism is None:
+        return
     if session_id is None:
         session_id = os.environ.get("CLAUDE_SESSION_ID")
     if not session_id:
         return
 
-    original_chars = len(original)
-    compressed_chars = len(compressed)
-
-    event = {
-        "event_type": "CompressionSaving",
-        "command": command[:200],  # truncate long commands
-        "original_chars": original_chars,
-        "compressed_chars": compressed_chars,
-        "savings_pct": round((1 - compressed_chars / original_chars) * 100, 1)
-        if original_chars > 0
-        else 0.0,
-    }
-
-    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    path = _SESSIONS_DIR / f"{session_id}.jsonl"
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(event) + "\n")
+    tokens_saved_estimate = max(0, (len(original) - len(compressed)) // 4)
+    append_event(
+        session_id,
+        mechanism_saving_event(
+            mechanism, applied=applied, tokens_saved_estimate=tokens_saved_estimate
+        ),
+    )

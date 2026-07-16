@@ -16,6 +16,12 @@ READ_INJECT_LIMIT = 200
 # Default head_limit for Grep when none is set.
 GREP_DEFAULT_HEAD_LIMIT = 50
 
+# Default output_mode for Grep when none is set: per-file match counts
+# instead of full matching lines. Cheapest native mode short of
+# files_with_matches, and it keeps the "how much is in this file" signal
+# an agent needs to decide whether to read further.
+GREP_DEFAULT_OUTPUT_MODE = "count"
+
 # Commands eligible for rewriting to rclm-compress.
 # Patterns: base command → True (rewrite the full command).
 _BASH_REWRITE_COMMANDS = {
@@ -27,15 +33,24 @@ _BASH_REWRITE_COMMANDS = {
     "cargo",
     "ls",
     "find",
+    "rg",
+    "grep",
 }
 
 
-def maybe_compress(tool_name: str, tool_input: dict) -> dict | None:
-    """Return updatedInput dict if compression applies, None otherwise."""
+def maybe_compress(tool_name: str, tool_input: dict, *, shadow: bool = False) -> dict | None:
+    """Return updatedInput dict if compression applies, None otherwise.
+
+    `shadow=True` suppresses the Read/Grep native-tool shaping — those have no
+    before/after size available at PreToolUse time to measure savings against,
+    so shadow mode just skips them rather than rewriting unmeasured. The Bash
+    rewrite is unaffected: it always routes through rclm-compress, which
+    measures and handles its own shadow/enforce output decision.
+    """
     if tool_name == "Read":
-        return _compress_read(tool_input)
+        return None if shadow else _compress_read(tool_input)
     if tool_name == "Grep":
-        return _compress_grep(tool_input)
+        return None if shadow else _compress_grep(tool_input)
     if tool_name == "Bash":
         return _compress_bash(tool_input)
     return None
@@ -62,11 +77,19 @@ def _compress_read(tool_input: dict) -> dict | None:
 
 
 def _compress_grep(tool_input: dict) -> dict | None:
-    """Inject head_limit if not already set."""
-    if tool_input.get("head_limit"):
-        return None  # Already has a limit
+    """Default output_mode to counts and inject head_limit, where unset.
 
-    return {"head_limit": GREP_DEFAULT_HEAD_LIMIT}
+    Full per-match content is still one call away: the agent gets file +
+    match-count shape first, then can re-call with output_mode="content"
+    (or a narrower pattern/path) for detail on demand.
+    """
+    delta: dict = {}
+    if not tool_input.get("output_mode"):
+        delta["output_mode"] = GREP_DEFAULT_OUTPUT_MODE
+    if not tool_input.get("head_limit"):
+        delta["head_limit"] = GREP_DEFAULT_HEAD_LIMIT
+
+    return delta or None
 
 
 def _compress_bash(tool_input: dict) -> dict | None:

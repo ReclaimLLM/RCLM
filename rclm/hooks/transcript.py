@@ -25,6 +25,9 @@ class TranscriptData:
     model: str | None = None
     total_input_tokens: int | None = None
     total_output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    usage_source: str | None = None  # "provider" when real per-message usage was found
 
 
 def parse_transcript(transcript_path: str | None) -> TranscriptData:
@@ -75,6 +78,8 @@ def _extract(entries: list[dict]) -> TranscriptData:
 
     total_in: int = 0
     total_out: int = 0
+    total_cache_read: int = 0
+    total_cache_creation: int = 0
     has_tokens = False
 
     for entry in entries:
@@ -102,6 +107,8 @@ def _extract(entries: list[dict]) -> TranscriptData:
                 has_tokens = True
                 total_in += usage.get("input_tokens", 0)
                 total_out += usage.get("output_tokens", 0)
+                total_cache_read += usage.get("cache_read_input_tokens", 0)
+                total_cache_creation += usage.get("cache_creation_input_tokens", 0)
 
             # Extract tool_use blocks and pair with results.
             content = msg.get("content", [])
@@ -128,5 +135,8 @@ def _extract(entries: list[dict]) -> TranscriptData:
     if has_tokens:
         data.total_input_tokens = total_in
         data.total_output_tokens = total_out
+        data.cache_read_tokens = total_cache_read
+        data.cache_creation_tokens = total_cache_creation
+        data.usage_source = "provider"
 
     return data

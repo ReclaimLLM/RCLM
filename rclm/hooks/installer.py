@@ -70,6 +70,12 @@ _CLAUDE_HOOKS_TO_INJECT: dict[str, list[dict]] = {
             "hooks": [{"type": "command", "command": "rclm-claude-hooks PostToolUse"}],
         }
     ],
+    "PostToolUseFailure": [
+        {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": "rclm-claude-hooks PostToolUseFailure"}],
+        }
+    ],
     "UserPromptSubmit": [
         {
             "hooks": [
@@ -224,9 +230,51 @@ Subsequent installs without --api-key reuse the saved config.""",
         help="Enable Data Loss Prevention: redact secrets from .env files before they reach the model",
     )
     parser.add_argument(
+        "--loop-breaker",
+        action="store_true",
+        help=(
+            "Enable loop detection (Claude only): flag repeated identical tool calls or "
+            "repeated failures on the same file, escalating to a permission prompt if the "
+            "pattern continues"
+        ),
+    )
+    parser.add_argument(
+        "--read-cache",
+        action="store_true",
+        help=(
+            "Enable read-cache/diff-on-change (Claude only): repeat reads of an unchanged "
+            "file are replaced with a short notice instead of the full content again"
+        ),
+    )
+    parser.add_argument(
         "--with-mcp",
         action="store_true",
         help="Also install the ReclaimLLM MCP server into supported local MCP clients",
+    )
+    parser.add_argument(
+        "--context-pack",
+        action="store_true",
+        help=(
+            "Enable session-start context pack (Claude only, requires --with-mcp credentials): "
+            "inject highlights from recent ReclaimLLM sessions in this project at session start"
+        ),
+    )
+    parser.add_argument(
+        "--handoff-advisor",
+        action="store_true",
+        help=(
+            "Enable handoff advisor (Claude only, requires --with-mcp): suggest the ReclaimLLM "
+            "`handoff` MCP tool once a session has grown large"
+        ),
+    )
+    parser.add_argument(
+        "--shadow-mode",
+        action="store_true",
+        help=(
+            "Shadow mode (Claude only): compress/read-cache/loop-breaker still detect and "
+            "measure savings, but don't rewrite anything — use to see estimated impact before "
+            "enabling enforcement"
+        ),
     )
 
     return parser.parse_args()
@@ -617,7 +665,22 @@ def main() -> None:
 
     compress_enabled = args.compress or saved.get("compress", False)
     dlp_enabled = args.dlp or saved.get("dlp", False)
-    _config.save(server_url, api_key, compress=compress_enabled, dlp=dlp_enabled)
+    loop_breaker_enabled = args.loop_breaker or saved.get("loop_breaker", False)
+    read_cache_enabled = args.read_cache or saved.get("read_cache", False)
+    context_pack_enabled = args.context_pack or saved.get("context_pack", False)
+    handoff_advisor_enabled = args.handoff_advisor or saved.get("handoff_advisor", False)
+    shadow_mode_enabled = args.shadow_mode or saved.get("shadow_mode", False)
+    _config.save(
+        server_url,
+        api_key,
+        compress=compress_enabled,
+        dlp=dlp_enabled,
+        loop_breaker=loop_breaker_enabled,
+        read_cache=read_cache_enabled,
+        context_pack=context_pack_enabled,
+        handoff_advisor=handoff_advisor_enabled,
+        shadow_mode=shadow_mode_enabled,
+    )
 
     try:
         from rclm.hooks.redaction import sync_remote_settings

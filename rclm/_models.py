@@ -79,13 +79,16 @@ class HookSessionRecord:
     file_diffs: list[FileDiff] = field(default_factory=list)
     total_input_tokens: int | None = None
     total_output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    usage_source: str | None = None  # "provider" when real per-message usage was captured
     tool_token_stats: dict | None = (
         None  # {"Bash": {"count": N, "input_tokens": N, "output_tokens": N}, ...}
     )
     tool_call_count: int | None = None
     unique_files_modified: int | None = None
     dominant_tool: str | None = None
-    compression_savings: dict | None = (
-        None  # {"total_original_chars": N, "total_compressed_chars": N, "savings_pct": float}
+    mechanism_savings: dict | None = (
+        None  # {mechanism: {"applied_count": N, "shadow_count": N, "tokens_saved_estimate": N}}
     )
     is_sync: bool = False  # True for historical sync uploads; server skips if session exists

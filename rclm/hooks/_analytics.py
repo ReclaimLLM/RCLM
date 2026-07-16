@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from rclm._models import FileDiff, ToolCall
 
@@ -57,20 +58,46 @@ def compute_session_analytics(
     }
 
 
-def aggregate_compression_savings(events: list[dict]) -> dict | None:
-    """Aggregate CompressionSaving events from session JSONL."""
-    savings_events = [e for e in events if e.get("event_type") == "CompressionSaving"]
+def mechanism_saving_event(
+    mechanism: str,
+    *,
+    applied: bool,
+    tokens_saved_estimate: int,
+) -> dict:
+    """Build a MechanismSaving event dict, ready for session_store.append_event.
+
+    `applied=False` marks a shadow-mode measurement: the mechanism detected an
+    opportunity and estimated the savings, but did not rewrite anything.
+    """
+    return {
+        "event_type": "MechanismSaving",
+        "mechanism": mechanism,
+        "applied": applied,
+        "tokens_saved_estimate": tokens_saved_estimate,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def aggregate_mechanism_savings(events: list[dict]) -> dict | None:
+    """Aggregate MechanismSaving events from session JSONL into a per-mechanism summary.
+
+    Returns {mechanism: {applied_count, shadow_count, tokens_saved_estimate}} or None
+    if the session has no MechanismSaving events at all.
+    """
+    savings_events = [e for e in events if e.get("event_type") == "MechanismSaving"]
     if not savings_events:
         return None
 
-    total_original = sum(e.get("original_chars", 0) for e in savings_events)
-    total_compressed = sum(e.get("compressed_chars", 0) for e in savings_events)
+    summary: dict[str, dict[str, int]] = {}
+    for ev in savings_events:
+        mechanism = ev.get("mechanism") or "unknown"
+        bucket = summary.setdefault(
+            mechanism, {"applied_count": 0, "shadow_count": 0, "tokens_saved_estimate": 0}
+        )
+        if ev.get("applied"):
+            bucket["applied_count"] += 1
+        else:
+            bucket["shadow_count"] += 1
+        bucket["tokens_saved_estimate"] += int(ev.get("tokens_saved_estimate") or 0)
 
-    return {
-        "total_original_chars": total_original,
-        "total_compressed_chars": total_compressed,
-        "savings_pct": round((1 - total_compressed / total_original) * 100, 1)
-        if total_original > 0
-        else 0.0,
-        "command_count": len(savings_events),
-    }
+    return summary

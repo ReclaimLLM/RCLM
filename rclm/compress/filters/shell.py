@@ -2,6 +2,62 @@
 
 from __future__ import annotations
 
+import re
+
+# CSI sequences (colors, cursor movement) and OSC sequences (terminal titles).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+# Collapse runs of 3+ identical lines (progress bars, repeated log lines).
+_MIN_REPEAT_RUN = 3
+
+# Generic fallback shape: head+tail cap for commands with no dedicated filter.
+_GENERIC_MAX_LINES = 60
+_GENERIC_HEAD = 40
+_GENERIC_TAIL = 20
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences (colors, cursor control, terminal titles)."""
+    return _ANSI_RE.sub("", text)
+
+
+def collapse_repeats(lines: list[str]) -> list[str]:
+    """Collapse runs of 3+ consecutive identical lines into one + a count marker."""
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        j = i
+        while j < len(lines) and lines[j] == lines[i]:
+            j += 1
+        run_len = j - i
+        result.append(lines[i])
+        if run_len >= _MIN_REPEAT_RUN:
+            result.append(f"... (repeated {run_len - 1} more times)")
+        else:
+            result.extend(lines[i + 1 : j])
+        i = j
+    return result
+
+
+def filter_generic(output: str) -> str | None:
+    """Fallback compaction for commands with no dedicated filter.
+
+    Collapses repeated lines, then caps to head+tail if still large. Returns
+    None if the output is already small enough that no shaping is needed.
+    """
+    lines = output.splitlines()
+    if len(lines) <= _GENERIC_MAX_LINES:
+        return None
+
+    collapsed = collapse_repeats(lines)
+    if len(collapsed) <= _GENERIC_MAX_LINES:
+        return "\n".join(collapsed)
+
+    head_lines = collapsed[:_GENERIC_HEAD]
+    tail_lines = collapsed[-_GENERIC_TAIL:]
+    omitted = len(collapsed) - _GENERIC_HEAD - _GENERIC_TAIL
+    return "\n".join([*head_lines, f"... ({omitted} lines omitted) ...", *tail_lines])
+
 
 def filter_shell(command: str, output: str) -> str | None:
     """Filter shell command output. Returns compressed string or None if no filter."""
@@ -73,11 +129,3 @@ def _truncate_lines(lines: list[str], max_lines: int) -> str:
     kept = lines[:max_lines]
     kept.append(f"... ({len(lines) - max_lines} more lines)")
     return "\n".join(kept)
-
-
-def truncate_output(output: str, max_lines: int = 50) -> str:
-    """Generic output truncation. Used as fallback for unrecognized commands."""
-    lines = output.splitlines()
-    if len(lines) <= max_lines:
-        return output
-    return _truncate_lines(lines, max_lines)

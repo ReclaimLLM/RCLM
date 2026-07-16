@@ -799,7 +799,7 @@ def _deserialize_record(data: dict) -> AnyRecord | None:
             tool_call_count=data.get("tool_call_count"),
             unique_files_modified=data.get("unique_files_modified"),
             dominant_tool=data.get("dominant_tool"),
-            compression_savings=data.get("compression_savings"),
+            mechanism_savings=data.get("mechanism_savings"),
             is_sync=data.get("is_sync", False),
         )
     except Exception:

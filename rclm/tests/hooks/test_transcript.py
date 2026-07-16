@@ -158,6 +158,91 @@ def test_accumulates_tokens_from_multiple_assistant_entries(tmp_path):
     assert data.model == "claude-sonnet-4-6"  # from first assistant entry
 
 
+def test_captures_cache_tokens_and_usage_source(tmp_path):
+    entries = [
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": "Hi"},
+            "timestamp": "2024-01-01T00:00:01Z",
+            "model": "claude-sonnet-4-6",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 4000,
+                "cache_creation_input_tokens": 200,
+            },
+        },
+    ]
+    path = _write_transcript(tmp_path / "t.jsonl", entries)
+    data = parse_transcript(path)
+    assert data.cache_read_tokens == 4000
+    assert data.cache_creation_tokens == 200
+    assert data.usage_source == "provider"
+
+
+def test_accumulates_cache_tokens_across_entries(tmp_path):
+    entries = [
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": "First"},
+            "timestamp": "2024-01-01T00:00:01Z",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 50,
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": "Second"},
+            "timestamp": "2024-01-01T00:00:02Z",
+            "usage": {
+                "input_tokens": 20,
+                "output_tokens": 8,
+                "cache_read_input_tokens": 3000,
+                "cache_creation_input_tokens": 0,
+            },
+        },
+    ]
+    path = _write_transcript(tmp_path / "t.jsonl", entries)
+    data = parse_transcript(path)
+    assert data.cache_read_tokens == 4000
+    assert data.cache_creation_tokens == 50
+
+
+def test_missing_cache_fields_default_to_zero_not_none(tmp_path):
+    """Usage present but without cache fields (e.g. older transcript format) -> 0, not None."""
+    entries = [
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": "Hi"},
+            "timestamp": "2024-01-01T00:00:01Z",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        },
+    ]
+    path = _write_transcript(tmp_path / "t.jsonl", entries)
+    data = parse_transcript(path)
+    assert data.cache_read_tokens == 0
+    assert data.cache_creation_tokens == 0
+    assert data.usage_source == "provider"
+
+
+def test_no_usage_leaves_usage_source_none(tmp_path):
+    entries = [
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": "Hi"},
+            "timestamp": "2024-01-01T00:00:01Z",
+        },
+    ]
+    path = _write_transcript(tmp_path / "t.jsonl", entries)
+    data = parse_transcript(path)
+    assert data.usage_source is None
+    assert data.cache_read_tokens is None
+    assert data.cache_creation_tokens is None
+
+
 def test_model_extracted_from_first_assistant_entry(tmp_path):
     entries = [
         {

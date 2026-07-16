@@ -69,6 +69,7 @@ def test_all_expected_events_present(tmp_path, monkeypatch):
         "SessionStart",
         "PreToolUse",
         "PostToolUse",
+        "PostToolUseFailure",
         "UserPromptSubmit",
         "Stop",
         "SubagentStop",

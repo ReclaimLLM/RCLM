@@ -2,9 +2,10 @@
 
 from rclm._models import FileDiff, ToolCall
 from rclm.hooks._analytics import (
-    aggregate_compression_savings,
+    aggregate_mechanism_savings,
     compute_session_analytics,
     estimate_tokens,
+    mechanism_saving_event,
 )
 
 # ---------------------------------------------------------------------------
@@ -85,35 +86,61 @@ class TestComputeSessionAnalytics:
 
 
 # ---------------------------------------------------------------------------
-# aggregate_compression_savings
+# mechanism_saving_event / aggregate_mechanism_savings
 # ---------------------------------------------------------------------------
 
 
-class TestAggregateCompressionSavings:
+class TestMechanismSavingEvent:
+    def test_shape(self):
+        ev = mechanism_saving_event("H1_read_cache", applied=True, tokens_saved_estimate=42)
+        assert ev["event_type"] == "MechanismSaving"
+        assert ev["mechanism"] == "H1_read_cache"
+        assert ev["applied"] is True
+        assert ev["tokens_saved_estimate"] == 42
+        assert "timestamp" in ev
+
+
+class TestAggregateMechanismSavings:
     def test_no_savings_events(self):
         events = [{"event_type": "SessionStart"}, {"event_type": "PreToolUse"}]
-        assert aggregate_compression_savings(events) is None
-
-    def test_aggregates_savings(self):
-        events = [
-            {"event_type": "SessionStart"},
-            {
-                "event_type": "CompressionSaving",
-                "original_chars": 1000,
-                "compressed_chars": 200,
-            },
-            {
-                "event_type": "CompressionSaving",
-                "original_chars": 500,
-                "compressed_chars": 100,
-            },
-        ]
-        result = aggregate_compression_savings(events)
-        assert result is not None
-        assert result["total_original_chars"] == 1500
-        assert result["total_compressed_chars"] == 300
-        assert result["savings_pct"] == 80.0
-        assert result["command_count"] == 2
+        assert aggregate_mechanism_savings(events) is None
 
     def test_empty_events(self):
-        assert aggregate_compression_savings([]) is None
+        assert aggregate_mechanism_savings([]) is None
+
+    def test_aggregates_by_mechanism(self):
+        events = [
+            {"event_type": "SessionStart"},
+            mechanism_saving_event("H1_read_cache", applied=True, tokens_saved_estimate=1000),
+            mechanism_saving_event("H1_read_cache", applied=True, tokens_saved_estimate=500),
+            mechanism_saving_event("H3_exec_compaction", applied=True, tokens_saved_estimate=200),
+        ]
+        result = aggregate_mechanism_savings(events)
+        assert result is not None
+        assert result["H1_read_cache"] == {
+            "applied_count": 2,
+            "shadow_count": 0,
+            "tokens_saved_estimate": 1500,
+        }
+        assert result["H3_exec_compaction"] == {
+            "applied_count": 1,
+            "shadow_count": 0,
+            "tokens_saved_estimate": 200,
+        }
+
+    def test_shadow_vs_applied_counts_separately(self):
+        events = [
+            mechanism_saving_event("H4_loop_breaker", applied=False, tokens_saved_estimate=100),
+            mechanism_saving_event("H4_loop_breaker", applied=True, tokens_saved_estimate=100),
+        ]
+        result = aggregate_mechanism_savings(events)
+        assert result is not None
+        assert result["H4_loop_breaker"]["applied_count"] == 1
+        assert result["H4_loop_breaker"]["shadow_count"] == 1
+        assert result["H4_loop_breaker"]["tokens_saved_estimate"] == 200
+
+    def test_unknown_mechanism_field_defaults(self):
+        events = [{"event_type": "MechanismSaving", "applied": True, "tokens_saved_estimate": 5}]
+        result = aggregate_mechanism_savings(events)
+        assert result is not None
+        assert "unknown" in result

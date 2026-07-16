@@ -38,6 +38,12 @@ class TestCompressRead:
         result = maybe_compress("Read", {})
         assert result is None
 
+    def test_shadow_suppresses_read_shaping(self, tmp_path):
+        large_file = tmp_path / "large.py"
+        large_file.write_text("line\n" * 1000)
+        result = maybe_compress("Read", {"file_path": str(large_file)}, shadow=True)
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # Grep compression
@@ -45,13 +51,32 @@ class TestCompressRead:
 
 
 class TestCompressGrep:
-    def test_no_head_limit_injects_default(self):
+    def test_no_params_defaults_both(self):
         result = maybe_compress("Grep", {"pattern": "foo"})
         assert result is not None
         assert result["head_limit"] == 50
+        assert result["output_mode"] == "count"
 
-    def test_head_limit_already_set(self):
+    def test_head_limit_set_still_defaults_output_mode(self):
         result = maybe_compress("Grep", {"pattern": "foo", "head_limit": 10})
+        assert result is not None
+        assert result["output_mode"] == "count"
+        assert "head_limit" not in result
+
+    def test_output_mode_set_still_defaults_head_limit(self):
+        result = maybe_compress("Grep", {"pattern": "foo", "output_mode": "content"})
+        assert result is not None
+        assert result["head_limit"] == 50
+        assert "output_mode" not in result
+
+    def test_both_already_set(self):
+        result = maybe_compress(
+            "Grep", {"pattern": "foo", "head_limit": 10, "output_mode": "content"}
+        )
+        assert result is None
+
+    def test_shadow_suppresses_grep_shaping(self):
+        result = maybe_compress("Grep", {"pattern": "foo"}, shadow=True)
         assert result is None
 
 
@@ -64,6 +89,13 @@ class TestCompressBash:
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_git_status_rewritten(self, mock_avail):
         result = maybe_compress("Bash", {"command": "git status"})
+        assert result is not None
+        assert result["command"] == "rclm-compress git status"
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_bash_rewrite_unaffected_by_shadow(self, mock_avail):
+        """Bash always routes through rclm-compress — shadow decision is made there."""
+        result = maybe_compress("Bash", {"command": "git status"}, shadow=True)
         assert result is not None
         assert result["command"] == "rclm-compress git status"
 
@@ -88,6 +120,18 @@ class TestCompressBash:
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_ls_rewritten(self, mock_avail):
         result = maybe_compress("Bash", {"command": "ls -la"})
+        assert result is not None
+        assert "rclm-compress" in result["command"]
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_rg_rewritten(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "rg -n TODO ."})
+        assert result is not None
+        assert result["command"] == "rclm-compress rg -n TODO ."
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_grep_rewritten(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "grep -rn TODO src/"})
         assert result is not None
         assert "rclm-compress" in result["command"]
 

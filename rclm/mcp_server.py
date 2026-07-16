@@ -19,6 +19,7 @@ _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 25
 _MAX_HIGHLIGHT_CHARS = 500
 _VALID_RECORD_TYPES = {"session", "proxy", "browser-chat"}
+_VALID_SCOPES = {"mine", "team", "org"}
 _MCP_INSTRUCTIONS = (
     "ReclaimLLM tools recall prior captured AI sessions. Use them sparingly and only when prior "
     "session context is likely useful. Prefer normal reasoning and local repo inspection for the "
@@ -27,9 +28,11 @@ _MCP_INSTRUCTIONS = (
     "1. search_sessions: use only when the user hints that similar prior work may exist, asks how "
     "something was handled before, or the task is a bug fix/performance improvement where past "
     "context may help. If the prompt has semantic terms plus a file/folder path, pass that path as "
-    "file_path. Run at most one search round; if results are weak or the user is unsatisfied, do not "
-    "keep changing terms and searching again. Ask whether they want to skip or provide a more specific "
-    "session clue. "
+    "file_path. Only pass scope when the user explicitly asks to search just their own sessions, or "
+    "their team's, or the whole org's; otherwise omit it so the backend searches the widest scope the "
+    "organization's sharing settings allow. Run at most one search round; if results are weak or the "
+    "user is unsatisfied, do not keep changing terms and searching again. Ask whether they want to "
+    "skip or provide a more specific session clue. "
     "2. search_by_filename: use for file/folder-only history requests such as 'show changes in "
     "`auth.tsx`' or 'show changes under `/api/auth`'. Do not use it when semantic intent is present; "
     "then use search_sessions with file_path. "
@@ -39,7 +42,14 @@ _MCP_INSTRUCTIONS = (
     "results are enough for the user to decide next steps. Use summarize_session only after an explicit "
     "user follow-up such as 'summarize <session-id>', 'use this session', or 'add <session-id> as context'. "
     "5. list_projects: use only when the user asks what projects are available or asks to choose a "
-    "project filter."
+    "project filter. "
+    "6. file_brief: use before a non-trivial edit to a file you don't already have context on, to "
+    "see who touched it recently and why. Don't call it for every file you read — only when prior "
+    "history is actually likely to change your approach. "
+    "7. handoff: use when the current session has grown large (many turns, large context) and "
+    "continuing is getting expensive, or when the user explicitly asks to hand off, continue in a "
+    "new session, or start fresh without losing context. Returns a document to paste as the first "
+    "message of a new session."
 )
 
 
@@ -119,7 +129,7 @@ def _frontend_session_url(session_id: str) -> str:
 
 
 def _session_search_result(session: dict[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         "session_id": session.get("session_id"),
         "title": session.get("title") or "Untitled session",
         "project_name": session.get("project_name"),
@@ -128,6 +138,14 @@ def _session_search_result(session: dict[str, Any]) -> dict[str, Any]:
         "ingested_at": session.get("ingested_at"),
         "highlight": _highlight_for_session(session),
     }
+    # Only present for org/team-shared results (see backend sharing scope).
+    owner_email = session.get("user_email")
+    owner_name = session.get("user_display_name")
+    if owner_email:
+        result["owner_email"] = owner_email
+    if owner_name:
+        result["owner_name"] = owner_name
+    return result
 
 
 class ReclaimLLMClient:
@@ -174,6 +192,7 @@ class ReclaimLLMClient:
         file_path: str | None,
         record_type: str | None,
         limit: int,
+        scope: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"limit": max(1, min(limit, _MAX_LIMIT))}
         if query:
@@ -188,10 +207,18 @@ class ReclaimLLMClient:
                     f"record_type must be one of: {', '.join(sorted(_VALID_RECORD_TYPES))}"
                 )
             params["record_type"] = record_type
+        if scope:
+            if scope not in _VALID_SCOPES:
+                raise ReclaimLLMError(f"scope must be one of: {', '.join(sorted(_VALID_SCOPES))}")
+            params["scope"] = scope
 
         data = await self._request("GET", "/api/sessions/search", params=params)
         sessions = [_session_search_result(session) for session in data.get("sessions", [])]
-        return {"sessions": sessions, "total_returned": len(sessions)}
+        return {
+            "sessions": sessions,
+            "total_returned": len(sessions),
+            "scope": data.get("scope"),
+        }
 
     async def get_session(self, session_id: str) -> dict[str, Any]:
         data = await self._request(
@@ -225,13 +252,62 @@ class ReclaimLLMClient:
             params={
                 "target_tool": "generic",
                 "include_diffs": str(include_diffs).lower(),
-                "max_diff_lines": max(10, min(max_diff_lines, 200)),
+                "max_diff_lines": max_diff_lines,
                 "force_regenerate": str(force_regenerate).lower(),
             },
         )
 
     async def list_projects(self) -> dict[str, Any]:
         return await self._request("GET", "/api/sessions/projects")
+
+    async def file_brief(
+        self,
+        path: str,
+        *,
+        limit: int,
+        scope: str | None,
+    ) -> dict[str, Any]:
+        """Distilled brief of prior sessions that touched `path`: reuses the same
+        search-by-filename backend call as search_by_filename, reshaped as a brief."""
+        data = await self.search_sessions(
+            None,
+            project_name=None,
+            file_path=path,
+            record_type="session",
+            limit=limit,
+            scope=scope,
+        )
+        return {
+            "path": path,
+            "touch_count": data.get("total_returned", 0),
+            "sessions": data.get("sessions", []),
+            "scope": data.get("scope"),
+        }
+
+    async def handoff(
+        self,
+        session_id: str,
+        *,
+        include_diffs: bool,
+        max_diff_lines: int,
+    ) -> dict[str, Any]:
+        """Package a session's state as a continuation document, reusing the same
+        export-context backend call as summarize_session."""
+        result = await self.summarize_session(
+            session_id,
+            include_diffs=include_diffs,
+            max_diff_lines=max_diff_lines,
+            force_regenerate=False,
+        )
+        return {
+            "session_id": session_id,
+            "handoff_document": result.get("context_document"),
+            "token_estimate": result.get("token_estimate"),
+            "instructions": (
+                "Paste handoff_document as the first message of a new session to continue with "
+                "this context, then end the current session."
+            ),
+        }
 
 
 def build_mcp_server():
@@ -249,6 +325,7 @@ def build_mcp_server():
         file_path: str | None = None,
         record_type: (Literal["session", "proxy", "browser-chat"] | None) = "session",
         limit: int = _DEFAULT_LIMIT,
+        scope: Literal["mine", "team", "org"] | None = None,
     ) -> dict[str, Any]:
         """Search prior ReclaimLLM sessions by intent using backend hybrid semantic plus BM25 search.
 
@@ -259,6 +336,10 @@ def build_mcp_server():
         If the prompt includes both a file/folder path and semantic terms, pass the file/folder as
         file_path. If the prompt is only about a file/folder history, use search_by_filename instead.
         Use project_name to narrow results only when current project is known.
+        scope controls whose sessions are searched: "mine" (only your own), "team" (your org team),
+        or "org" (whole organization). Omit scope to search the widest scope your organization's
+        sharing settings allow; the backend clamps a request that is wider than what is allowed.
+        Results for sessions owned by someone else include owner_email/owner_name.
         Returns session IDs, short titles, and short highlights so the user can decide next steps.
         Do not automatically call summarize_session after this tool.
         """
@@ -269,6 +350,7 @@ def build_mcp_server():
             file_path=file_path,
             record_type=record_type,
             limit=limit,
+            scope=scope,
         )
 
     @mcp.tool()
@@ -277,6 +359,7 @@ def build_mcp_server():
         project_name: str | None = None,
         record_type: (Literal["session", "proxy", "browser-chat"] | None) = "session",
         limit: int = _DEFAULT_LIMIT,
+        scope: Literal["mine", "team", "org"] | None = None,
     ) -> dict[str, Any]:
         """Find prior sessions that touched a file or folder path.
 
@@ -284,6 +367,8 @@ def build_mcp_server():
         separate semantic search terms, for example "show me all changes in `auth.tsx`" or
         "show me changes under `/somefolder`". If the user includes semantic terms too, such as
         "show all auth fixes in `auth.tsx`", use search_sessions with file_path instead.
+        scope controls whose sessions are searched: "mine", "team", or "org". Omit scope to search
+        the widest scope your organization's sharing settings allow.
         Do not automatically call summarize_session after this tool.
         """
         client = ReclaimLLMClient()
@@ -293,6 +378,7 @@ def build_mcp_server():
             file_path=file_path,
             record_type=record_type,
             limit=limit,
+            scope=scope,
         )
 
     @mcp.tool()
@@ -332,6 +418,53 @@ def build_mcp_server():
         """
         client = ReclaimLLMClient()
         return await client.list_projects()
+
+    @mcp.tool()
+    async def file_brief(
+        path: str,
+        limit: int = _DEFAULT_LIMIT,
+        scope: Literal["mine", "team", "org"] | None = None,
+    ) -> dict[str, Any]:
+        """Return a distilled brief of prior sessions that touched a file: who, when, and a short
+        highlight of what each session did.
+
+        Use before a non-trivial edit to a file you don't already have context on — to see why it
+        looks the way it does or what related work has touched it recently. Do not call this for
+        every file you read; only when prior history is actually likely to change your approach.
+        scope controls whose sessions are searched: "mine", "team", or "org". Omit scope to search
+        the widest scope your organization's sharing settings allow.
+        """
+        client = ReclaimLLMClient()
+        return await client.file_brief(path, limit=limit, scope=scope)
+
+    @mcp.tool()
+    async def handoff(
+        session_id: str | None = None,
+        include_diffs: bool = True,
+        max_diff_lines: int = 50,
+    ) -> dict[str, Any]:
+        """Package the current (or a given) session's state into a compact continuation document
+        for starting a fresh session, without losing decisions/context already established.
+
+        Use when the current session has grown long (many turns, large context) and continuing it
+        is getting expensive, or when the user explicitly asks to "hand off", "continue this in a
+        new session", or "start fresh but keep context". If session_id is omitted, resolves the
+        current session from the CLAUDE_SESSION_ID environment variable; if that isn't set, pass
+        session_id explicitly. Returns a markdown document to paste as the first message of a new
+        session — this does not end the current session for you.
+        """
+        resolved_id = session_id or os.environ.get("CLAUDE_SESSION_ID")
+        if not resolved_id:
+            raise ReclaimLLMError(
+                "No session_id given and CLAUDE_SESSION_ID is not set in this environment; "
+                "pass session_id explicitly."
+            )
+        client = ReclaimLLMClient()
+        return await client.handoff(
+            resolved_id,
+            include_diffs=include_diffs,
+            max_diff_lines=max_diff_lines,
+        )
 
     return mcp
 

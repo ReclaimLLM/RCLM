@@ -14,10 +14,12 @@ Usage:
     rclm-hooks-install --openclaw                 # OpenClaw only, global
     rclm-hooks-install --claude --codex           # Claude + Codex, global
     rclm-hooks-install --api-key=<key>            # explicit key (skips browser)
-    rclm-hooks-install --compress                 # enable compression (Claude only)
-    rclm-hooks-install --with-mcp                 # also install ReclaimLLM MCP server
+    rclm-hooks-install --no-compress               # disable compression (Claude only)
+    rclm-hooks-install --no-with-mcp               # skip installing ReclaimLLM MCP server
 
-Credentials are stored in ~/.reclaimllm/config.json and reused on subsequent runs.
+--with-mcp, --read-cache, --loop-breaker, and --compress are on by default; pass the
+--no-<flag> form to opt out. Credentials and preferences are stored in
+~/.reclaimllm/config.json and reused on subsequent runs.
 """
 
 from __future__ import annotations
@@ -25,23 +27,12 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import secrets
 import shutil
 import sys
-import time
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from rclm import _config
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DEFAULT_FRONTEND_URL = "https://reclaimllm.com"
-DEFAULT_BACKEND_SERVER_URL = "https://api.reclaimllm.com"
-SETUP_URL = DEFAULT_FRONTEND_URL + "/settings"
-_CALLBACK_TIMEOUT_S = 300  # 5 minutes
+from rclm import _config, auth
+from rclm.auth import DEFAULT_BACKEND_SERVER_URL, DEFAULT_FRONTEND_URL
 
 # ---------------------------------------------------------------------------
 # Hook command definitions
@@ -174,9 +165,10 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --openclaw               # OpenClaw only
   %(prog)s --claude --cursor         # Claude Code + Cursor
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
-  %(prog)s --compress               # enable compression for Claude Code
-  %(prog)s --with-mcp               # also register the ReclaimLLM MCP server
+  %(prog)s --no-compress            # disable compression for Claude Code
+  %(prog)s --no-with-mcp            # skip registering the ReclaimLLM MCP server
 
+--with-mcp, --read-cache, --loop-breaker, and --compress are on by default.
 Subsequent installs without --api-key reuse the saved config.""",
     )
 
@@ -221,8 +213,12 @@ Subsequent installs without --api-key reuse the saved config.""",
     )
     parser.add_argument(
         "--compress",
-        action="store_true",
-        help="Enable context compression for Claude Code (rewrites Bash/Read/Grep inputs to reduce tokens)",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Context compression for Claude Code (rewrites Bash/Read/Grep inputs to reduce "
+            "tokens). On by default; pass --no-compress to disable"
+        ),
     )
     parser.add_argument(
         "--dlp",
@@ -231,25 +227,32 @@ Subsequent installs without --api-key reuse the saved config.""",
     )
     parser.add_argument(
         "--loop-breaker",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable loop detection (Claude only): flag repeated identical tool calls or "
-            "repeated failures on the same file, escalating to a permission prompt if the "
-            "pattern continues"
+            "Loop detection (Claude only): flag repeated identical tool calls or repeated "
+            "failures on the same file, escalating to a permission prompt if the pattern "
+            "continues. On by default; pass --no-loop-breaker to disable"
         ),
     )
     parser.add_argument(
         "--read-cache",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable read-cache/diff-on-change (Claude only): repeat reads of an unchanged "
-            "file are replaced with a short notice instead of the full content again"
+            "Read-cache/diff-on-change (Claude only): repeat reads of an unchanged file are "
+            "replaced with a short notice instead of the full content again. On by default; "
+            "pass --no-read-cache to disable"
         ),
     )
     parser.add_argument(
         "--with-mcp",
-        action="store_true",
-        help="Also install the ReclaimLLM MCP server into supported local MCP clients",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Also install the ReclaimLLM MCP server into supported local MCP clients. On by "
+            "default; pass --no-with-mcp to skip"
+        ),
     )
     parser.add_argument(
         "--context-pack",
@@ -535,97 +538,6 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Browser key flow
-# ---------------------------------------------------------------------------
-
-
-def _wait_for_api_key_via_browser(app_url: str) -> str | None:
-    """Open the settings page in a browser and wait for the user to POST back an API key.
-
-    A one-time nonce is embedded in the callback path so that only the rclm
-    app (which receives the full URL) can successfully POST to the local server.
-    Any request to a different path is rejected with 404.
-    """
-    received_key: list[str] = []
-    nonce = secrets.token_urlsafe(16)
-
-    class _Handler(BaseHTTPRequestHandler):
-        def do_OPTIONS(self) -> None:
-            if self.path != f"/{nonce}":
-                self.send_response(404)
-                self.end_headers()
-                return
-            self.send_response(200)
-            self._cors_headers()
-            self.end_headers()
-
-        def do_POST(self) -> None:
-            if self.path != f"/{nonce}":
-                self.send_response(404)
-                self.end_headers()
-                return
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length))
-                key = body.get("api_key", "").strip()
-                if key:
-                    received_key.append(key)
-            except Exception:
-                pass
-            self.send_response(200)
-            self._cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok":true}')
-
-        def _cors_headers(self) -> None:
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            # Chrome 98+ (Private Network Access spec): HTTPS pages need this
-            # header in the preflight response to be allowed to POST to localhost.
-            self.send_header("Access-Control-Allow-Private-Network", "true")
-
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-            pass
-
-    server = HTTPServer(("127.0.0.1", 0), _Handler)
-    port = server.server_address[1]
-    settings_url = f"{app_url}/settings?cli_callback=http://localhost:{port}/{nonce}"
-
-    print(
-        "No API key configured. Opening browser to create one...\n"
-        f"  {settings_url}\n\n"
-        "Waiting for key from browser... (Ctrl+C to cancel)\n",
-        file=sys.stderr,
-    )
-    webbrowser.open(settings_url)
-
-    deadline = time.monotonic() + _CALLBACK_TIMEOUT_S
-    server.timeout = 1.0
-    try:
-        while not received_key and time.monotonic() < deadline:
-            server.handle_request()
-    except KeyboardInterrupt:
-        print("\nCancelled. To install manually, run:", file=sys.stderr)
-        print("  rclm-hooks-install --api-key=<your-key>", file=sys.stderr)
-        return None
-    finally:
-        server.server_close()
-
-    if not received_key:
-        print(
-            f"Timed out waiting for API key.\n"
-            f"Visit {app_url}/settings to create a key, then run:\n"
-            "  rclm-hooks-install --api-key=<your-key>",
-            file=sys.stderr,
-        )
-        return None
-
-    return received_key[0]
-
-
-# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -656,17 +568,21 @@ def main() -> None:
     server_url: str = args.server_url or saved.get("server_url") or DEFAULT_BACKEND_SERVER_URL
 
     if not api_key:
-        api_key = _wait_for_api_key_via_browser(DEFAULT_FRONTEND_URL)
+        api_key = auth.wait_for_api_key_via_browser(DEFAULT_FRONTEND_URL)
         if not api_key:
             sys.exit(1)
 
     server_url = server_url.replace('"', "").replace("'", "").strip()
     api_key = api_key.replace('"', "").replace("'", "").strip()
 
-    compress_enabled = args.compress or saved.get("compress", False)
+    compress_enabled = args.compress if args.compress is not None else saved.get("compress", True)
     dlp_enabled = args.dlp or saved.get("dlp", False)
-    loop_breaker_enabled = args.loop_breaker or saved.get("loop_breaker", False)
-    read_cache_enabled = args.read_cache or saved.get("read_cache", False)
+    loop_breaker_enabled = (
+        args.loop_breaker if args.loop_breaker is not None else saved.get("loop_breaker", True)
+    )
+    read_cache_enabled = (
+        args.read_cache if args.read_cache is not None else saved.get("read_cache", True)
+    )
     context_pack_enabled = args.context_pack or saved.get("context_pack", False)
     handoff_advisor_enabled = args.handoff_advisor or saved.get("handoff_advisor", False)
     shadow_mode_enabled = args.shadow_mode or saved.get("shadow_mode", False)

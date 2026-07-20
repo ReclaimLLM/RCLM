@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rclm import _config
+from rclm import _config, auth
 from rclm.hooks import installer
 
 # ---------------------------------------------------------------------------
@@ -202,8 +202,8 @@ def test_with_mcp_reuses_saved_api_key_without_browser_prompt(tmp_path, monkeypa
         ],
     )
     monkeypatch.setattr(
-        installer,
-        "_wait_for_api_key_via_browser",
+        auth,
+        "wait_for_api_key_via_browser",
         lambda _url: pytest.fail("browser API-key flow should not run"),
     )
     monkeypatch.setattr("rclm.mcp_install._resolve_binary", lambda: "/bin/rclm-mcp")
@@ -226,7 +226,7 @@ def test_missing_api_key_exits_1_and_shows_setup_url(tmp_path, monkeypatch, caps
     monkeypatch.setattr("sys.argv", ["rclm-hooks-install"])
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
     # Patch browser flow to return None immediately (simulates user cancelling).
-    monkeypatch.setattr(installer, "_wait_for_api_key_via_browser", lambda server_url: None)
+    monkeypatch.setattr(auth, "wait_for_api_key_via_browser", lambda server_url: None)
 
     with pytest.raises(SystemExit) as exc_info:
         installer.main()
@@ -238,7 +238,7 @@ def test_missing_api_key_does_not_write_settings_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("sys.argv", ["rclm-hooks-install"])
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
-    monkeypatch.setattr(installer, "_wait_for_api_key_via_browser", lambda server_url: None)
+    monkeypatch.setattr(auth, "wait_for_api_key_via_browser", lambda server_url: None)
 
     with pytest.raises(SystemExit):
         installer.main()
@@ -366,12 +366,20 @@ def test_compress_flag_saves_to_config(tmp_path, monkeypatch):
     assert config["compress"] is True
 
 
-def test_compress_off_by_default(tmp_path, monkeypatch):
+def test_compress_on_by_default(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _run_install(monkeypatch, tmp_path)
 
     config = json.loads((tmp_path / "config.json").read_text())
-    assert config.get("compress") is False
+    assert config["compress"] is True
+
+
+def test_no_compress_disables(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-compress")
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["compress"] is False
 
 
 def test_compress_flag_persists_across_reinstalls(tmp_path, monkeypatch):
@@ -390,11 +398,23 @@ def test_compress_flag_persists_across_reinstalls(tmp_path, monkeypatch):
     assert config["compress"] is True
 
 
-def test_rtk_only_removed_when_compress_enabled(tmp_path, monkeypatch):
-    """RTK hooks should only be removed when --compress is passed."""
+def test_no_compress_persists_across_reinstalls(tmp_path, monkeypatch):
+    """Once --no-compress is set, subsequent installs without any flag preserve the opt-out."""
     monkeypatch.chdir(tmp_path)
 
-    # Pre-populate settings with a fake RTK hook.
+    # First install disables compression explicitly.
+    _run_install(monkeypatch, tmp_path, "--no-compress")
+
+    # Second install with no flags should keep it disabled, not fall back to the new default.
+    monkeypatch.setattr("sys.argv", ["rclm-hooks-install"])
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    installer.main()
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["compress"] is False
+
+
+def _seed_rtk_hook(tmp_path: Path) -> Path:
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(
@@ -411,15 +431,85 @@ def test_rtk_only_removed_when_compress_enabled(tmp_path, monkeypatch):
             }
         )
     )
+    return settings_path
 
-    # Install without --compress — RTK should survive.
-    _run_install(monkeypatch, tmp_path)
+
+def test_rtk_survives_with_no_compress(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings_path = _seed_rtk_hook(tmp_path)
+
+    _run_install(monkeypatch, tmp_path, "--no-compress")
+
     settings = _read_settings(settings_path)
     rtk_commands = _hook_commands_for_event(settings, "PreToolUse")
     assert "rtk bash-tool" in rtk_commands
 
-    # Install with --compress — RTK should be removed.
-    _run_install(monkeypatch, tmp_path, "--compress")
+
+def test_rtk_removed_by_default(tmp_path, monkeypatch):
+    """Compress is on by default, so RTK hooks are removed even without --compress."""
+    monkeypatch.chdir(tmp_path)
+    settings_path = _seed_rtk_hook(tmp_path)
+
+    _run_install(monkeypatch, tmp_path)
+
     settings = _read_settings(settings_path)
     rtk_commands = _hook_commands_for_event(settings, "PreToolUse")
     assert "rtk bash-tool" not in rtk_commands
+
+
+# ---------------------------------------------------------------------------
+# read-cache / loop-breaker / with-mcp defaults
+# ---------------------------------------------------------------------------
+
+
+def test_read_cache_on_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path)
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["read_cache"] is True
+
+
+def test_no_read_cache_disables(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-read-cache")
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["read_cache"] is False
+
+
+def test_loop_breaker_on_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path)
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["loop_breaker"] is True
+
+
+def test_no_loop_breaker_disables(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-loop-breaker")
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["loop_breaker"] is False
+
+
+def test_with_mcp_on_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("rclm.mcp_install._resolve_binary", lambda: "/bin/rclm-mcp")
+
+    _run_install(monkeypatch, tmp_path)
+
+    assert (tmp_path / ".claude" / "mcp.json").exists()
+
+
+def test_no_with_mcp_skips_install(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "rclm.mcp_install.install_mcp",
+        lambda **kwargs: pytest.fail("MCP install should be skipped"),
+    )
+
+    _run_install(monkeypatch, tmp_path, "--no-with-mcp")
+
+    assert not (tmp_path / ".claude" / "mcp.json").exists()

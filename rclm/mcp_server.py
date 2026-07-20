@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 import aiohttp
 
-from rclm import _config
+from rclm import _config, auth
 from rclm._http import create_tcp_connector
 
 _DEFAULT_LIMIT = 5
@@ -69,10 +69,8 @@ def _load_credentials() -> Credentials:
     server_url = (cfg.get("server_url") or os.environ.get("RECLAIMLLM_SERVER_URL") or "").strip()
     api_key = (cfg.get("api_key") or os.environ.get("RECLAIMLLM_API_KEY") or "").strip()
 
-    if not server_url:
-        raise ReclaimLLMError("ReclaimLLM server_url missing. Run `rclm-hooks-install --with-mcp`.")
-    if not api_key:
-        raise ReclaimLLMError("ReclaimLLM api_key missing. Run `rclm-hooks-install --with-mcp`.")
+    if not server_url or not api_key:
+        raise ReclaimLLMError(auth.AUTH_REQUIRED_MESSAGE)
     return Credentials(server_url=server_url.rstrip("/"), api_key=api_key)
 
 
@@ -172,6 +170,8 @@ class ReclaimLLMClient:
             session.request(method, url, params=params) as resp,
         ):
             body = await resp.text()
+            if resp.status in (401, 403):
+                raise ReclaimLLMError(auth.AUTH_REQUIRED_MESSAGE)
             if resp.status >= 400:
                 detail = body
                 with suppress(Exception):

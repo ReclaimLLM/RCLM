@@ -3,6 +3,26 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.18] — 2026-07-20
+
+### Added
+- Added `rclm-login` CLI entry point for standalone sign-in without installing hooks (`rclm/login.py`, `pyproject.toml`)
+- Added shared `rclm/auth.py` module consolidating the browser device-flow key handoff and `/api/whoami` key validation, used by `rclm-hooks-install`, `rclm-login`, and `rclm-mcp`
+- Added support for pasting an API key directly into the terminal while waiting for the browser callback, via `select()`-based stdin multiplexing (POSIX only; falls back to browser-only wait on Windows) (`rclm/auth.py`)
+- Added tests for the new auth module and `rclm-login` entrypoint, including the stdin-paste flow (`rclm/tests/test_auth.py`, `rclm/tests/test_login.py`)
+
+### Changed
+- Changed `--with-mcp`, `--read-cache`, `--loop-breaker`, and `--compress` to be enabled by default on `rclm-hooks-install`; pass `--no-<flag>` to opt out, and the opt-out persists across reinstalls (`rclm/hooks/installer.py`)
+- Changed `rclm-mcp` auth-required and 401/403 error messages to point at `rclm-login` instead of the retired `rclm-hooks-install --with-mcp` credential path (`rclm/mcp_server.py`)
+
+### Fixed
+- Fixed installer tests that asserted compression/RTK-removal were off by default, which no longer matched the new default-on behavior; added matching coverage for the `--no-compress`/`--no-read-cache`/`--no-loop-breaker`/`--no-with-mcp` opt-outs (`rclm/tests/hooks/test_installer.py`)
+
+### Security
+- Moved the local CLI callback URL out of the query string and into the URL fragment so it's never transmitted to the server or captured by page-load analytics (`rclm/auth.py`)
+
+---
+
 ## [v0.1.16] — 2026-07-07
 
 ### Added

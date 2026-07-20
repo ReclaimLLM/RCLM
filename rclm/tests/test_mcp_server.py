@@ -283,5 +283,51 @@ def test_missing_credentials_raises(tmp_path, monkeypatch):
     monkeypatch.delenv("RECLAIMLLM_SERVER_URL", raising=False)
     monkeypatch.delenv("RECLAIMLLM_API_KEY", raising=False)
 
-    with pytest.raises(mcp_server.ReclaimLLMError):
+    with pytest.raises(mcp_server.ReclaimLLMError) as exc_info:
         mcp_server._load_credentials()
+
+    assert "rclm-login" in str(exc_info.value)
+
+
+class _FakeAuthFailureResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    async def text(self) -> str:
+        return "unauthorized"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeAuthFailureSession:
+    def __init__(self, status: int) -> None:
+        self._status = status
+
+    def request(self, method, url, params=None):
+        return _FakeAuthFailureResponse(self._status)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_request_raises_clear_message_on_401(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "revoked-key"}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(
+        mcp_server.aiohttp, "ClientSession", lambda **kwargs: _FakeAuthFailureSession(401)
+    )
+
+    client = mcp_server.ReclaimLLMClient()
+    with pytest.raises(mcp_server.ReclaimLLMError) as exc_info:
+        await client._request("GET", "/api/sessions")
+
+    assert "rclm-login" in str(exc_info.value)

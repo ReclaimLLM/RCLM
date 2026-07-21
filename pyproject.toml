@@ -41,6 +41,7 @@ dev = [
 rclm = "rclm.cli:main"
 rclm-proxy = "rclm.proxy.start:main"
 rclm-claude-hooks = "rclm.hooks.claude_handler:main"
+rclm-claude-statusline = "rclm.hooks.statusline_handler:main"
 rclm-codex-hooks = "rclm.hooks.codex_handler:main"
 rclm-cursor-hooks = "rclm.hooks.cursor_handler:main"
 rclm-gemini-hooks = "rclm.hooks.gemini_handler:main"

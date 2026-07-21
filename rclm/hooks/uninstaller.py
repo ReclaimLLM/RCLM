@@ -84,16 +84,23 @@ def _parse_flags() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _is_rclm_hook(entry: dict) -> bool:
-    """Return True if every command in this entry belongs to rclm.
+def _command_belongs_to_rclm(command: str) -> bool:
+    """Return True if a hook/statusLine command invokes an rclm-* binary.
 
-    Matches both the current prefix (rclm-) and the legacy prefix
-    (rclm-) so stale entries from older installs are cleaned up.
+    Installers resolve binaries to an absolute path via shutil.which when found on
+    PATH (e.g. /home/user/.venv/bin/rclm-claude-hooks), so this checks the basename
+    of the first token rather than a literal string prefix on the full command.
     """
+    first_token = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+    return Path(first_token).name.startswith("rclm-")
+
+
+def _is_rclm_hook(entry: dict) -> bool:
+    """Return True if every command in this entry belongs to rclm."""
     hooks = entry.get("hooks", [])
     if not hooks:
         return False
-    return all(hook.get("command", "").strip().startswith(("rclm-", "rclm-")) for hook in hooks)
+    return all(_command_belongs_to_rclm(hook.get("command", "")) for hook in hooks)
 
 
 def _remove_from_settings(settings: dict) -> tuple[dict, int]:
@@ -111,7 +118,30 @@ def _remove_from_settings(settings: dict) -> tuple[dict, int]:
     if not hooks_section:
         settings.pop("hooks", None)
 
+    total_removed += _remove_statusline(settings)
+
     return settings, total_removed
+
+
+def _remove_statusline(settings: dict) -> int:
+    """Strip an rclm-installed statusLine, restoring any backed-up prior one.
+
+    No-op for providers (Gemini, Codex) that never had a statusLine key written.
+    """
+    status_line = settings.get("statusLine")
+    if not isinstance(status_line, dict) or not _command_belongs_to_rclm(
+        str(status_line.get("command", ""))
+    ):
+        return 0
+
+    saved = _config.load()
+    backup = saved.get("statusline_backup")
+    if backup:
+        settings["statusLine"] = backup
+        _config.patch(statusline_backup=None)
+    else:
+        settings.pop("statusLine", None)
+    return 1
 
 
 # ---------------------------------------------------------------------------

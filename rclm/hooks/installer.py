@@ -16,9 +16,10 @@ Usage:
     rclm-hooks-install --api-key=<key>            # explicit key (skips browser)
     rclm-hooks-install --no-compress               # disable compression (Claude only)
     rclm-hooks-install --no-with-mcp               # skip installing ReclaimLLM MCP server
+    rclm-hooks-install --no-statusline             # skip the Claude Code statusline
 
---with-mcp, --read-cache, --loop-breaker, and --compress are on by default; pass the
---no-<flag> form to opt out. Credentials and preferences are stored in
+--with-mcp, --read-cache, --loop-breaker, --compress, and --statusline are on by default;
+pass the --no-<flag> form to opt out. Credentials and preferences are stored in
 ~/.reclaimllm/config.json and reused on subsequent runs.
 """
 
@@ -167,8 +168,9 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
   %(prog)s --no-compress            # disable compression for Claude Code
   %(prog)s --no-with-mcp            # skip registering the ReclaimLLM MCP server
+  %(prog)s --no-statusline          # skip the Claude Code statusline
 
---with-mcp, --read-cache, --loop-breaker, and --compress are on by default.
+--with-mcp, --read-cache, --loop-breaker, --compress, and --statusline are on by default.
 Subsequent installs without --api-key reuse the saved config.""",
     )
 
@@ -252,6 +254,16 @@ Subsequent installs without --api-key reuse the saved config.""",
         help=(
             "Also install the ReclaimLLM MCP server into supported local MCP clients. On by "
             "default; pass --no-with-mcp to skip"
+        ),
+    )
+    parser.add_argument(
+        "--statusline",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Claude Code statusline showing context usage, rate limits, peak/off-peak, model, "
+            "git branch, and lines changed. On by default; pass --no-statusline to disable. "
+            "An existing non-rclm statusLine is backed up and restored on uninstall"
         ),
     )
     parser.add_argument(
@@ -428,7 +440,39 @@ def _merge_cursor_hooks(data: dict, hooks_to_inject: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _install_claude(use_global: bool, compress_enabled: bool) -> None:
+_STATUSLINE_REFRESH_INTERVAL_S = 5
+
+
+def _command_belongs_to_rclm(command: str) -> bool:
+    """Return True if a statusLine/hook command invokes an rclm-* binary.
+
+    Checks the basename of the first token rather than a literal string prefix on
+    the full command, since _resolve_binary may return an absolute path (e.g.
+    /home/user/.venv/bin/rclm-claude-statusline) when the binary is found on PATH.
+    """
+    first_token = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+    return Path(first_token).name.startswith("rclm-")
+
+
+def _apply_statusline(settings: dict) -> None:
+    """Write the rclm statusLine, backing up and preserving any existing non-rclm one."""
+    existing = settings.get("statusLine")
+    if isinstance(existing, dict) and not _command_belongs_to_rclm(existing.get("command", "")):
+        _config.patch(statusline_backup=existing)
+        print(
+            "Warning: replacing your existing Claude Code statusLine with the rclm statusline "
+            "(backed up; restored automatically by rclm-hooks-uninstall).",
+            file=sys.stderr,
+        )
+    settings["statusLine"] = {
+        "type": "command",
+        "command": _resolve_binary("rclm-claude-statusline"),
+        "padding": 0,
+        "refreshInterval": _STATUSLINE_REFRESH_INTERVAL_S,
+    }
+
+
+def _install_claude(use_global: bool, compress_enabled: bool, statusline_enabled: bool) -> None:
     path = (
         Path.home() / ".claude" / "settings.json"
         if use_global
@@ -443,6 +487,8 @@ def _install_claude(use_global: bool, compress_enabled: bool) -> None:
     if compress_enabled:
         _remove_rtk_hooks(settings)
     _merge_settings_hooks(settings, hooks)
+    if statusline_enabled:
+        _apply_statusline(settings)
     _write_json(path, settings)
     print(f"rclm hooks installed into {path}")
 
@@ -583,6 +629,9 @@ def main() -> None:
     read_cache_enabled = (
         args.read_cache if args.read_cache is not None else saved.get("read_cache", True)
     )
+    statusline_enabled = (
+        args.statusline if args.statusline is not None else saved.get("statusline", True)
+    )
     context_pack_enabled = args.context_pack or saved.get("context_pack", False)
     handoff_advisor_enabled = args.handoff_advisor or saved.get("handoff_advisor", False)
     shadow_mode_enabled = args.shadow_mode or saved.get("shadow_mode", False)
@@ -593,6 +642,7 @@ def main() -> None:
         dlp=dlp_enabled,
         loop_breaker=loop_breaker_enabled,
         read_cache=read_cache_enabled,
+        statusline=statusline_enabled,
         context_pack=context_pack_enabled,
         handoff_advisor=handoff_advisor_enabled,
         shadow_mode=shadow_mode_enabled,
@@ -608,11 +658,16 @@ def main() -> None:
 
     for provider in providers:
         if provider == "claude":
-            _install_claude(use_global, compress_enabled)
+            _install_claude(use_global, compress_enabled, statusline_enabled)
         elif provider == "gemini":
             _install_gemini(use_global)
         elif provider == "codex":
             _install_codex(use_global)
+            print(
+                "Codex CLI already shows context and rate-limit usage natively — run "
+                "`/statusline` inside codex and enable context-used, context-remaining, "
+                "five-hour-limit, and weekly-limit."
+            )
         elif provider == "cursor":
             _install_cursor(use_global)
         elif provider == "openclaw":

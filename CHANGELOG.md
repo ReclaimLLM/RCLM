@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.19] — 2026-07-21
+
+### Added
+- Added `rclm-claude-statusline` entry point: a Claude Code statusline showing context window usage, five-hour/weekly rate limits (Claude.ai subscribers only), PEAK/OFF-PEAK status against Anthropic's published weekday 5–11am Pacific window, model name, git branch, and lines changed — sourced entirely from Claude Code's `statusLine` stdin payload with no network calls (`rclm/hooks/statusline_handler.py`, `pyproject.toml`)
+- Added `--statusline`/`--no-statusline` flag to `rclm-hooks-install`, on by default and persisted across reinstalls the same way `--compress` is (`rclm/hooks/installer.py`)
+
+### Changed
+- `rclm-hooks-install` now backs up any pre-existing non-rclm Claude Code `statusLine` into `~/.reclaimllm/config.json` before replacing it, and `rclm-hooks-uninstall` restores it automatically (`rclm/hooks/installer.py`, `rclm/hooks/uninstaller.py`)
+- `rclm-hooks-install --codex` now prints a one-line hint to enable Codex's native `context-used`/`context-remaining`/`five-hour-limit`/`weekly-limit` status line items via `/statusline`, since Codex has no external-script hook to target (`rclm/hooks/installer.py`)
+
+### Fixed
+- Fixed `rclm-hooks-uninstall` silently removing nothing in any real (`pip install rclm`) installation: hook and statusline commands were matched by literal string prefix (`command.startswith("rclm-")`), but `_resolve_binary` returns an absolute path (e.g. `/home/user/.venv/bin/rclm-claude-hooks`) whenever the binary is found on PATH; matching is now done against the binary's basename via a shared `_command_belongs_to_rclm` helper (`rclm/hooks/installer.py`, `rclm/hooks/uninstaller.py`)
+
+---
+
 ## [v0.1.18] — 2026-07-20
 
 ### Added

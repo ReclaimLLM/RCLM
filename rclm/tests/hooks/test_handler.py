@@ -381,13 +381,41 @@ def test_handoff_advisor_prints_once_per_session(monkeypatch, tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_pre_tool_use_no_compression_by_default(monkeypatch, tmp_path, capsys):
-    """With compress=False (default), PreToolUse should NOT print updatedInput."""
+def test_pre_tool_use_compression_enabled_by_default(monkeypatch, tmp_path, capsys):
+    """With no config file, compression defaults to enabled, so PreToolUse prints updatedInput."""
     from rclm import _config
     from rclm.hooks import session_store
 
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+
+    session_store.append_event(
+        "sid-c1", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"}
+    )
+
+    payload = {
+        "session_id": "sid-c1",
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "foo"},
+        "timestamp": "2024-01-01T00:00:01Z",
+    }
+    _run_handler("PreToolUse", payload, monkeypatch)
+
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    validate(instance=output, schema=CLAUDE_PRE_TOOL_USE_OUTPUT_SCHEMA)
+    assert output["hookSpecificOutput"]["updatedInput"]["head_limit"] == 50
+
+
+def test_pre_tool_use_no_compression_when_disabled(monkeypatch, tmp_path, capsys):
+    """With compress=False explicitly set, PreToolUse should NOT print updatedInput."""
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"compress": False}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
 
     session_store.append_event(
         "sid-c1", {"event_type": "SessionStart", "cwd": "/x", "timestamp": "2024-01-01T00:00:00Z"}
@@ -493,7 +521,9 @@ def test_loop_breaker_shadow_mode_records_but_does_not_warn(monkeypatch, tmp_pat
 
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({"loop_breaker": True, "shadow_mode": True}))
+    config_path.write_text(
+        json.dumps({"loop_breaker": True, "shadow_mode": True, "compress": False})
+    )
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
 
     payload = {

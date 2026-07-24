@@ -72,6 +72,86 @@ def test_should_not_skip_record_outside_excluded_folder(tmp_path: Path):
     assert not redaction.should_skip_record(_record(str(tmp_path / "public")), settings)
 
 
+def test_should_skip_record_inside_wildcard_excluded_folder(tmp_path: Path):
+    memory_dir = tmp_path / "Users" / "example" / ".codex" / "memories" / "notes"
+    memory_dir.mkdir(parents=True)
+    settings = redaction.RedactionSettings(
+        enabled=True,
+        remote_substitutions={},
+        local_substitutions={},
+        exclude_folders=["**/.codex/memories/"],
+    )
+
+    assert redaction.should_skip_record(_record(str(memory_dir)), settings)
+
+
+def test_wildcard_excluded_folder_does_not_skip_sibling_codex_paths(tmp_path: Path):
+    session_dir = tmp_path / "Users" / "example" / ".codex" / "sessions" / "2026"
+    session_dir.mkdir(parents=True)
+    settings = redaction.RedactionSettings(
+        enabled=True,
+        remote_substitutions={},
+        local_substitutions={},
+        exclude_folders=["**/.codex/memories/"],
+    )
+
+    assert not redaction.should_skip_record(_record(str(session_dir)), settings)
+
+
+def test_include_folders_allow_matching_record(tmp_path: Path):
+    project = tmp_path / "allowed"
+    project.mkdir()
+    settings = redaction.RedactionSettings(
+        enabled=True,
+        remote_substitutions={},
+        local_substitutions={},
+        include_folders=[str(project)],
+        exclude_folders=[],
+    )
+
+    assert not redaction.should_skip_record(_record(str(project / "repo")), settings)
+
+
+def test_include_folders_skip_non_matching_record(tmp_path: Path):
+    settings = redaction.RedactionSettings(
+        enabled=True,
+        remote_substitutions={},
+        local_substitutions={},
+        include_folders=[str(tmp_path / "allowed")],
+        exclude_folders=[],
+    )
+
+    assert redaction.should_skip_record(_record(str(tmp_path / "other")), settings)
+
+
+def test_include_folders_supersede_exclude_folders(tmp_path: Path):
+    project = tmp_path / "allowed"
+    project.mkdir()
+    settings = redaction.RedactionSettings(
+        enabled=True,
+        remote_substitutions={},
+        local_substitutions={},
+        include_folders=[str(project)],
+        exclude_folders=[str(project)],
+    )
+
+    assert not redaction.should_skip_record(_record(str(project / "repo")), settings)
+
+
+def test_wildcard_include_folder_matches_nested_record(tmp_path: Path):
+    project = tmp_path / "Users" / "example" / "work" / "repo"
+    project.mkdir(parents=True)
+    settings = redaction.RedactionSettings(
+        enabled=True,
+        remote_substitutions={},
+        local_substitutions={},
+        include_folders=["**/work/"],
+        exclude_folders=[],
+    )
+
+    assert not redaction.should_skip_record(_record(str(project)), settings)
+
+
 def test_ensure_settings_writes_missing_default_keys(tmp_path: Path, monkeypatch):
     config_path = tmp_path / "config.json"
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
@@ -84,7 +164,8 @@ def test_ensure_settings_writes_missing_default_keys(tmp_path: Path, monkeypatch
         "enabled": True,
         "remote_substitutions": {},
         "local_substitutions": {},
-        "exclude_folders": [],
+        "include_folders": [],
+        "exclude_folders": ["**/.codex/memories/"],
         "last_sync": None,
     }
 
@@ -100,7 +181,8 @@ def test_sync_remote_settings_seeds_defaults_when_credentials_missing(tmp_path: 
     assert cfg["enabled"] is True
     assert cfg["remote_substitutions"] == {}
     assert cfg["local_substitutions"] == {}
-    assert cfg["exclude_folders"] == []
+    assert cfg["include_folders"] == []
+    assert cfg["exclude_folders"] == ["**/.codex/memories/"]
     assert cfg["last_sync"] is None
 
 
@@ -114,6 +196,7 @@ def test_sync_remote_settings_preserves_local_fields(tmp_path: Path, monkeypatch
             "enabled": True,
             "remote_substitutions": {"old": "[OLD]"},
             "local_substitutions": {"local": "[LOCAL]"},
+            "include_folders": ["/allowed"],
             "exclude_folders": ["/private"],
             "last_sync": None,
         },
@@ -143,7 +226,8 @@ def test_sync_remote_settings_preserves_local_fields(tmp_path: Path, monkeypatch
     assert cfg["enabled"] is False
     assert cfg["remote_substitutions"] == {"remote": "[REMOTE]"}
     assert cfg["local_substitutions"] == {"local": "[LOCAL]"}
-    assert cfg["exclude_folders"] == ["/private"]
+    assert cfg["include_folders"] == ["/allowed"]
+    assert cfg["exclude_folders"] == ["**/.codex/memories/", "/private"]
     assert cfg["last_sync"]
 
 

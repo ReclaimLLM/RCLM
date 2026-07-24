@@ -87,6 +87,54 @@ async def test_upload_skips_excluded_folder(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_upload_skips_outside_include_folder(tmp_path, monkeypatch):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _config.patch(
+        server_url="https://api.example.test",
+        api_key="key",
+        redaction={
+            "enabled": True,
+            "remote_substitutions": {},
+            "local_substitutions": {},
+            "include_folders": [str(allowed)],
+            "exclude_folders": [],
+            "last_sync": None,
+        },
+    )
+    session = _Session()
+
+    await upload(_record(str(tmp_path / "other")), session)
+
+    assert session.posts == []
+
+
+@pytest.mark.asyncio
+async def test_upload_include_folder_supersedes_exclude_folder(tmp_path, monkeypatch):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _config.patch(
+        server_url="https://api.example.test",
+        api_key="key",
+        redaction={
+            "enabled": True,
+            "remote_substitutions": {},
+            "local_substitutions": {},
+            "include_folders": [str(allowed)],
+            "exclude_folders": [str(allowed)],
+            "last_sync": None,
+        },
+    )
+    session = _Session()
+
+    await upload(_record(str(allowed / "repo")), session)
+
+    assert len(session.posts) == 1
+
+
+@pytest.mark.asyncio
 async def test_upload_prefers_config_server_url_over_env(tmp_path, monkeypatch):
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
     monkeypatch.setenv("RECLAIMLLM_SERVER_URL", "https://env.example.test")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import json
 import logging
 import urllib.error
@@ -17,6 +18,7 @@ from rclm._endpoints import REDACTION_SETTINGS_PATH
 logger = logging.getLogger(__name__)
 
 _NETWORK_TIMEOUT_S = 30
+_DEFAULT_EXCLUDE_FOLDERS = ["**/.codex/memories/"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -24,7 +26,8 @@ class RedactionSettings:
     enabled: bool
     remote_substitutions: dict[str, Any]
     local_substitutions: dict[str, Any]
-    exclude_folders: list[str]
+    include_folders: list[str] = dataclasses.field(default_factory=list)
+    exclude_folders: list[str] = dataclasses.field(default_factory=list)
     last_sync: str | None = None
 
     @property
@@ -39,7 +42,8 @@ def default_redaction_config() -> dict[str, Any]:
         "enabled": True,
         "remote_substitutions": {},
         "local_substitutions": {},
-        "exclude_folders": [],
+        "include_folders": [],
+        "exclude_folders": list(_DEFAULT_EXCLUDE_FOLDERS),
         "last_sync": None,
     }
 
@@ -50,10 +54,15 @@ def _normalise_mapping(value: object) -> dict[str, Any]:
     return {k: v for k, v in value.items() if isinstance(k, str) and isinstance(v, str) and k}
 
 
-def _normalise_folders(value: object) -> list[str]:
+def _normalise_folders(value: object, *, defaults: list[str] | None = None) -> list[str]:
+    folders = list(defaults or [])
     if not isinstance(value, list):
-        return []
-    return [str(item) for item in value if str(item).strip()]
+        return folders
+    for item in value:
+        folder = str(item).strip()
+        if folder and folder not in folders:
+            folders.append(folder)
+    return folders
 
 
 def load_settings(cfg: dict | None = None) -> RedactionSettings:
@@ -67,7 +76,11 @@ def load_settings(cfg: dict | None = None) -> RedactionSettings:
         enabled=bool(raw.get("enabled", defaults["enabled"])),
         remote_substitutions=_normalise_mapping(raw.get("remote_substitutions")),
         local_substitutions=_normalise_mapping(raw.get("local_substitutions")),
-        exclude_folders=_normalise_folders(raw.get("exclude_folders")),
+        include_folders=_normalise_folders(raw.get("include_folders")),
+        exclude_folders=_normalise_folders(
+            raw.get("exclude_folders"),
+            defaults=_DEFAULT_EXCLUDE_FOLDERS,
+        ),
         last_sync=(raw.get("last_sync") if isinstance(raw.get("last_sync"), str) else None),
     )
 
@@ -77,6 +90,7 @@ def _settings_to_config(settings: RedactionSettings) -> dict[str, Any]:
         "enabled": settings.enabled,
         "remote_substitutions": settings.remote_substitutions,
         "local_substitutions": settings.local_substitutions,
+        "include_folders": settings.include_folders,
         "exclude_folders": settings.exclude_folders,
         "last_sync": settings.last_sync,
     }
@@ -140,6 +154,7 @@ def sync_remote_settings(
             enabled=bool(payload.get("enabled", True)),
             remote_substitutions=remote_substitutions,
             local_substitutions=current.local_substitutions,
+            include_folders=current.include_folders,
             exclude_folders=current.exclude_folders,
             last_sync=datetime.now(timezone.utc).isoformat(),
         )
@@ -164,10 +179,60 @@ def _is_relative_to(path: Path, folder: Path) -> bool:
         return False
 
 
+def _is_glob_pattern(path: str) -> bool:
+    return any(char in path for char in "*?[")
+
+
+def _glob_patterns(raw_folder: str) -> list[str]:
+    pattern = raw_folder.strip().replace("\\", "/")
+    if not pattern:
+        return []
+    base = pattern.rstrip("/")
+    if not base:
+        return []
+    patterns = [base, f"{base}/**"]
+    if base.startswith("**/"):
+        # Let "**/.codex/memories/" match paths after the leading home segments
+        # have already been skipped or normalized away.
+        unanchored = base[3:]
+        patterns.extend([unanchored, f"{unanchored}/**"])
+    return patterns
+
+
+def _path_match_inputs(path: Path) -> list[str]:
+    full = path.as_posix().rstrip("/")
+    inputs = [full]
+    parts = [part for part in path.parts if part != path.anchor]
+    if parts:
+        inputs.append("/".join(parts).rstrip("/"))
+    if len(parts) > 2:
+        inputs.append("/".join(parts[2:]).rstrip("/"))
+    return [item for item in dict.fromkeys(inputs) if item]
+
+
+def _matches_folder_glob(candidate: Path, raw_folder: str) -> bool:
+    patterns = _glob_patterns(raw_folder)
+    if not patterns:
+        return False
+    return any(
+        fnmatch.fnmatchcase(path_text, pattern)
+        for path_text in _path_match_inputs(candidate)
+        for pattern in patterns
+    )
+
+
+def _matches_folder(candidate: Path, raw_folder: str) -> bool:
+    if _is_glob_pattern(raw_folder):
+        return _matches_folder_glob(candidate, raw_folder)
+
+    folder = _resolve_path(raw_folder)
+    return folder is not None and _is_relative_to(candidate, folder)
+
+
 def should_skip_record(record: object, settings: RedactionSettings | None = None) -> bool:
-    """Return True when record belongs to a locally excluded folder."""
+    """Return True when record is outside includes or inside excludes."""
     settings = settings or load_settings()
-    if not settings.exclude_folders:
+    if not settings.include_folders and not settings.exclude_folders:
         return False
 
     candidates = [
@@ -176,14 +241,18 @@ def should_skip_record(record: object, settings: RedactionSettings | None = None
     ]
     resolved_candidates = [p for p in (_resolve_path(str(c or "")) for c in candidates) if p]
     if not resolved_candidates:
-        return False
+        return bool(settings.include_folders)
+
+    if settings.include_folders:
+        for raw_folder in settings.include_folders:
+            for candidate in resolved_candidates:
+                if _matches_folder(candidate, raw_folder):
+                    return False
+        return True
 
     for raw_folder in settings.exclude_folders:
-        folder = _resolve_path(raw_folder)
-        if folder is None:
-            continue
         for candidate in resolved_candidates:
-            if _is_relative_to(candidate, folder):
+            if _matches_folder(candidate, raw_folder):
                 return True
     return False
 

@@ -20,6 +20,7 @@ from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
 from rclm.hooks import (
+    dedupe,
     dlp,
     read_cache,
     session_store,
@@ -32,7 +33,9 @@ from rclm.hooks._analytics import (
     mechanism_saving_event,
 )
 from rclm.hooks.compress import maybe_compress
+from rclm.hooks.handoff_advisor import thresholds_from_config
 from rclm.hooks.loop_breaker import analyze as analyze_loop
+from rclm.hooks.updater import schedule_session_end_update
 from rclm.mcp_server import ReclaimLLMClient, ReclaimLLMError
 
 logger = logging.getLogger(__name__)
@@ -44,11 +47,9 @@ THRESHOLD_ZERO_DURATION = (
 CONTEXT_PACK_TIMEOUT_S = 3.0  # SessionStart blocks Claude Code's startup; keep this tight.
 CONTEXT_PACK_LIMIT = 3
 
-# Handoff-advisor thresholds: transcript-estimate tokens (see PRD G1 — this
-# undercounts real billed tokens, but is a fine relative growth signal within
-# one session) or tool-call count, whichever trips first.
-HANDOFF_TOKEN_THRESHOLD = 80_000
-HANDOFF_TOOL_CALL_THRESHOLD = 60
+# Handoff-advisor thresholds use transcript-estimated tokens. This undercounts
+# real billed tokens, but is a fine relative growth signal within one session.
+HANDOFF_ADVISOR_MARKER = "handoff_advisor_shown"
 
 
 def _now() -> str:
@@ -178,7 +179,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             pass  # Never let DLP disrupt Claude Code
 
-    if cfg.get("compress", False):
+    if _config.compression_config(cfg)["enabled"]:
         try:
             # Bash rewrites always apply — they route through rclm-compress, which
             # measures and makes its own shadow/enforce output decision. Native
@@ -269,6 +270,50 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 context_notes.append("[rclm DLP] Secrets were redacted from the tool response.")
         except Exception:
             pass  # Never let DLP disrupt Claude Code
+
+    compression = _config.compression_config(cfg)
+    if compression["dedupe"]:
+        try:
+            state = session_store.read_dedupe_state(session_id)
+            turn = sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
+            replacement, state, match = dedupe.maybe_dedupe(
+                effective_text,
+                state,
+                tool_name=tool_name,
+                turn=turn,
+                cwd=_resolve_cwd(session_id, payload),
+                min_chars=int(compression["min_dedupe_chars"]),
+            )
+            session_store.write_dedupe_state(session_id, state)
+            if replacement and match:
+                raw_tokens = estimate_tokens(effective_text)
+                compressed_tokens = estimate_tokens(replacement)
+                saved = max(0, raw_tokens - compressed_tokens)
+                session_store.append_event(
+                    session_id,
+                    mechanism_saving_event(
+                        "hash_dedupe", applied=not shadow, tokens_saved_estimate=saved
+                    ),
+                )
+                session_store.append_event(
+                    session_id,
+                    {
+                        "event_type": "ToolTransformation",
+                        "tool_use_id": payload.get("tool_use_id"),
+                        "was_compressed": True,
+                        "compression_strategy": "hash_dedupe",
+                        "raw_token_estimate": raw_tokens,
+                        "compressed_token_estimate": compressed_tokens,
+                        "tokens_saved_estimate": saved,
+                        "compression_ratio": len(replacement) / max(1, len(effective_text)),
+                        "applied": not shadow,
+                    },
+                )
+                if not shadow:
+                    effective_text = replacement
+                    hook_output["updatedToolOutput"] = replacement
+        except Exception:
+            logger.exception("hash dedupe failed; passing through tool result")
 
     if cfg.get("read_cache", False) and tool_name == "Read":
         try:
@@ -414,7 +459,7 @@ def _extract_file_diffs_from_tool_calls(
     return diffs
 
 
-def _handoff_advisory(transcript_data) -> str | None:
+def _handoff_advisory(transcript_data, cfg: dict) -> str | None:
     """Suggest the handoff MCP tool once a session has grown large.
 
     Every tool result gets re-sent on every subsequent turn, so cost grows faster than
@@ -424,19 +469,26 @@ def _handoff_advisory(transcript_data) -> str | None:
         transcript_data.total_output_tokens or 0
     )
     tool_call_count = len(transcript_data.tool_calls or [])
+    token_threshold, tool_call_threshold = thresholds_from_config(cfg)
 
-    if total_tokens < HANDOFF_TOKEN_THRESHOLD and tool_call_count < HANDOFF_TOOL_CALL_THRESHOLD:
+    if total_tokens < token_threshold and tool_call_count < tool_call_threshold:
         return None
 
     return (
         "[rclm] This session has grown large "
         f"(~{total_tokens:,} tokens, {tool_call_count} tool calls so far). Every tool result gets "
-        "re-sent on every future turn, so cost grows faster than it looks. Consider calling the "
-        "ReclaimLLM `handoff` MCP tool to package current context and continue in a fresh session."
+        "re-sent on every future turn, so cost grows faster than it looks. Ask the user to compact "
+        "with a focused message, for example `/compact focus on the login bug`, then call the "
+        "ReclaimLLM `handoff` MCP tool if they want to continue in a fresh session."
     )
 
 
-def _handle_stop(session_id: str, payload: dict) -> None:
+def _handle_stop(
+    session_id: str,
+    payload: dict,
+    *,
+    schedule_update: bool = False,
+) -> None:
     now = _now()
     events = session_store.read_events(session_id)
 
@@ -464,6 +516,24 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         ended_at = None
     transcript_path = payload.get("transcript_path")
     transcript_data = transcript.parse_transcript(transcript_path)
+    transformations = {
+        event.get("tool_use_id"): event
+        for event in events
+        if event.get("event_type") == "ToolTransformation" and event.get("tool_use_id")
+    }
+    for call in transcript_data.tool_calls:
+        transformation = transformations.get(call.tool_use_id)
+        if transformation:
+            for key in (
+                "was_compressed",
+                "compression_strategy",
+                "raw_token_estimate",
+                "compressed_token_estimate",
+                "tokens_saved_estimate",
+                "compression_ratio",
+            ):
+                setattr(call, key, transformation.get(key))
+            call.extra_fields["compression_applied"] = transformation.get("applied", True)
     file_diffs = _extract_file_diffs_from_tool_calls(transcript_data.tool_calls)
 
     # Compute analytics from tool calls and file diffs.
@@ -494,10 +564,17 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     )
 
     asyncio.run(upload_single(record))
+    if schedule_update:
+        schedule_session_end_update()
 
-    if _config.load().get("handoff_advisor", False):
-        advisory = _handoff_advisory(transcript_data)
+    cfg = _config.load()
+    if cfg.get("handoff_advisor", False) and not session_store.has_marker(
+        session_id,
+        HANDOFF_ADVISOR_MARKER,
+    ):
+        advisory = _handoff_advisory(transcript_data, cfg)
         if advisory:
+            session_store.write_marker(session_id, HANDOFF_ADVISOR_MARKER)
             print(
                 json.dumps(
                     {
@@ -524,7 +601,11 @@ _HANDLERS = {
     "PostToolUse": _handle_post_tool_use,
     "PostToolUseFailure": _handle_post_tool_use_failure,
     "UserPromptSubmit": _handle_user_prompt_submit,
-    "Stop": _handle_stop,
+    "Stop": lambda session_id, payload: _handle_stop(
+        session_id,
+        payload,
+        schedule_update=True,
+    ),
     "SubagentStop": _handle_stop,
 }
 

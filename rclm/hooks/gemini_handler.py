@@ -28,7 +28,9 @@ from datetime import datetime, timezone
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import dlp, session_store
+from rclm.hooks import dedupe, dlp, session_store
+from rclm.hooks._analytics import estimate_tokens, mechanism_saving_event
+from rclm.hooks.updater import schedule_session_end_update
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +101,12 @@ _DLP_SCRUB_TOOLS = {"run_shell_command", "read_file"}
 def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
     """Fires after a tool executes; captures tool name, input, and normalised response.
 
-    Returns a hookSpecificOutput dict if DLP scrubbed the response, else None.
+    Returns a decision:deny dict (per Gemini's AfterTool contract) if DLP or
+    dedupe replaced the response, else None.
     """
     tool_name = payload.get("tool_name", "")
     tool_response = _normalise_tool_response(payload.get("tool_response"))
+    prior_events = session_store.read_events(session_id)
 
     session_store.append_event(
         session_id,
@@ -115,14 +119,54 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
         },
     )
 
-    if _config.load().get("dlp", False) and tool_name in _DLP_SCRUB_TOOLS:
+    cfg = _config.load()
+    shadow = cfg.get("shadow_mode", False)
+    cwd = _resolve_cwd(session_id, payload)
+    # DLP runs first so dedupe only ever hashes secret-free content.
+    effective_text = tool_response
+    replaced = False
+
+    if cfg.get("dlp", False) and tool_name in _DLP_SCRUB_TOOLS:
         try:
-            cwd = _resolve_cwd(session_id, payload)
             scrubbed = dlp.maybe_redact_output(tool_name, tool_response, cwd)
             if scrubbed is not None:
-                return {"decision": "deny", "reason": scrubbed}
+                effective_text = scrubbed
+                replaced = True
         except Exception:
             pass  # Never let DLP disrupt Gemini CLI
+
+    compression = _config.compression_config(cfg)
+    if compression["dedupe"]:
+        try:
+            state = session_store.read_dedupe_state(session_id)
+            turn = sum(1 for ev in prior_events if ev.get("event_type") == "AfterTool") + 1
+            replacement, state, match = dedupe.maybe_dedupe(
+                effective_text,
+                state,
+                tool_name=tool_name,
+                turn=turn,
+                cwd=cwd,
+                min_chars=int(compression["min_dedupe_chars"]),
+            )
+            session_store.write_dedupe_state(session_id, state)
+            if replacement and match:
+                raw_tokens = estimate_tokens(effective_text)
+                compressed_tokens = estimate_tokens(replacement)
+                saved = max(0, raw_tokens - compressed_tokens)
+                session_store.append_event(
+                    session_id,
+                    mechanism_saving_event(
+                        "hash_dedupe", applied=not shadow, tokens_saved_estimate=saved
+                    ),
+                )
+                if not shadow:
+                    effective_text = replacement
+                    replaced = True
+        except Exception:
+            logger.exception("hash dedupe failed; passing through tool result")
+
+    if replaced:
+        return {"decision": "deny", "reason": effective_text}
 
     return None
 
@@ -318,6 +362,7 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
     )
 
     asyncio.run(upload_single(record))
+    schedule_session_end_update()
     session_store.cleanup(session_id)
 
 

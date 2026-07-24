@@ -236,6 +236,62 @@ def test_after_tool_dlp_output_matches_gemini_schema(monkeypatch, tmp_path, caps
     assert parsed == {"decision": "deny", "reason": "TOKEN=[REDACTED:TOKEN]"}
 
 
+def test_after_tool_dedupe_denies_repeated_result(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "load", lambda: {"compression": {"dedupe": True}})
+
+    text = "result line\n" * 100  # > min_dedupe_chars
+
+    def _payload(session_id: str) -> dict:
+        return {
+            "session_id": session_id,
+            "transcript_path": "/tmp/gemini-session.json",
+            "cwd": "/repo",
+            "hook_event_name": "AfterTool",
+            "timestamp": "2026-04-10T00:00:00Z",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": "cat build.log"},
+            "tool_response": {"llmContent": text, "returnDisplay": text, "error": None},
+        }
+
+    payload = _payload("gsid-dedupe")
+    validate(instance=payload, schema=GEMINI_AFTER_TOOL_INPUT_SCHEMA)
+
+    first_output = _run_handler("AfterTool", payload, monkeypatch, capsys=capsys)
+    assert json.loads(first_output) == {}
+
+    second_output = _run_handler("AfterTool", payload, monkeypatch, capsys=capsys)
+    parsed = json.loads(second_output)
+    validate(instance=parsed, schema=GEMINI_COMMON_OUTPUT_SCHEMA)
+    assert parsed["decision"] == "deny"
+    assert "Identical to the result of `run_shell_command`" in parsed["reason"]
+
+
+def test_after_tool_dedupe_off_by_default(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "load", lambda: {})
+
+    text = "result line\n" * 100
+    payload = {
+        "session_id": "gsid-dedupe-off",
+        "transcript_path": "/tmp/gemini-session.json",
+        "cwd": "/repo",
+        "hook_event_name": "AfterTool",
+        "timestamp": "2026-04-10T00:00:00Z",
+        "tool_name": "run_shell_command",
+        "tool_input": {"command": "cat build.log"},
+        "tool_response": {"llmContent": text, "returnDisplay": text, "error": None},
+    }
+
+    _run_handler("AfterTool", payload, monkeypatch, capsys=capsys)
+    second_output = _run_handler("AfterTool", payload, monkeypatch, capsys=capsys)
+    assert json.loads(second_output) == {}
+
+
 # ---------------------------------------------------------------------------
 # SessionEnd — record assembly
 # ---------------------------------------------------------------------------
@@ -337,6 +393,28 @@ def test_session_end_without_session_start_uses_fallback_cwd(monkeypatch, tmp_pa
 
     assert len(uploaded) == 1
     assert uploaded[0].cwd == "/fallback-cwd"
+
+
+def test_session_end_schedules_update_after_upload(monkeypatch, tmp_path):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    calls: list[str] = []
+
+    async def fake_upload(_record):
+        calls.append("upload")
+
+    monkeypatch.setattr("rclm.hooks.gemini_handler.upload_single", fake_upload)
+    monkeypatch.setattr(
+        "rclm.hooks.gemini_handler.schedule_session_end_update",
+        lambda: calls.append("schedule"),
+    )
+
+    _run_handler(
+        "SessionEnd",
+        {"session_id": "gsid-update", "timestamp": "2024-01-01T00:01:00Z"},
+        monkeypatch,
+    )
+
+    assert calls == ["upload", "schedule"]
 
 
 # ---------------------------------------------------------------------------

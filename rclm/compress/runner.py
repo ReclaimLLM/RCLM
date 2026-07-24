@@ -7,6 +7,7 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 
+from rclm import _config
 from rclm.compress.filters.git import filter_git
 from rclm.compress.filters.search import filter_search
 from rclm.compress.filters.shell import filter_generic, filter_shell, strip_ansi
@@ -35,7 +36,7 @@ def execute(command: str) -> tuple[str, str, int]:
     return result.stdout, result.stderr, result.returncode
 
 
-def apply_filter(command: str, stdout: str, stderr: str) -> FilterResult:
+def apply_filter(command: str, stdout: str, stderr: str, *, exit_code: int = 0) -> FilterResult:
     """Route command to appropriate filter. Returns the (possibly) filtered output
     tagged with which mechanism produced it, for savings telemetry."""
     combined = strip_ansi(stdout + stderr)
@@ -56,9 +57,15 @@ def apply_filter(command: str, stdout: str, stderr: str) -> FilterResult:
     if filtered is not None:
         return FilterResult(filtered, "H2_search_shaping")
 
-    filtered = filter_test(command, combined)
+    compression = _config.compression_config()
+    max_chars = int(compression["test_filter_max_chars"])
+    filtered = (
+        filter_test(command, combined, exit_code=exit_code, max_chars=max_chars)
+        if compression["test_filter"]
+        else None
+    )
     if filtered is not None:
-        return FilterResult(filtered, "legacy_compress")
+        return FilterResult(filtered, "test_filter")
 
     filtered = filter_shell(command, combined)
     if filtered is not None:

@@ -35,6 +35,7 @@ _BASH_REWRITE_COMMANDS = {
     "find",
     "rg",
     "grep",
+    "go",
 }
 
 
@@ -120,6 +121,9 @@ def _compress_bash(tool_input: dict) -> dict | None:
 
     # For npm/npx, only rewrite test-related commands
     if base_cmd in ("npm", "npx") and not any(kw in command for kw in ("test", "jest", "vitest")):
+        return None
+
+    if base_cmd == "go" and not command.lstrip().startswith("go test"):
         return None
 
     return {"command": f"rclm-compress {command}"}

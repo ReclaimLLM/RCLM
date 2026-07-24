@@ -17,8 +17,9 @@ Usage:
     rclm-hooks-install --no-compress               # disable compression (Claude only)
     rclm-hooks-install --no-with-mcp               # skip installing ReclaimLLM MCP server
     rclm-hooks-install --no-statusline             # skip the Claude Code statusline
+    rclm-hooks-install --no-handoff-advisor        # skip Claude handoff suggestions
 
---with-mcp, --read-cache, --loop-breaker, --compress, and --statusline are on by default;
+--with-mcp, --read-cache, --loop-breaker, --compress, --statusline, and --handoff-advisor are on by default;
 pass the --no-<flag> form to opt out. Credentials and preferences are stored in
 ~/.reclaimllm/config.json and reused on subsequent runs.
 """
@@ -34,6 +35,12 @@ from pathlib import Path
 
 from rclm import _config, auth
 from rclm.auth import DEFAULT_BACKEND_SERVER_URL, DEFAULT_FRONTEND_URL
+from rclm.hooks.handoff_advisor import (
+    DEFAULT_TOKEN_THRESHOLD,
+    DEFAULT_TOOL_CALL_THRESHOLD,
+    TOKEN_THRESHOLD_KEY,
+    TOOL_CALL_THRESHOLD_KEY,
+)
 
 # ---------------------------------------------------------------------------
 # Hook command definitions
@@ -166,11 +173,13 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --openclaw               # OpenClaw only
   %(prog)s --claude --cursor         # Claude Code + Cursor
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
+  %(prog)s --include-folder=/repo   # only upload sessions from this folder
   %(prog)s --no-compress            # disable compression for Claude Code
   %(prog)s --no-with-mcp            # skip registering the ReclaimLLM MCP server
   %(prog)s --no-statusline          # skip the Claude Code statusline
+  %(prog)s --no-handoff-advisor     # skip Claude handoff suggestions
 
---with-mcp, --read-cache, --loop-breaker, --compress, and --statusline are on by default.
+--with-mcp, --read-cache, --loop-breaker, --compress, --statusline, and --handoff-advisor are on by default.
 Subsequent installs without --api-key reuse the saved config.""",
     )
 
@@ -214,6 +223,26 @@ Subsequent installs without --api-key reuse the saved config.""",
         help=f"ReclaimLLM server URL (default: {DEFAULT_BACKEND_SERVER_URL})",
     )
     parser.add_argument(
+        "--include-folder",
+        action="append",
+        default=[],
+        metavar="PATH_OR_GLOB",
+        help=(
+            "Only upload sessions whose cwd or transcript path is under this folder. "
+            "Repeat to allow multiple folders. Stored in redaction.include_folders."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-folder",
+        action="append",
+        default=[],
+        metavar="PATH_OR_GLOB",
+        help=(
+            "Skip uploads whose cwd or transcript path is under this folder. Repeat to "
+            "block multiple folders. Stored in redaction.exclude_folders."
+        ),
+    )
+    parser.add_argument(
         "--compress",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -221,6 +250,12 @@ Subsequent installs without --api-key reuse the saved config.""",
             "Context compression for Claude Code (rewrites Bash/Read/Grep inputs to reduce "
             "tokens). On by default; pass --no-compress to disable"
         ),
+    )
+    parser.add_argument(
+        "--dedupe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Deduplicate identical large Claude Code tool results. Off by default; pass --dedupe to enable",
     )
     parser.add_argument(
         "--dlp",
@@ -276,10 +311,11 @@ Subsequent installs without --api-key reuse the saved config.""",
     )
     parser.add_argument(
         "--handoff-advisor",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Enable handoff advisor (Claude only, requires --with-mcp): suggest the ReclaimLLM "
-            "`handoff` MCP tool once a session has grown large"
+            "Claude handoff advisor suggesting the ReclaimLLM `handoff` MCP tool once a "
+            "session has grown large. On by default; pass --no-handoff-advisor to disable"
         ),
     )
     parser.add_argument(
@@ -583,6 +619,40 @@ def _write_json(path: Path, data: dict) -> None:
         fh.write("\n")
 
 
+def _merge_unique(existing: object, additions: list[str]) -> list[str]:
+    values: list[str] = []
+    if isinstance(existing, list):
+        values.extend(str(item).strip() for item in existing if str(item).strip())
+    for item in additions:
+        value = str(item).strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _redaction_config_with_folder_filters(
+    saved: dict,
+    *,
+    include_folders: list[str],
+    exclude_folders: list[str],
+) -> dict | None:
+    if not include_folders and not exclude_folders:
+        return None
+    current = saved.get("redaction") if isinstance(saved.get("redaction"), dict) else {}
+    redaction = dict(current)
+    if include_folders:
+        redaction["include_folders"] = _merge_unique(
+            redaction.get("include_folders"),
+            include_folders,
+        )
+    if exclude_folders:
+        redaction["exclude_folders"] = _merge_unique(
+            redaction.get("exclude_folders"),
+            exclude_folders,
+        )
+    return redaction
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -621,7 +691,8 @@ def main() -> None:
     server_url = server_url.replace('"', "").replace("'", "").strip()
     api_key = api_key.replace('"', "").replace("'", "").strip()
 
-    compress_enabled = args.compress if args.compress is not None else saved.get("compress", True)
+    saved_compression = _config.compression_config(saved)
+    compress_enabled = args.compress if args.compress is not None else saved_compression["enabled"]
     dlp_enabled = args.dlp or saved.get("dlp", False)
     loop_breaker_enabled = (
         args.loop_breaker if args.loop_breaker is not None else saved.get("loop_breaker", True)
@@ -633,19 +704,48 @@ def main() -> None:
         args.statusline if args.statusline is not None else saved.get("statusline", True)
     )
     context_pack_enabled = args.context_pack or saved.get("context_pack", False)
-    handoff_advisor_enabled = args.handoff_advisor or saved.get("handoff_advisor", False)
+    handoff_advisor_enabled = (
+        args.handoff_advisor
+        if args.handoff_advisor is not None
+        else saved.get("handoff_advisor", True)
+    )
+    handoff_advisor_token_threshold = saved.get(
+        TOKEN_THRESHOLD_KEY,
+        DEFAULT_TOKEN_THRESHOLD,
+    )
+    handoff_advisor_tool_call_threshold = saved.get(
+        TOOL_CALL_THRESHOLD_KEY,
+        DEFAULT_TOOL_CALL_THRESHOLD,
+    )
     shadow_mode_enabled = args.shadow_mode or saved.get("shadow_mode", False)
+    dedupe_enabled = args.dedupe if args.dedupe is not None else saved_compression["dedupe"]
+    redaction_config = _redaction_config_with_folder_filters(
+        saved,
+        include_folders=args.include_folder,
+        exclude_folders=args.exclude_folder,
+    )
+    config_extra = {
+        "compression": {
+            **saved_compression,
+            "enabled": compress_enabled,
+            "dedupe": dedupe_enabled,
+        },
+        "dlp": dlp_enabled,
+        "loop_breaker": loop_breaker_enabled,
+        "read_cache": read_cache_enabled,
+        "statusline": statusline_enabled,
+        "context_pack": context_pack_enabled,
+        "handoff_advisor": handoff_advisor_enabled,
+        TOKEN_THRESHOLD_KEY: handoff_advisor_token_threshold,
+        TOOL_CALL_THRESHOLD_KEY: handoff_advisor_tool_call_threshold,
+        "shadow_mode": shadow_mode_enabled,
+    }
+    if redaction_config is not None:
+        config_extra["redaction"] = redaction_config
     _config.save(
         server_url,
         api_key,
-        compress=compress_enabled,
-        dlp=dlp_enabled,
-        loop_breaker=loop_breaker_enabled,
-        read_cache=read_cache_enabled,
-        statusline=statusline_enabled,
-        context_pack=context_pack_enabled,
-        handoff_advisor=handoff_advisor_enabled,
-        shadow_mode=shadow_mode_enabled,
+        **config_extra,
     )
 
     try:
@@ -691,14 +791,3 @@ def main() -> None:
         prompt_and_run_sync(providers, resync=True)
     except Exception:
         pass  # Never let sync failure disrupt the install.
-
-    # Non-blocking update check — print a notice if a newer version exists.
-    try:
-        from rclm.hooks.updater import check_for_update, installed_version
-
-        latest = check_for_update()
-        if latest:
-            current = installed_version()
-            print(f"\n✦ rclm {latest} is available (you have {current}). Run: rclm-update")
-    except Exception:
-        pass

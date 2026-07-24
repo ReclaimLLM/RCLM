@@ -320,6 +320,34 @@ def test_codex_stop_prefers_transcript_data(monkeypatch, tmp_path):
     ]
 
 
+def test_codex_stop_schedules_update_after_upload(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    calls: list[str] = []
+
+    async def fake_upload_single(_record):
+        calls.append("upload")
+
+    monkeypatch.setattr("rclm.hooks.codex_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.schedule_session_end_update",
+        lambda: calls.append("schedule"),
+    )
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.codex_transcript.parse_transcript",
+        lambda _path: codex_transcript.CodexTranscriptData(),
+    )
+
+    _run_handler(
+        "Stop",
+        {"session_id": "sid-codex-update", "timestamp": "2026-03-30T12:05:00+00:00"},
+        monkeypatch,
+    )
+
+    assert calls == ["upload", "schedule"]
+
+
 def test_codex_stop_falls_back_when_transcript_empty(monkeypatch, tmp_path):
     from rclm.hooks import session_store
 
@@ -411,10 +439,9 @@ def test_codex_post_tool_use_dlp_output_matches_codex_schema(monkeypatch, tmp_pa
     parsed = json.loads(output)
     validate(instance=parsed, schema=CODEX_POST_TOOL_USE_OUTPUT_SCHEMA)
 
-    hso = parsed["hookSpecificOutput"]
-    assert hso["hookEventName"] == "PostToolUse"
-    assert hso["updatedMCPToolOutput"] == "My secret is [REDACTED:PASSWORD]"
-    assert "updatedResponse" not in hso
+    assert parsed["decision"] == "block"
+    assert parsed["reason"] == "My secret is [REDACTED:PASSWORD]"
+    assert "hookSpecificOutput" not in parsed
 
 
 def test_codex_post_tool_use_no_stdout_when_dlp_finds_nothing(monkeypatch, tmp_path, capsys):
@@ -440,5 +467,65 @@ def test_codex_post_tool_use_no_stdout_when_dlp_finds_nothing(monkeypatch, tmp_p
     validate(instance=payload, schema=CODEX_POST_TOOL_USE_INPUT_SCHEMA)
 
     _run_handler("PostToolUse", payload, monkeypatch)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_codex_post_tool_use_dedupe_blocks_repeated_result(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"dedupe": True}})
+
+    text = "result line\n" * 100  # > min_dedupe_chars
+
+    first_payload = {
+        "session_id": "sid-codex-dedupe",
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.4",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat build.log"},
+        "tool_response": text,
+        "tool_use_id": "call-1",
+        "transcript_path": None,
+        "turn_id": "turn-1",
+    }
+    _run_handler("PostToolUse", first_payload, monkeypatch)
+    assert capsys.readouterr().out == ""
+
+    second_payload = dict(first_payload, tool_use_id="call-2", turn_id="turn-2")
+    _run_handler("PostToolUse", second_payload, monkeypatch)
+
+    output = capsys.readouterr().out.strip()
+    parsed = json.loads(output)
+    validate(instance=parsed, schema=CODEX_POST_TOOL_USE_OUTPUT_SCHEMA)
+    assert parsed["decision"] == "block"
+    assert "Identical to the result of `Bash`" in parsed["reason"]
+
+
+def test_codex_post_tool_use_dedupe_off_by_default(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {})
+
+    text = "result line\n" * 100
+    payload = {
+        "session_id": "sid-codex-dedupe-off",
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.4",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat build.log"},
+        "tool_response": text,
+        "tool_use_id": "call-1",
+        "transcript_path": None,
+        "turn_id": "turn-1",
+    }
+    _run_handler("PostToolUse", payload, monkeypatch)
+    _run_handler("PostToolUse", dict(payload, tool_use_id="call-2", turn_id="turn-2"), monkeypatch)
 
     assert capsys.readouterr().out == ""

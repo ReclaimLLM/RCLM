@@ -3,6 +3,30 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.20] — 2026-07-24
+
+### Added
+- Added session-scoped, conservative PostToolUse hash deduplication for large identical tool results, including ANSI/path/timestamp normalization, error bypasses, bounded LRU state, and per-call compression telemetry (`rclm/hooks/dedupe.py`, `rclm/hooks/{claude,codex,gemini}_handler.py`)
+- Added per-mechanism compression savings events and extended tool-call payloads with compression strategy, before/after token estimates, savings, ratios, and shadow-mode status (`rclm/_models.py`, `rclm/hooks/_analytics.py`)
+- Added conservative pytest, Jest/Vitest, Go, and Cargo test-output filters with failure preservation, ambiguity passthrough, output caps, and `test_filter` telemetry (`rclm/compress/filters/test.py`, `rclm/compress/runner.py`)
+- Added `--dedupe` installation flag and nested `compression` settings for deduplication and test-filter thresholds (`rclm/_config.py`, `rclm/hooks/installer.py`)
+- Added upload include/exclude folder filters, including a default exclusion for Codex memory files (`rclm/hooks/redaction.py`, `rclm/hooks/installer.py`)
+- Added default-on Claude handoff advisor with configurable token/tool-call thresholds and once-per-session guidance (`rclm/hooks/handoff_advisor.py`, `rclm/hooks/claude_handler.py`)
+- Added a once-daily, detached `rclm-update` scheduler after successful primary Claude, Codex, and Gemini session uploads, with local locking and an update log (`rclm/hooks/updater.py`, `rclm/hooks/{claude,codex,gemini}_handler.py`)
+
+### Changed
+- Migrated legacy flat compression configuration keys to the nested `compression` object while retaining read compatibility for existing installations (`rclm/_config.py`, `rclm/update.py`)
+- Routed `go test` through the command wrapper and made test filtering exit-code-aware so unknown non-zero runner output passes through unchanged (`rclm/hooks/compress.py`, `rclm/compress/cli.py`)
+- Moved automatic update execution from login/install completion to primary session completion, so session hooks never wait for PyPI, pip, or hook reinstallation (`rclm/login.py`, `rclm/hooks/installer.py`, `rclm/hooks/updater.py`)
+
+### Fixed
+- Fixed Codex and Gemini PostToolUse replacement responses to use their supported block/deny contracts when DLP or deduplication rewrites output (`rclm/hooks/{codex,gemini}_handler.py`)
+
+### Security
+- Prevented uploads from the local Codex memories directory by default and allowlisted folder capture when configured (`rclm/hooks/redaction.py`, `rclm/_uploader.py`)
+
+---
+
 ## [v0.1.19] — 2026-07-21
 
 ### Added

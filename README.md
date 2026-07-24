@@ -99,6 +99,15 @@ rclm-hooks-install --compress  # Reduces token usage for Claude Code
 rclm-hooks-install --dlp       # Enables Data Loss Prevention for .env files
 ```
 
+### Folder Capture Filters
+Limit uploads to specific project folders during installation:
+```bash
+rclm-hooks-install --include-folder=/path/to/project
+rclm-hooks-install --include-folder=/work/app --include-folder=/work/infra
+```
+
+Use `--exclude-folder=/path/to/private` to skip specific folders when no include allowlist is configured.
+
 ### Proxy Capture (Experimental)
 Point your tools at `http://localhost:4000` to capture raw API interactions:
 ```bash

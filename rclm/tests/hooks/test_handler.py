@@ -259,6 +259,56 @@ def test_handoff_advisor_small_session_no_advisory(monkeypatch, tmp_path, capsys
     assert "handoff" not in capsys.readouterr().out
 
 
+def test_handoff_advisor_below_threshold_no_advisory(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"handoff_advisor": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    _stub_transcript(
+        monkeypatch, total_input_tokens=100_000, total_output_tokens=50_000, tool_call_count=119
+    )
+
+    payload = {"session_id": "sid-ha-below", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
+    _run_handler("Stop", payload, monkeypatch)
+
+    assert "handoff" not in capsys.readouterr().out
+
+
+def test_handoff_advisor_uses_configured_thresholds(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "handoff_advisor": True,
+                "handoff_advisor_token_threshold": 300_000,
+                "handoff_advisor_tool_call_threshold": 200,
+            }
+        )
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    _stub_transcript(
+        monkeypatch, total_input_tokens=200_000, total_output_tokens=50_000, tool_call_count=125
+    )
+
+    payload = {
+        "session_id": "sid-ha-config-threshold",
+        "cwd": "/repo",
+        "timestamp": "2024-01-01T00:01:00Z",
+    }
+    _run_handler("Stop", payload, monkeypatch)
+
+    assert "handoff" not in capsys.readouterr().out
+
+
 def test_handoff_advisor_fires_on_large_session(monkeypatch, tmp_path, capsys):
     from rclm import _config
     from rclm.hooks import session_store
@@ -277,7 +327,9 @@ def test_handoff_advisor_fires_on_large_session(monkeypatch, tmp_path, capsys):
 
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["hookEventName"] == "Stop"
-    assert "handoff" in output["hookSpecificOutput"]["additionalContext"]
+    additional_context = output["hookSpecificOutput"]["additionalContext"]
+    assert "handoff" in additional_context
+    assert "/compact focus on the login bug" in additional_context
 
 
 def test_handoff_advisor_fires_on_high_tool_call_count(monkeypatch, tmp_path, capsys):
@@ -290,7 +342,7 @@ def test_handoff_advisor_fires_on_high_tool_call_count(monkeypatch, tmp_path, ca
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
     monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
     _stub_transcript(
-        monkeypatch, total_input_tokens=100, total_output_tokens=100, tool_call_count=75
+        monkeypatch, total_input_tokens=100, total_output_tokens=100, tool_call_count=125
     )
 
     payload = {"session_id": "sid-ha4", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
@@ -298,6 +350,30 @@ def test_handoff_advisor_fires_on_high_tool_call_count(monkeypatch, tmp_path, ca
 
     output = json.loads(capsys.readouterr().out)
     assert "handoff" in output["hookSpecificOutput"]["additionalContext"]
+
+
+def test_handoff_advisor_prints_once_per_session(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"handoff_advisor": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    _stub_transcript(
+        monkeypatch, total_input_tokens=200_000, total_output_tokens=50_000, tool_call_count=100
+    )
+
+    payload = {"session_id": "sid-ha5", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
+    _run_handler("Stop", payload, monkeypatch)
+    first = capsys.readouterr().out
+
+    _run_handler("Stop", payload, monkeypatch)
+    second = capsys.readouterr().out
+
+    assert "handoff" in first
+    assert second == ""
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +911,33 @@ def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
 
     # Cleanup should have removed the session file.
     assert session_store.read_events("sid-3") == []
+
+
+def test_primary_stop_schedules_update_after_upload(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+    from rclm.hooks.transcript import TranscriptData
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    calls: list[str] = []
+
+    async def fake_upload_single(_record):
+        calls.append("upload")
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda _path: TranscriptData(),
+    )
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.schedule_session_end_update",
+        lambda: calls.append("schedule"),
+    )
+
+    _run_handler(
+        "Stop", {"session_id": "sid-update", "timestamp": "2024-01-01T00:01:00Z"}, monkeypatch
+    )
+
+    assert calls == ["upload", "schedule"]
 
 
 def test_stop_without_prior_session_start_uses_fallback(monkeypatch, tmp_path):

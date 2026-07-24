@@ -63,6 +63,13 @@ class ToolCall:
     timestamp: str  # ISO-8601
     input_token_estimate: int | None = None
     output_token_estimate: int | None = None
+    was_compressed: bool = False
+    compression_strategy: str | None = None
+    raw_token_estimate: int | None = None
+    compressed_token_estimate: int | None = None
+    tokens_saved_estimate: int | None = None
+    compression_ratio: float | None = None
+    extra_fields: dict = field(default_factory=dict)
 
 
 @dataclass

@@ -19,6 +19,36 @@ def _session_path(session_id: str) -> Path:
     return _SESSIONS_DIR / f"{session_id}.jsonl"
 
 
+def _dedupe_path(session_id: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.dedupe.json"
+
+
+def _marker_path(session_id: str, marker: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.{marker}.marker"
+
+
+def has_marker(session_id: str, marker: str) -> bool:
+    return _marker_path(session_id, marker).exists()
+
+
+def write_marker(session_id: str, marker: str) -> None:
+    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _marker_path(session_id, marker).write_text("1", encoding="utf-8")
+
+
+def read_dedupe_state(session_id: str) -> dict[str, dict]:
+    try:
+        data = json.loads(_dedupe_path(session_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_dedupe_state(session_id: str, state: dict[str, dict]) -> None:
+    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _dedupe_path(session_id).write_text(json.dumps(state), encoding="utf-8")
+
+
 def append_event(session_id: str, event: dict) -> None:
     """Append one JSON event dict as a line to the session file."""
     _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,3 +80,5 @@ def cleanup(session_id: str) -> None:
     path = _session_path(session_id)
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        _dedupe_path(session_id).unlink()

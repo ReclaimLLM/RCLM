@@ -45,6 +45,9 @@ class TestFilterPytest:
     def test_no_match_for_non_test_command(self):
         assert filter_test("git status", "some output") is None
 
+    def test_nonzero_without_a_parsed_failure_passes_through(self):
+        assert filter_test("pytest tests/", "fatal runner crash\n", exit_code=2) is None
+
 
 # ---------------------------------------------------------------------------
 # npm test / jest
@@ -124,3 +127,14 @@ class TestFilterCargoTest:
         result = filter_test("cargo test", output)
         assert "FAILED" in result
         assert "assertion failed" in result
+
+
+class TestFilterGoTest:
+    def test_all_passing(self):
+        result = filter_test("go test ./...", "ok\texample/pkg\t0.042s\n")
+        assert "1 passed" in result
+
+    def test_failure_keeps_failure(self):
+        output = "--- FAIL: TestThing (0.00s)\n    thing_test.go:10: expected 1\nFAIL\texample/pkg\t0.042s\n"
+        result = filter_test("go test ./...", output, exit_code=1)
+        assert "expected 1" in result

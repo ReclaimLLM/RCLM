@@ -57,7 +57,7 @@ async def upload(
     cfg = _config.load()
     redaction_settings = redaction.load_settings(cfg)
     if redaction.should_skip_record(record, redaction_settings):
-        logger.info("rclm upload skipped by local redaction exclude_folders")
+        logger.info("rclm upload skipped by local redaction folder filters")
         return
 
     base = cfg.get("server_url")

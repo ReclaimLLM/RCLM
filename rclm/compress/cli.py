@@ -33,7 +33,7 @@ def main() -> None:
         sys.exit(1)
 
     original = stdout + stderr
-    result = apply_filter(command, stdout, stderr)
+    result = apply_filter(command, stdout, stderr, exit_code=exit_code)
     shadow = _config.load().get("shadow_mode", False)
 
     with contextlib.suppress(Exception):

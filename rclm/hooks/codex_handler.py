@@ -48,7 +48,9 @@ from datetime import datetime, timezone
 from rclm import _config
 from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import codex_transcript, dlp, session_store
+from rclm.hooks import codex_transcript, dedupe, dlp, session_store
+from rclm.hooks._analytics import estimate_tokens, mechanism_saving_event
+from rclm.hooks.updater import schedule_session_end_update
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     tool_response = payload.get("tool_response")
+    prior_events = session_store.read_events(session_id)
 
     session_store.append_event(
         session_id,
@@ -112,23 +115,72 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         },
     )
 
-    if _config.load().get("dlp", False):
+    cfg = _config.load()
+    shadow = cfg.get("shadow_mode", False)
+    # DLP runs first so dedupe only ever hashes secret-free content.
+    effective_text = tool_response if isinstance(tool_response, str) else str(tool_response or "")
+    replaced = False
+
+    if cfg.get("dlp", False):
         try:
             cwd = payload.get("cwd", "")
             scrubbed = dlp.maybe_redact_output("Bash", tool_response, cwd)
             if scrubbed is not None:
-                print(
-                    json.dumps(
-                        {
-                            "hookSpecificOutput": {
-                                "hookEventName": "PostToolUse",
-                                "updatedMCPToolOutput": scrubbed,
-                            }
-                        }
-                    )
-                )
+                effective_text = scrubbed
+                replaced = True
         except Exception:
             pass  # Never let DLP disrupt Codex CLI
+
+    compression = _config.compression_config(cfg)
+    if compression["dedupe"]:
+        try:
+            state = session_store.read_dedupe_state(session_id)
+            turn = sum(1 for ev in prior_events if ev.get("event_type") == "PostToolUse") + 1
+            replacement, state, match = dedupe.maybe_dedupe(
+                effective_text,
+                state,
+                tool_name="Bash",
+                turn=turn,
+                cwd=payload.get("cwd", ""),
+                min_chars=int(compression["min_dedupe_chars"]),
+            )
+            session_store.write_dedupe_state(session_id, state)
+            if replacement and match:
+                raw_tokens = estimate_tokens(effective_text)
+                compressed_tokens = estimate_tokens(replacement)
+                saved = max(0, raw_tokens - compressed_tokens)
+                session_store.append_event(
+                    session_id,
+                    mechanism_saving_event(
+                        "hash_dedupe", applied=not shadow, tokens_saved_estimate=saved
+                    ),
+                )
+                session_store.append_event(
+                    session_id,
+                    {
+                        "event_type": "ToolTransformation",
+                        "tool_use_id": payload.get("tool_use_id"),
+                        "was_compressed": True,
+                        "compression_strategy": "hash_dedupe",
+                        "raw_token_estimate": raw_tokens,
+                        "compressed_token_estimate": compressed_tokens,
+                        "tokens_saved_estimate": saved,
+                        "compression_ratio": len(replacement) / max(1, len(effective_text)),
+                        "applied": not shadow,
+                    },
+                )
+                if not shadow:
+                    effective_text = replacement
+                    replaced = True
+        except Exception:
+            logger.exception("hash dedupe failed; passing through tool result")
+
+    if replaced:
+        # updatedMCPToolOutput is parsed but not applied by Codex CLI (hook run
+        # is marked failed and the original output passes through unchanged).
+        # decision:"block" + reason is the documented, supported way to
+        # replace PostToolUse output.
+        print(json.dumps({"decision": "block", "reason": effective_text}))
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +317,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     )
 
     asyncio.run(upload_single(record))
+    schedule_session_end_update()
     session_store.cleanup(session_id)
 
 

@@ -17,10 +17,10 @@ class TestApplyFilterMechanismTagging:
         result = apply_filter("rg -n TODO .", output, "")
         assert result.mechanism == "H2_search_shaping"
 
-    def test_pytest_tagged_legacy_compress(self):
+    def test_pytest_tagged_test_filter(self):
         output = "\n".join(f"test_{i} PASSED" for i in range(40)) + "\n=== 40 passed ==="
         result = apply_filter("pytest tests/", output, "")
-        assert result.mechanism == "legacy_compress"
+        assert result.mechanism == "test_filter"
 
     def test_ls_tagged_legacy_compress(self):
         output = "\n".join(f"file{i}.py" for i in range(40))

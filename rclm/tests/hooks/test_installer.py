@@ -43,6 +43,11 @@ def _hook_commands_for_event(settings: dict, event: str) -> list[str]:
     return commands
 
 
+@pytest.fixture(autouse=True)
+def _isolate_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Basic install (Claude Code)
 # ---------------------------------------------------------------------------
@@ -172,6 +177,62 @@ def test_credentials_saved_to_config_file(tmp_path, monkeypatch):
     config = json.loads((tmp_path / "config.json").read_text())
     assert config["api_key"] == "sk-save-me"
     assert config["server_url"] == "http://saved-server.com"
+
+
+def test_include_folder_flag_saves_to_redaction_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    _run_install(monkeypatch, tmp_path, "--include-folder=/work/reclaim")
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["redaction"]["include_folders"] == ["/work/reclaim"]
+
+
+def test_include_folder_flag_can_be_repeated(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    _run_install(
+        monkeypatch,
+        tmp_path,
+        "--include-folder=/work/reclaim",
+        "--include-folder=/work/other",
+    )
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["redaction"]["include_folders"] == ["/work/reclaim", "/work/other"]
+
+
+def test_folder_filter_flags_preserve_existing_redaction_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "config.json"
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    _config.patch(
+        redaction={
+            "enabled": False,
+            "remote_substitutions": {"remote": "[REMOTE]"},
+            "local_substitutions": {"local": "[LOCAL]"},
+            "include_folders": ["/existing/include"],
+            "exclude_folders": ["/existing/exclude"],
+            "last_sync": "2026-04-27T10:00:00Z",
+        }
+    )
+
+    _run_install(
+        monkeypatch,
+        tmp_path,
+        "--include-folder=/new/include",
+        "--exclude-folder=/new/exclude",
+    )
+
+    redaction = json.loads(config_path.read_text())["redaction"]
+    assert redaction == {
+        "enabled": False,
+        "remote_substitutions": {"remote": "[REMOTE]"},
+        "local_substitutions": {"local": "[LOCAL]"},
+        "include_folders": ["/existing/include", "/new/include"],
+        "exclude_folders": ["**/.codex/memories/", "/existing/exclude", "/new/exclude"],
+        "last_sync": "2026-04-27T10:00:00Z",
+    }
 
 
 def test_saved_config_used_when_no_flags_provided(tmp_path, monkeypatch):
@@ -363,7 +424,7 @@ def test_compress_flag_saves_to_config(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path, "--compress")
 
     config = json.loads((tmp_path / "config.json").read_text())
-    assert config["compress"] is True
+    assert config["compression"]["enabled"] is True
 
 
 def test_compress_on_by_default(tmp_path, monkeypatch):
@@ -371,7 +432,7 @@ def test_compress_on_by_default(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path)
 
     config = json.loads((tmp_path / "config.json").read_text())
-    assert config["compress"] is True
+    assert config["compression"]["enabled"] is True
 
 
 def test_no_compress_disables(tmp_path, monkeypatch):
@@ -379,7 +440,7 @@ def test_no_compress_disables(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path, "--no-compress")
 
     config = json.loads((tmp_path / "config.json").read_text())
-    assert config["compress"] is False
+    assert config["compression"]["enabled"] is False
 
 
 def test_compress_flag_persists_across_reinstalls(tmp_path, monkeypatch):
@@ -395,7 +456,7 @@ def test_compress_flag_persists_across_reinstalls(tmp_path, monkeypatch):
     installer.main()
 
     config = json.loads((tmp_path / "config.json").read_text())
-    assert config["compress"] is True
+    assert config["compression"]["enabled"] is True
 
 
 def test_no_compress_persists_across_reinstalls(tmp_path, monkeypatch):
@@ -411,7 +472,7 @@ def test_no_compress_persists_across_reinstalls(tmp_path, monkeypatch):
     installer.main()
 
     config = json.loads((tmp_path / "config.json").read_text())
-    assert config["compress"] is False
+    assert config["compression"]["enabled"] is False
 
 
 def _seed_rtk_hook(tmp_path: Path) -> Path:
@@ -501,6 +562,24 @@ def test_with_mcp_on_by_default(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path)
 
     assert (tmp_path / ".claude" / "mcp.json").exists()
+
+
+def test_handoff_advisor_on_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path)
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["handoff_advisor"] is True
+    assert config["handoff_advisor_token_threshold"] == 160_000
+    assert config["handoff_advisor_tool_call_threshold"] == 120
+
+
+def test_no_handoff_advisor_disables(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-handoff-advisor")
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["handoff_advisor"] is False
 
 
 def test_no_with_mcp_skips_install(tmp_path, monkeypatch):

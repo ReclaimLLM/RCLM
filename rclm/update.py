@@ -107,7 +107,7 @@ def main() -> None:
     # Uses saved config (no credential prompt) and defaults to global scope
     # to match the install default.
     cfg = _config.load()
-    compress = cfg.get("compress", False)
+    compress = _config.compression_config(cfg)["enabled"]
 
     try:
         from rclm.hooks.installer import (

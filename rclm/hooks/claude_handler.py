@@ -13,6 +13,7 @@ import difflib
 import json
 import logging
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
 
@@ -20,6 +21,7 @@ from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
 from rclm.hooks import (
+    brevity,
     dedupe,
     dlp,
     read_cache,
@@ -31,6 +33,7 @@ from rclm.hooks._analytics import (
     compute_session_analytics,
     estimate_tokens,
     mechanism_saving_event,
+    merge_mechanism_savings,
 )
 from rclm.hooks.compress import maybe_compress
 from rclm.hooks.handoff_advisor import thresholds_from_config
@@ -103,6 +106,10 @@ async def _build_context_pack(cwd: str) -> str | None:
 
 
 def _handle_session_start(session_id: str, payload: dict) -> None:
+    # Optimization cleanup must never block Claude Code startup.
+    with contextlib.suppress(OSError):
+        session_store.prune_stale_sidecars()
+
     session_store.append_event(
         session_id,
         {
@@ -113,25 +120,42 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
         },
     )
 
-    if not _config.load().get("context_pack", False):
-        return
-
     cwd = payload.get("cwd", "")
-    if not cwd:
-        return
+    cfg = _config.load()
+    context_blocks: list[str] = []
+
+    if cfg.get("context_pack", False) and cwd:
+        try:
+            context = asyncio.run(
+                asyncio.wait_for(_build_context_pack(cwd), CONTEXT_PACK_TIMEOUT_S)
+            )
+        except Exception:
+            context = None  # Never let a slow/failed backend call disrupt Claude Code startup.
+        if context:
+            context_blocks.append(context)
 
     try:
-        context = asyncio.run(asyncio.wait_for(_build_context_pack(cwd), CONTEXT_PACK_TIMEOUT_S))
+        brevity_result = brevity.build_session_start_context(cwd, cfg)
     except Exception:
-        context = None  # Never let a slow/failed backend call disrupt Claude Code startup.
+        brevity_result = None  # Never let brevity detection disrupt Claude Code startup.
+    if brevity_result:
+        context_blocks.append(brevity_result["text"])
+        session_store.append_event(
+            session_id,
+            {
+                "event_type": "BrevityInjected",
+                "instruction_hash": brevity_result["instruction_hash"],
+                "instruction_tokens": brevity_result["instruction_tokens"],
+            },
+        )
 
-    if context:
+    if context_blocks:
         print(
             json.dumps(
                 {
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": context,
+                        "additionalContext": "\n\n".join(context_blocks),
                     }
                 }
             )
@@ -164,10 +188,10 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     effective_input = dict(tool_input)
     changed = False
     hook_output: dict = {"hookEventName": "PreToolUse"}
+    cwd = _resolve_cwd(session_id, payload)
 
     if cfg.get("dlp", False):
         try:
-            cwd = _resolve_cwd(session_id, payload)
 
             def _track(path: str) -> None:
                 session_store.append_event(session_id, {"event_type": "DLPTempFile", "path": path})
@@ -179,28 +203,75 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             pass  # Never let DLP disrupt Claude Code
 
+    read_offset: int | None = None
+    if cfg.get("read_cache", False):
+        try:
+            read_state = session_store.read_read_cache_state(session_id)
+            if tool_name in {"Write", "Edit", "NotebookEdit"}:
+                read_state = read_cache.invalidate_tool_path(
+                    read_state, tool_name, effective_input, cwd=cwd
+                )
+                session_store.write_read_cache_state(session_id, read_state)
+            elif tool_name == "Read" and not shadow:
+                read_offset, read_state = read_cache.next_unseen_offset(
+                    effective_input, read_state, cwd=cwd
+                )
+                session_store.write_read_cache_state(session_id, read_state)
+            elif tool_name == "Bash":
+                command = effective_input.get("command", "")
+                shell = effective_input.get("shell") or ("posix" if os.name == "posix" else os.name)
+                request = (
+                    read_cache.parse_shell_read(command, cwd=cwd, shell=shell)
+                    if isinstance(command, str)
+                    else None
+                )
+                # rclm-read-cache executes argv directly. Keep the one supported
+                # read pipeline on PostToolUse measurement-only until the wrapper
+                # grows an equally explicit pipeline executor.
+                if (
+                    request is not None
+                    and "|" not in command
+                    and not command.lstrip().startswith("rclm-read-cache ")
+                ):
+                    effective_input["command"] = (
+                        f"CLAUDE_SESSION_ID={shlex.quote(session_id)} rclm-read-cache {command}"
+                    )
+                    changed = True
+                    hook_output.update(
+                        {
+                            "permissionDecision": "allow",
+                            "permissionDecisionReason": (
+                                "ReclaimLLM validated this as an exact local file read and "
+                                "routed it through the session cache."
+                            ),
+                        }
+                    )
+                    session_store.append_event(
+                        session_id,
+                        {
+                            "event_type": "ReadCacheWrapped",
+                            "tool_use_id": payload.get("tool_use_id"),
+                        },
+                    )
+        except Exception:
+            pass  # Never let read-cache state handling disrupt Claude Code
+
     if _config.compression_config(cfg)["enabled"]:
         try:
             # Bash rewrites always apply — they route through rclm-compress, which
             # measures and makes its own shadow/enforce output decision. Native
             # Read/Grep shaping is suppressed in shadow mode (see maybe_compress).
-            compress_delta = maybe_compress(tool_name, effective_input, shadow=shadow)
+            compress_delta = maybe_compress(
+                tool_name,
+                effective_input,
+                shadow=shadow,
+                read_offset=read_offset,
+            )
             if compress_delta:
                 effective_input.update(compress_delta)
                 changed = True
         except Exception:
             pass  # Never let compression disrupt Claude Code
-
-    if cfg.get("read_cache", False) and tool_name == "Bash":
-        try:
-            # Always rewrites — routes through rclm-read-cache, which measures and
-            # makes its own shadow/enforce output decision (same as compress above).
-            read_cache_delta = read_cache.maybe_wrap_dump_command(effective_input)
-            if read_cache_delta:
-                effective_input.update(read_cache_delta)
-                changed = True
-        except Exception:
-            pass  # Never let read-cache disrupt Claude Code
 
     if cfg.get("loop_breaker", False):
         try:
@@ -227,7 +298,26 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
 
 
 def _response_text(tool_response: object) -> str:
-    return tool_response if isinstance(tool_response, str) else str(tool_response or "")
+    """Extract the textual payload Claude exposed for a completed tool call."""
+    if isinstance(tool_response, str):
+        return tool_response
+    if isinstance(tool_response, dict):
+        stdout = tool_response.get("stdout")
+        stderr = tool_response.get("stderr")
+        if isinstance(stdout, str) or isinstance(stderr, str):
+            return (stdout if isinstance(stdout, str) else "") + (
+                stderr if isinstance(stderr, str) else ""
+            )
+
+        content = tool_response.get("content")
+        if isinstance(content, str):
+            return content
+
+        file_result = tool_response.get("file")
+        if isinstance(file_result, dict) and isinstance(file_result.get("content"), str):
+            return file_result["content"]
+
+    return str(tool_response or "")
 
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
@@ -259,11 +349,12 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     # DLP runs first so every downstream mechanism (read-cache included) only
     # ever sees secret-free content — never the raw response.
     effective_text = _response_text(tool_response)
+    cwd = _resolve_cwd(session_id, payload)
 
     if cfg.get("dlp", False):
         try:
             cwd = _resolve_cwd(session_id, payload)
-            scrubbed = dlp.maybe_redact_output(tool_name, tool_response, cwd)
+            scrubbed = dlp.maybe_redact_output(tool_name, effective_text, cwd)
             if scrubbed is not None:
                 effective_text = scrubbed
                 hook_output["updatedToolOutput"] = scrubbed
@@ -271,8 +362,46 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             pass  # Never let DLP disrupt Claude Code
 
+    tool_use_id = payload.get("tool_use_id")
+    range_claimed = any(
+        event.get("event_type") == "ReadCacheWrapped" and event.get("tool_use_id") == tool_use_id
+        for event in prior_events
+    )
+    if cfg.get("read_cache", False) and tool_name in {"Read", "Bash"}:
+        try:
+            request = None
+            if tool_name == "Read":
+                request = read_cache.native_read_request(tool_input, cwd=cwd)
+            elif not range_claimed:
+                command = tool_input.get("command", "")
+                shell = tool_input.get("shell") or ("posix" if os.name == "posix" else os.name)
+                if isinstance(command, str):
+                    request = read_cache.parse_shell_read(command, cwd=cwd, shell=shell)
+            if request is not None:
+                range_claimed = True
+                state = session_store.read_read_cache_state(session_id)
+                turn = (
+                    sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
+                )
+                application = read_cache.apply_range_cache(
+                    request,
+                    effective_text,
+                    state,
+                    turn=turn,
+                    tool_use_id=tool_use_id,
+                    # Claude 2.1.205 ignores PostToolUse.updatedToolOutput.
+                    # Track conservative potential here; Bash enforcement occurs
+                    # in rclm-read-cache before Claude receives the tool result.
+                    shadow=True,
+                )
+                session_store.write_read_cache_state(session_id, application.state)
+                for event in application.events:
+                    session_store.append_event(session_id, event)
+        except Exception:
+            logger.exception("range cache failed; passing through tool result")
+
     compression = _config.compression_config(cfg)
-    if compression["dedupe"]:
+    if compression["dedupe"] and not range_claimed:
         try:
             state = session_store.read_dedupe_state(session_id)
             turn = sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
@@ -281,7 +410,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 state,
                 tool_name=tool_name,
                 turn=turn,
-                cwd=_resolve_cwd(session_id, payload),
+                cwd=cwd,
                 min_chars=int(compression["min_dedupe_chars"]),
             )
             session_store.write_dedupe_state(session_id, state)
@@ -292,7 +421,10 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 session_store.append_event(
                     session_id,
                     mechanism_saving_event(
-                        "hash_dedupe", applied=not shadow, tokens_saved_estimate=saved
+                        "hash_dedupe",
+                        applied=not shadow,
+                        tokens_saved_estimate=saved,
+                        measurement_kind="measured",
                     ),
                 )
                 session_store.append_event(
@@ -306,6 +438,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                         "compressed_token_estimate": compressed_tokens,
                         "tokens_saved_estimate": saved,
                         "compression_ratio": len(replacement) / max(1, len(effective_text)),
+                        "measurement_kind": "measured",
                         "applied": not shadow,
                     },
                 )
@@ -314,39 +447,6 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                     hook_output["updatedToolOutput"] = replacement
         except Exception:
             logger.exception("hash dedupe failed; passing through tool result")
-
-    if cfg.get("read_cache", False) and tool_name == "Read":
-        try:
-            file_path = tool_input.get("file_path", "")
-            if file_path:
-                offset = tool_input.get("offset")
-                limit = tool_input.get("limit")
-                timestamp = payload.get("timestamp", _now())
-
-                delta = read_cache.build_delta(
-                    file_path, offset, limit, effective_text, prior_events
-                )
-                session_store.append_event(
-                    session_id,
-                    read_cache.snapshot_event(file_path, offset, limit, effective_text, timestamp),
-                )
-                if delta:
-                    tokens_saved = max(
-                        0,
-                        (len(effective_text) - len(delta["updatedToolOutput"])) // 4,
-                    )
-                    session_store.append_event(
-                        session_id,
-                        mechanism_saving_event(
-                            "H1_read_cache",
-                            applied=not shadow,
-                            tokens_saved_estimate=tokens_saved,
-                        ),
-                    )
-                    if not shadow:
-                        hook_output["updatedToolOutput"] = delta["updatedToolOutput"]
-        except Exception:
-            pass  # Never let read-cache disrupt Claude Code
 
     if context_notes:
         hook_output["additionalContext"] = " ".join(context_notes)
@@ -516,6 +616,45 @@ def _handle_stop(
         ended_at = None
     transcript_path = payload.get("transcript_path")
     transcript_data = transcript.parse_transcript(transcript_path)
+    cfg = _config.load()
+
+    transcript_tool_calls = len(transcript_data.tool_calls)
+    previous_hook_health = session_store.read_hook_health(session_id)
+    pre_tool_events = previous_hook_health.get("pre_tool_use_count", 0) + sum(
+        1 for event in events if event.get("event_type") == "PreToolUse"
+    )
+    post_tool_events = previous_hook_health.get("post_tool_use_count", 0) + sum(
+        1 for event in events if event.get("event_type") == "PostToolUse"
+    )
+    tool_failure_events = previous_hook_health.get("tool_failure_count", 0) + sum(
+        1 for event in events if event.get("event_type") == "ToolFailure"
+    )
+    completed_tool_events = post_tool_events + tool_failure_events
+    if transcript_tool_calls == 0:
+        hook_health_status = "no_tool_calls"
+    elif pre_tool_events == 0 and completed_tool_events == 0:
+        hook_health_status = "missing_tool_hooks"
+    elif pre_tool_events == 0 or completed_tool_events == 0:
+        hook_health_status = "incomplete_tool_hooks"
+    else:
+        hook_health_status = "healthy"
+
+    hook_health = {
+        "schema_version": 1,
+        "provider": "claude",
+        "session_id": session_id,
+        "status": hook_health_status,
+        "recorded_at": now,
+        "transcript_tool_call_count": transcript_tool_calls,
+        "pre_tool_use_count": pre_tool_events,
+        "post_tool_use_count": post_tool_events,
+        "tool_failure_count": tool_failure_events,
+        "read_cache_enabled": bool(cfg.get("read_cache", False)),
+    }
+    try:
+        session_store.write_hook_health(session_id, hook_health)
+    except OSError:
+        logger.exception("failed to persist Claude hook-health metadata")
     transformations = {
         event.get("tool_use_id"): event
         for event in events
@@ -534,11 +673,27 @@ def _handle_stop(
             ):
                 setattr(call, key, transformation.get(key))
             call.extra_fields["compression_applied"] = transformation.get("applied", True)
+            if transformation.get("measurement_kind"):
+                call.extra_fields["measurement_kind"] = transformation["measurement_kind"]
+            if transformation.get("file_path"):
+                call.extra_fields["compression_file_path"] = transformation["file_path"]
     file_diffs = _extract_file_diffs_from_tool_calls(transcript_data.tool_calls)
 
     # Compute analytics from tool calls and file diffs.
     analytics = compute_session_analytics(transcript_data.tool_calls, file_diffs)
-    mechanism_savings = aggregate_mechanism_savings(events)
+    turn_mechanism_savings = aggregate_mechanism_savings(events)
+    brevity_event = next((ev for ev in events if ev.get("event_type") == "BrevityInjected"), None)
+    if brevity_event:
+        turn_mechanism_savings = turn_mechanism_savings or {}
+        turn_mechanism_savings["brevity"] = {
+            "enabled": True,
+            "instruction_hash": brevity_event.get("instruction_hash"),
+            "instruction_tokens": brevity_event.get("instruction_tokens"),
+        }
+    mechanism_savings = merge_mechanism_savings(
+        session_store.read_mechanism_savings_state(session_id),
+        turn_mechanism_savings,
+    )
 
     record = HookSessionRecord(
         session_id=session_id,
@@ -564,10 +719,27 @@ def _handle_stop(
     )
 
     asyncio.run(upload_single(record))
+    if mechanism_savings:
+        try:
+            session_store.write_mechanism_savings_state(session_id, mechanism_savings)
+        except OSError:
+            logger.exception("failed to persist cumulative mechanism savings")
     if schedule_update:
         schedule_session_end_update()
 
-    cfg = _config.load()
+    stop_context_blocks: list[str] = []
+    if (
+        hook_health_status == "missing_tool_hooks"
+        and previous_hook_health.get("status") != "missing_tool_hooks"
+    ):
+        stop_context_blocks.append(
+            "[rclm] Hook health warning: Claude's transcript contains "
+            f"{transcript_tool_calls} tool call(s), but ReclaimLLM received no PreToolUse or "
+            "PostToolUse events. Read cache and other tool-level mechanisms were inactive. "
+            "Run Claude with `--debug hooks` and verify the tool hooks in "
+            "`~/.claude/settings.json`."
+        )
+
     if cfg.get("handoff_advisor", False) and not session_store.has_marker(
         session_id,
         HANDOFF_ADVISOR_MARKER,
@@ -575,16 +747,19 @@ def _handle_stop(
         advisory = _handoff_advisory(transcript_data, cfg)
         if advisory:
             session_store.write_marker(session_id, HANDOFF_ADVISOR_MARKER)
-            print(
-                json.dumps(
-                    {
-                        "hookSpecificOutput": {
-                            "hookEventName": "Stop",
-                            "additionalContext": advisory,
-                        }
+            stop_context_blocks.append(advisory)
+
+    if stop_context_blocks:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "Stop",
+                        "additionalContext": "\n\n".join(stop_context_blocks),
                     }
-                )
+                }
             )
+        )
 
     # Clean up any DLP temp files created during this session.
     for ev in events:
@@ -592,11 +767,21 @@ def _handle_stop(
             with contextlib.suppress(OSError):
                 os.unlink(ev["path"])
 
+    session_store.cleanup_events(session_id)
+
+
+def _handle_session_end(session_id: str, payload: dict) -> None:
+    """Clean all session-scoped state only when Claude declares the session finished."""
+    for event in session_store.read_events(session_id):
+        if event.get("event_type") == "DLPTempFile":
+            with contextlib.suppress(OSError):
+                os.unlink(event["path"])
     session_store.cleanup(session_id)
 
 
 _HANDLERS = {
     "SessionStart": _handle_session_start,
+    "SessionEnd": _handle_session_end,
     "PreToolUse": _handle_pre_tool_use,
     "PostToolUse": _handle_post_tool_use,
     "PostToolUseFailure": _handle_post_tool_use_failure,

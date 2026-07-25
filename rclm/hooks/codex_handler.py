@@ -42,14 +42,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
 from rclm import _config
 from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import codex_transcript, dedupe, dlp, session_store
-from rclm.hooks._analytics import estimate_tokens, mechanism_saving_event
+from rclm.hooks import codex_transcript, dedupe, dlp, read_cache, session_store
+from rclm.hooks._analytics import (
+    aggregate_mechanism_savings,
+    estimate_tokens,
+    mechanism_saving_event,
+)
 from rclm.hooks.updater import schedule_session_end_update
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,15 @@ THRESHOLD_ZERO_DURATION = 5.0  # seconds
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_cwd(session_id: str, payload: dict) -> str:
+    if payload.get("cwd"):
+        return payload["cwd"]
+    for event in session_store.read_events(session_id):
+        if event.get("event_type") == "SessionStart":
+            return event.get("cwd", "")
+    return ""
 
 
 def _handle_session_start(session_id: str, payload: dict) -> None:
@@ -117,13 +131,23 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
 
     cfg = _config.load()
     shadow = cfg.get("shadow_mode", False)
+    turn_id = payload.get("turn_id")
+    pre_event = next(
+        (
+            event
+            for event in reversed(prior_events)
+            if event.get("event_type") == "PreToolUse" and event.get("turn_id") == turn_id
+        ),
+        None,
+    )
+    tool_input = pre_event.get("tool_input", {}) if pre_event else {}
+    cwd = _resolve_cwd(session_id, payload)
     # DLP runs first so dedupe only ever hashes secret-free content.
     effective_text = tool_response if isinstance(tool_response, str) else str(tool_response or "")
     replaced = False
 
     if cfg.get("dlp", False):
         try:
-            cwd = payload.get("cwd", "")
             scrubbed = dlp.maybe_redact_output("Bash", tool_response, cwd)
             if scrubbed is not None:
                 effective_text = scrubbed
@@ -131,8 +155,41 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             pass  # Never let DLP disrupt Codex CLI
 
+    range_claimed = False
+    if cfg.get("read_cache", False):
+        try:
+            command = tool_input.get("command") or tool_input.get("cmd")
+            shell = tool_input.get("shell") or ("posix" if os.name == "posix" else os.name)
+            request = (
+                read_cache.parse_shell_read(command, cwd=cwd, shell=shell)
+                if isinstance(command, str)
+                else None
+            )
+            if request is not None:
+                range_claimed = True
+                state = session_store.read_read_cache_state(session_id)
+                turn = (
+                    sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
+                )
+                application = read_cache.apply_range_cache(
+                    request,
+                    effective_text,
+                    state,
+                    turn=turn,
+                    tool_use_id=f"codex-turn-{turn_id}",
+                    shadow=shadow,
+                )
+                session_store.write_read_cache_state(session_id, application.state)
+                for event in application.events:
+                    session_store.append_event(session_id, {**event, "turn_id": turn_id})
+                if application.replacement is not None:
+                    effective_text = application.replacement
+                    replaced = True
+        except Exception:
+            logger.exception("range cache failed; passing through tool result")
+
     compression = _config.compression_config(cfg)
-    if compression["dedupe"]:
+    if compression["dedupe"] and not range_claimed:
         try:
             state = session_store.read_dedupe_state(session_id)
             turn = sum(1 for ev in prior_events if ev.get("event_type") == "PostToolUse") + 1
@@ -141,7 +198,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 state,
                 tool_name="Bash",
                 turn=turn,
-                cwd=payload.get("cwd", ""),
+                cwd=cwd,
                 min_chars=int(compression["min_dedupe_chars"]),
             )
             session_store.write_dedupe_state(session_id, state)
@@ -152,7 +209,10 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 session_store.append_event(
                     session_id,
                     mechanism_saving_event(
-                        "hash_dedupe", applied=not shadow, tokens_saved_estimate=saved
+                        "hash_dedupe",
+                        applied=not shadow,
+                        tokens_saved_estimate=saved,
+                        measurement_kind="measured",
                     ),
                 )
                 session_store.append_event(
@@ -167,6 +227,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                         "tokens_saved_estimate": saved,
                         "compression_ratio": len(replacement) / max(1, len(effective_text)),
                         "applied": not shadow,
+                        "measurement_kind": "measured",
+                        "turn_id": turn_id,
                     },
                 )
                 if not shadow:
@@ -235,7 +297,7 @@ def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
             )
             tool_calls.append(
                 ToolCall(
-                    tool_use_id=f"codex-tool-{counter}",
+                    tool_use_id=f"codex-turn-{turn_id}",
                     tool_name="Bash",
                     tool_input=tool_input,
                     tool_result=ev.get("tool_response"),
@@ -258,6 +320,70 @@ def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
         counter += 1
 
     return tool_calls
+
+
+_TRANSFORMATION_FIELDS = (
+    "was_compressed",
+    "compression_strategy",
+    "raw_token_estimate",
+    "compressed_token_estimate",
+    "tokens_saved_estimate",
+    "compression_ratio",
+)
+
+
+def _apply_transformation(call: ToolCall, transformation: dict) -> None:
+    for key in _TRANSFORMATION_FIELDS:
+        setattr(call, key, transformation.get(key))
+    call.extra_fields["compression_applied"] = transformation.get("applied", True)
+    if transformation.get("measurement_kind"):
+        call.extra_fields["measurement_kind"] = transformation["measurement_kind"]
+    if transformation.get("file_path"):
+        call.extra_fields["compression_file_path"] = transformation["file_path"]
+
+
+def _tool_command(call: ToolCall) -> str | None:
+    command = call.tool_input.get("command") or call.tool_input.get("cmd")
+    if isinstance(command, list) and all(isinstance(part, str) for part in command):
+        return " ".join(command)
+    return command if isinstance(command, str) else None
+
+
+def _attach_transformations(
+    tool_calls: list[ToolCall], fallback_calls: list[ToolCall], events: list[dict]
+) -> None:
+    """Map hook transformations onto transcript calls without relying on provider IDs."""
+    transformations = {
+        event.get("tool_use_id"): event
+        for event in events
+        if event.get("event_type") == "ToolTransformation" and event.get("tool_use_id")
+    }
+    for call in fallback_calls:
+        transformation = transformations.get(call.tool_use_id)
+        if transformation:
+            _apply_transformation(call, transformation)
+    if tool_calls is fallback_calls:
+        return
+
+    cursor = 0
+    for fallback in fallback_calls:
+        command = _tool_command(fallback)
+        if command is None:
+            continue
+        match_index = next(
+            (
+                index
+                for index in range(cursor, len(tool_calls))
+                if _tool_command(tool_calls[index]) == command
+            ),
+            None,
+        )
+        if match_index is None:
+            continue
+        transformation = transformations.get(fallback.tool_use_id)
+        if transformation:
+            _apply_transformation(tool_calls[match_index], transformation)
+        cursor = match_index + 1
 
 
 def _handle_stop(session_id: str, payload: dict) -> None:
@@ -298,6 +424,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     # reconstruction remains as a safety net for missing or unreadable transcripts.
     messages = transcript_data.messages or fallback_messages
     tool_calls = transcript_data.tool_calls or fallback_tool_calls
+    _attach_transformations(tool_calls, fallback_tool_calls, events)
     file_diffs = transcript_data.file_diffs
     model = transcript_data.model or model
 
@@ -314,6 +441,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         file_diffs=file_diffs,
         total_input_tokens=None,
         total_output_tokens=None,
+        mechanism_savings=aggregate_mechanism_savings(events),
     )
 
     asyncio.run(upload_single(record))

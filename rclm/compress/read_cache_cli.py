@@ -1,6 +1,6 @@
 """Entry point for rclm-read-cache CLI.
 
-Wraps cat/sed/head/tail/type/Get-Content with the session-scoped read cache
+Wraps cat/sed/head/tail/Get-Content with the session-scoped read cache
 (diff-on-change) — the shell counterpart of the native Read tool's
 PostToolUse handling in claude_handler.py. Executes the command, then either
 prints the raw output (first read of this file) or a cache-derived
@@ -17,25 +17,12 @@ Usage: rclm-read-cache <command...>
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
-from datetime import datetime, timezone
 
 from rclm import _config
 from rclm.hooks import read_cache, session_store
-from rclm.hooks._analytics import mechanism_saving_event
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _target_file(args: list[str]) -> str | None:
-    """Best-effort: last non-flag argument is the target file."""
-    for token in reversed(args):
-        if not token.startswith("-"):
-            return token
-    return None
 
 
 def main() -> None:
@@ -44,12 +31,12 @@ def main() -> None:
         sys.exit(1)
 
     args = sys.argv[1:]
-    command = " ".join(args)
+    command = shlex.join(args)
 
     try:
         result = subprocess.run(
-            command,
-            shell=True,
+            args,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=300,
@@ -59,30 +46,29 @@ def main() -> None:
         sys.exit(1)
 
     output = result.stdout + result.stderr
-    file_path = _target_file(args)
     session_id = os.environ.get("CLAUDE_SESSION_ID")
 
-    if session_id and file_path:
+    if session_id:
         try:
-            events = session_store.read_events(session_id)
-            delta = read_cache.build_delta(file_path, None, None, output, events)
-            session_store.append_event(
-                session_id,
-                read_cache.snapshot_event(file_path, None, None, output, _now()),
-            )
-            if delta is not None:
+            request = read_cache.parse_shell_read(command, cwd=os.getcwd(), shell="posix")
+            if request is not None:
+                state = session_store.read_read_cache_state(session_id)
+                events = session_store.read_events(session_id)
+                turn = sum(1 for event in events if event.get("event_type") == "PostToolUse") + 1
                 shadow = _config.load().get("shadow_mode", False)
-                tokens_saved = max(0, (len(output) - len(delta["updatedToolOutput"])) // 4)
-                session_store.append_event(
-                    session_id,
-                    mechanism_saving_event(
-                        "H1_read_cache",
-                        applied=not shadow,
-                        tokens_saved_estimate=tokens_saved,
-                    ),
+                application = read_cache.apply_range_cache(
+                    request,
+                    output,
+                    state,
+                    turn=turn,
+                    tool_use_id=None,
+                    shadow=shadow,
                 )
-                if not shadow:
-                    print(delta["updatedToolOutput"], end="")
+                session_store.write_read_cache_state(session_id, application.state)
+                for event in application.events:
+                    session_store.append_event(session_id, event)
+                if application.replacement is not None:
+                    print(application.replacement, end="")
                     sys.exit(result.returncode)
         except Exception:
             pass  # Any cache error falls through to raw output below.

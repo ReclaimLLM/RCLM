@@ -1,150 +1,220 @@
-"""Tests for rclm.hooks.read_cache (diff-on-change for repeated reads)."""
+"""Range-cache parser, interval-state, and fail-open tests."""
 
-from unittest.mock import patch
+from __future__ import annotations
 
-from rclm.hooks.read_cache import build_delta, maybe_wrap_dump_command, snapshot_event
+import json
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# First read of a range — nothing to compare against
-# ---------------------------------------------------------------------------
+import pytest
 
+from rclm.hooks import read_cache
 
-def test_first_read_returns_none():
-    assert build_delta("a.py", None, None, "content", []) is None
-
-
-def test_only_other_files_in_history_returns_none():
-    events = [snapshot_event("b.py", None, None, "content", "t1")]
-    assert build_delta("a.py", None, None, "content", events) is None
+FIXTURES = Path(__file__).parents[1] / "fixtures" / "read_commands.json"
 
 
-# ---------------------------------------------------------------------------
-# Unchanged re-read
-# ---------------------------------------------------------------------------
+def _long_lines(start: int, end: int, marker: str = "line") -> str:
+    return "".join(f"{marker}-{line}-" + ("x" * 100) + "\n" for line in range(start, end + 1))
 
 
-def test_identical_reread_returns_unchanged_notice():
-    events = [snapshot_event("a.py", None, None, "def foo(): pass\n", "t1")]
-    delta = build_delta("a.py", None, None, "def foo(): pass\n", events)
-    assert delta is not None
-    assert "Unchanged since the last read of a.py" in delta["updatedToolOutput"]
-    assert "t1" in delta["updatedToolOutput"]
+def _write_lines(path: Path, count: int, marker: str = "line") -> None:
+    path.write_text(_long_lines(1, count, marker), encoding="utf-8")
 
 
-def test_uses_most_recent_matching_snapshot():
-    events = [
-        snapshot_event("a.py", None, None, "old content\n", "t1"),
-        snapshot_event("a.py", None, None, "new content\n", "t2"),
+def _request(tmp_path: Path, command: str) -> read_cache.ReadRequest:
+    request = read_cache.parse_shell_read(command, cwd=str(tmp_path), shell="posix")
+    assert request is not None
+    return request
+
+
+def test_real_captured_posix_commands_match_expected_syntax() -> None:
+    fixture = json.loads(FIXTURES.read_text(encoding="utf-8"))
+    assert "production session_tool_calls" in fixture["source"]
+    for case in fixture["commands"]:
+        parsed = read_cache._parse_posix(case["command"])
+        assert (parsed is not None) is case["recognized"], case["command"]
+        if parsed is not None:
+            path, start, end, style = parsed
+            assert path == case["path"]
+            assert start == case["start"]
+            assert end == case["end"]
+            if case.get("tail_count"):
+                assert style == "tail"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("sed -n '10,40p' source.py", (10, 40)),
+        ("sed -n '50p' source.py", (50, 50)),
+        ("head -50 source.py", (1, 50)),
+        ("head -n 50 source.py", (1, 50)),
+        ("tail -n 30 source.py", (71, 100)),
+        ("cat source.py", (1, 100)),
+        ("nl source.py", (1, 100)),
+        ("nl -ba source.py | sed -n '1,80p'", (1, 80)),
+        ("awk 'NR>=10 && NR<=40' source.py", (10, 40)),
+    ],
+)
+def test_parse_supported_posix_ranges(
+    tmp_path: Path, command: str, expected: tuple[int, int]
+) -> None:
+    _write_lines(tmp_path / "source.py", 100)
+    request = read_cache.parse_shell_read(command, cwd=str(tmp_path), shell="zsh")
+    assert request is not None
+    assert (request.start_line, request.end_line) == expected
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("Get-Content source.ps1", (1, 100)),
+        ("Get-Content -Path source.ps1", (1, 100)),
+        ("Get-Content -LiteralPath source.ps1", (1, 100)),
+        ("Get-Content -TotalCount 25 source.ps1", (1, 25)),
+        ("Get-Content -Tail 20 source.ps1", (81, 100)),
+    ],
+)
+def test_parse_supported_powershell_ranges(
+    tmp_path: Path, command: str, expected: tuple[int, int]
+) -> None:
+    _write_lines(tmp_path / "source.ps1", 100)
+    request = read_cache.parse_shell_read(command, cwd=str(tmp_path), shell="pwsh")
+    assert request is not None
+    assert (request.start_line, request.end_line) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat *.py",
+        "cat a.py b.py",
+        "cat a.py > out.txt",
+        "cat a.py | grep token",
+        "sed -n '1,20p' a.py | grep token",
+        "awk '{print $1}' a.py",
+        "nl -v 10 a.py",
+    ],
+)
+def test_ambiguous_posix_commands_passthrough(tmp_path: Path, command: str) -> None:
+    _write_lines(tmp_path / "a.py", 100)
+    assert read_cache.parse_shell_read(command, cwd=str(tmp_path), shell="posix") is None
+
+
+def test_full_coverage_returns_turn_notice(tmp_path: Path) -> None:
+    path = tmp_path / "source.py"
+    _write_lines(path, 10)
+    request = _request(tmp_path, "cat source.py")
+    content = path.read_text(encoding="utf-8")
+
+    first = read_cache.process_read(request, content, {}, turn=4)
+    second = read_cache.process_read(request, content, first.state, turn=5)
+
+    assert first.replacement is None
+    assert second.cache_hit is True
+    assert second.replacement == "[RCLM] Lines 1-10 of source.py unchanged since turn 4.\n"
+
+
+def test_partial_overlap_keeps_only_uncovered_lines(tmp_path: Path) -> None:
+    path = tmp_path / "source.py"
+    _write_lines(path, 8)
+    first_request = _request(tmp_path, "sed -n '1,4p' source.py")
+    second_request = _request(tmp_path, "sed -n '3,8p' source.py")
+
+    first = read_cache.process_read(first_request, _long_lines(1, 4), {}, turn=1)
+    second = read_cache.process_read(second_request, _long_lines(3, 8), first.state, turn=2)
+
+    assert second.replacement is not None
+    assert "Lines 3-4 of source.py unchanged since turn 1" in second.replacement
+    assert "line-5-" in second.replacement
+    assert "line-8-" in second.replacement
+    assert "line-3-" not in second.replacement
+
+
+def test_hash_change_invalidates_all_intervals(tmp_path: Path) -> None:
+    path = tmp_path / "source.py"
+    _write_lines(path, 6, "old")
+    first_request = _request(tmp_path, "cat source.py")
+    first = read_cache.process_read(first_request, path.read_text(), {}, turn=1)
+
+    _write_lines(path, 6, "new")
+    changed_request = _request(tmp_path, "cat source.py")
+    changed = read_cache.process_read(changed_request, path.read_text(), first.state, turn=2)
+
+    assert changed.replacement is None
+    entry = changed.state["files"][changed_request.path]
+    assert entry["spans"] == [{"start": 1, "end": 6, "turn": 2}]
+
+
+def test_edit_invalidation_forces_fresh_reread(tmp_path: Path) -> None:
+    path = tmp_path / "source.py"
+    _write_lines(path, 6)
+    request = _request(tmp_path, "cat source.py")
+    first = read_cache.process_read(request, path.read_text(), {}, turn=1)
+
+    invalidated = read_cache.invalidate_tool_path(
+        first.state, "Edit", {"file_path": "source.py"}, cwd=str(tmp_path)
+    )
+    reread = read_cache.process_read(request, path.read_text(), invalidated, turn=2)
+
+    assert reread.replacement is None
+    assert reread.state["files"][request.path]["spans"][0]["turn"] == 2
+
+
+def test_shadow_mode_measures_without_returning_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "source.py"
+    _write_lines(path, 10)
+    request = _request(tmp_path, "cat source.py")
+    content = path.read_text()
+    first = read_cache.apply_range_cache(
+        request, content, {}, turn=1, tool_use_id="tool-1", shadow=True
+    )
+    second = read_cache.apply_range_cache(
+        request, content, first.state, turn=2, tool_use_id="tool-2", shadow=True
+    )
+
+    assert second.replacement is None
+    assert [event["event_type"] for event in second.events] == [
+        "MechanismSaving",
+        "ToolTransformation",
     ]
-    delta = build_delta("a.py", None, None, "new content\n", events)
-    assert "Unchanged" in delta["updatedToolOutput"]
-    assert "t2" in delta["updatedToolOutput"]
+    assert second.events[0]["measurement_kind"] == "measured"
+    assert second.events[0]["applied"] is False
 
 
-# ---------------------------------------------------------------------------
-# Changed re-read — unified diff
-# ---------------------------------------------------------------------------
+def test_pagination_advances_to_first_unseen_line(tmp_path: Path) -> None:
+    path = tmp_path / "large.py"
+    _write_lines(path, 600)
+    first_request = _request(tmp_path, "sed -n '1,200p' large.py")
+    first = read_cache.process_read(first_request, _long_lines(1, 200), {}, turn=1)
+
+    offset, state = read_cache.next_unseen_offset(
+        {"file_path": "large.py"}, first.state, cwd=str(tmp_path)
+    )
+
+    assert offset == 200
+    assert state["files"][first_request.path]["line_count"] == 600
 
 
-def test_changed_reread_returns_diff():
-    before = "line1\nline2\nline3\n"
-    after = "line1\nCHANGED\nline3\n"
-    events = [snapshot_event("a.py", None, None, before, "t1")]
-    delta = build_delta("a.py", None, None, after, events)
-    assert delta is not None
-    output = delta["updatedToolOutput"]
-    assert "a.py changed since the last read" in output
-    assert "-line2" in output
-    assert "+CHANGED" in output
+def test_binary_missing_and_malformed_state_fail_open(tmp_path: Path) -> None:
+    (tmp_path / "binary.bin").write_bytes(b"text\x00binary")
+    assert read_cache.parse_shell_read("cat binary.bin", cwd=str(tmp_path)) is None
+    assert read_cache.parse_shell_read("cat missing.py", cwd=str(tmp_path)) is None
+
+    path = tmp_path / "source.py"
+    _write_lines(path, 3)
+    request = _request(tmp_path, "cat source.py")
+    decision = read_cache.process_read(request, path.read_text(), {"files": "bad"}, turn=1)
+    assert decision.replacement is None
+    assert decision.state["version"] == read_cache.STATE_VERSION
 
 
-def test_large_diff_is_capped():
-    before = "\n".join(f"line{i}" for i in range(200)) + "\n"
-    after = "\n".join(f"changed{i}" for i in range(200)) + "\n"
-    events = [snapshot_event("a.py", None, None, before, "t1")]
-    delta = build_delta("a.py", None, None, after, events)
-    output = delta["updatedToolOutput"]
-    assert "more diff lines omitted" in output
-    assert len(output.splitlines()) < 200
-
-
-# ---------------------------------------------------------------------------
-# Different ranges of the same file are tracked independently
-# ---------------------------------------------------------------------------
-
-
-def test_different_offset_limit_not_compared():
-    events = [snapshot_event("a.py", 0, 100, "content A", "t1")]
-    # Same file, different range -> no history for this specific key.
-    assert build_delta("a.py", 100, 200, "content A", events) is None
-
-
-def test_same_offset_limit_compared():
-    events = [snapshot_event("a.py", 0, 100, "content A", "t1")]
-    delta = build_delta("a.py", 0, 100, "content A", events)
-    assert delta is not None
-    assert "Unchanged" in delta["updatedToolOutput"]
-
-
-# ---------------------------------------------------------------------------
-# snapshot_event shape
-# ---------------------------------------------------------------------------
-
-
-def test_snapshot_event_shape():
-    ev = snapshot_event("a.py", 1, 2, "hello", "t1")
-    assert ev["event_type"] == "ReadSnapshot"
-    assert ev["file_path"] == "a.py"
-    assert ev["key"] == "a.py::1::2"
-    assert ev["content"] == "hello"
-    assert ev["timestamp"] == "t1"
-    assert "content_hash" in ev
-
-
-# ---------------------------------------------------------------------------
-# maybe_wrap_dump_command
-# ---------------------------------------------------------------------------
-
-
-class TestMaybeWrapDumpCommand:
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_cat_is_wrapped(self, mock_which):
-        result = maybe_wrap_dump_command({"command": "cat src/a.py"})
-        assert result == {"command": "rclm-read-cache cat src/a.py"}
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_head_is_wrapped(self, mock_which):
-        result = maybe_wrap_dump_command({"command": "head -50 src/a.py"})
-        assert result == {"command": "rclm-read-cache head -50 src/a.py"}
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_powershell_get_content_is_wrapped(self, mock_which):
-        result = maybe_wrap_dump_command({"command": "Get-Content src/a.ps1"})
-        assert result == {"command": "rclm-read-cache Get-Content src/a.ps1"}
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_already_wrapped_skipped(self, mock_which):
-        assert maybe_wrap_dump_command({"command": "rclm-read-cache cat src/a.py"}) is None
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_piped_command_not_wrapped(self, mock_which):
-        assert maybe_wrap_dump_command({"command": "cat src/a.py | grep foo"}) is None
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_redirected_command_not_wrapped(self, mock_which):
-        assert maybe_wrap_dump_command({"command": "cat src/a.py > out.txt"}) is None
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_chained_command_not_wrapped(self, mock_which):
-        assert maybe_wrap_dump_command({"command": "cat src/a.py && echo done"}) is None
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value=None)
-    def test_binary_unavailable_not_wrapped(self, mock_which):
-        assert maybe_wrap_dump_command({"command": "cat src/a.py"}) is None
-
-    @patch("rclm.hooks.read_cache.shutil.which", return_value="/usr/local/bin/rclm-read-cache")
-    def test_non_dump_command_not_wrapped(self, mock_which):
-        assert maybe_wrap_dump_command({"command": "python script.py"}) is None
-
-    def test_empty_command(self):
-        assert maybe_wrap_dump_command({"command": ""}) is None
+def test_file_and_span_caps_evict_oldest_entries(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(read_cache, "MAX_TRACKED_FILES", 2)
+    state: dict = {}
+    for index in range(3):
+        path = tmp_path / f"file-{index}.py"
+        _write_lines(path, 2)
+        request = _request(tmp_path, f"cat file-{index}.py")
+        state = read_cache.process_read(request, path.read_text(), state, turn=index + 1).state
+    assert len(state["files"]) == 2
+    assert str((tmp_path / "file-0.py").resolve()) not in state["files"]

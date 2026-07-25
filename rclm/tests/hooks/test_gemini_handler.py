@@ -292,6 +292,37 @@ def test_after_tool_dedupe_off_by_default(monkeypatch, tmp_path, capsys):
     assert json.loads(second_output) == {}
 
 
+def test_after_tool_range_cache_denies_repeated_native_read(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "load", lambda: {"read_cache": True})
+    target = tmp_path / "source.py"
+    content = "".join(f"line {line}: {'x' * 32}\n" for line in range(1, 81))
+    target.write_text(content)
+    payload = {
+        "session_id": "gsid-range",
+        "transcript_path": "/tmp/gemini-session.json",
+        "cwd": str(tmp_path),
+        "hook_event_name": "AfterTool",
+        "timestamp": "2026-04-10T00:00:00Z",
+        "tool_name": "read_file",
+        "tool_input": {"file_path": str(target)},
+        "tool_response": {"llmContent": content, "returnDisplay": content, "error": None},
+    }
+
+    assert json.loads(_run_handler("AfterTool", payload, monkeypatch, capsys=capsys)) == {}
+    output = json.loads(_run_handler("AfterTool", payload, monkeypatch, capsys=capsys))
+
+    validate(instance=output, schema=GEMINI_COMMON_OUTPUT_SCHEMA)
+    assert output["decision"] == "deny"
+    assert "[RCLM] Lines 1-80 of source.py unchanged since turn 1." in output["reason"]
+    events = session_store.read_events("gsid-range")
+    transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
+    assert transformation["compression_strategy"] == "range_cache"
+    assert transformation["measurement_kind"] == "measured"
+
+
 # ---------------------------------------------------------------------------
 # SessionEnd — record assembly
 # ---------------------------------------------------------------------------

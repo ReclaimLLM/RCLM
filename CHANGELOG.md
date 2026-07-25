@@ -3,6 +3,31 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.21] — 2026-07-24
+
+### Added
+- Added conservative, range-aware read caching for native and exact shell file reads across Claude, Codex, and Gemini, with interval tracking, edit invalidation, bounded session state, shadow mode, and per-file measured savings (`rclm/hooks/read_cache.py`, `rclm/compress/read_cache_cli.py`, `rclm/hooks/{claude,codex,gemini}_handler.py`)
+- Added bounded Claude hook-health diagnostics that compare transcript tool calls with observed lifecycle events and warn once when tool hooks are missing (`rclm/hooks/claude_handler.py`, `rclm/hooks/session_store.py`)
+- Added opt-in Claude brevity instruction wiring and `SessionEnd` registration for final session-state cleanup (`rclm/hooks/claude_handler.py`, `rclm/hooks/installer.py`)
+
+### Changed
+- Extended mechanism telemetry with measured/estimated classification, raw and compressed token counts, per-file attribution, and provider tool-transformation attachment (`rclm/hooks/_analytics.py`, `rclm/hooks/{claude,codex,gemini}_handler.py`, `rclm/compress/runner.py`)
+- Made large native reads advance to the first unseen range and made shell-command detection explicitly parse supported POSIX segments instead of using substring matching (`rclm/hooks/compress.py`, `rclm/hooks/read_cache.py`)
+- Expanded package compatibility through Python 3.14 (`pyproject.toml`, `uv.lock`)
+
+### Fixed
+- Fixed Claude structured tool responses and exact Bash reads so range-cache replacements reach the model despite Claude ignoring `PostToolUse.updatedToolOutput` (`rclm/hooks/claude_handler.py`, `rclm/compress/read_cache_cli.py`)
+- Fixed Claude `Stop` cleanup erasing cache state and earlier savings by separating turn cleanup from `SessionEnd` cleanup and persisting cumulative mechanism rollups (`rclm/hooks/claude_handler.py`, `rclm/hooks/session_store.py`)
+- Fixed range cache and hash deduplication from double-claiming the same result, while preserving transformation telemetry on uploaded Codex and Gemini tool calls (`rclm/hooks/{claude,codex,gemini}_handler.py`)
+
+### Performance
+- Replaced full repeated file output with compact unchanged-range notices while passing ambiguous commands, changed files, binary files, and unsupported output through unchanged (`rclm/hooks/read_cache.py`)
+
+### Deps
+- Refreshed `uv.lock` to the current lock format and Python 3.14-compatible artifact metadata without changing declared runtime dependencies (`uv.lock`)
+
+---
+
 ## [v0.1.20] — 2026-07-24
 
 ### Added
@@ -15,6 +40,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added a once-daily, detached `rclm-update` scheduler after successful primary Claude, Codex, and Gemini session uploads, with local locking and an update log (`rclm/hooks/updater.py`, `rclm/hooks/{claude,codex,gemini}_handler.py`)
 
 ### Changed
+- Expanded package Python compatibility to include Python 3.14 (`pyproject.toml`, `uv.lock`)
 - Migrated legacy flat compression configuration keys to the nested `compression` object while retaining read compatibility for existing installations (`rclm/_config.py`, `rclm/update.py`)
 - Routed `go test` through the command wrapper and made test filtering exit-code-aware so unknown non-zero runner output passes through unchanged (`rclm/hooks/compress.py`, `rclm/compress/cli.py`)
 - Moved automatic update execution from login/install completion to primary session completion, so session hooks never wait for PyPI, pip, or hook reinstallation (`rclm/login.py`, `rclm/hooks/installer.py`, `rclm/hooks/updater.py`)

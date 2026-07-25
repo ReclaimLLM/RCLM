@@ -7,6 +7,8 @@ Returns an updatedInput dict for Claude Code's hookSpecificOutput, or None.
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import shutil
 
 # File size threshold (lines) above which Read tool gets a limit injected.
@@ -39,7 +41,13 @@ _BASH_REWRITE_COMMANDS = {
 }
 
 
-def maybe_compress(tool_name: str, tool_input: dict, *, shadow: bool = False) -> dict | None:
+def maybe_compress(
+    tool_name: str,
+    tool_input: dict,
+    *,
+    shadow: bool = False,
+    read_offset: int | None = None,
+) -> dict | None:
     """Return updatedInput dict if compression applies, None otherwise.
 
     `shadow=True` suppresses the Read/Grep native-tool shaping — those have no
@@ -49,7 +57,7 @@ def maybe_compress(tool_name: str, tool_input: dict, *, shadow: bool = False) ->
     measures and handles its own shadow/enforce output decision.
     """
     if tool_name == "Read":
-        return None if shadow else _compress_read(tool_input)
+        return None if shadow else _compress_read(tool_input, read_offset=read_offset)
     if tool_name == "Grep":
         return None if shadow else _compress_grep(tool_input)
     if tool_name == "Bash":
@@ -57,8 +65,8 @@ def maybe_compress(tool_name: str, tool_input: dict, *, shadow: bool = False) ->
     return None
 
 
-def _compress_read(tool_input: dict) -> dict | None:
-    """If file is large and no limit set, inject a limit."""
+def _compress_read(tool_input: dict, *, read_offset: int | None = None) -> dict | None:
+    """If a file is large and unbounded, inject a progressing read window."""
     if tool_input.get("limit"):
         return None  # User/agent already set a limit
 
@@ -74,7 +82,10 @@ def _compress_read(tool_input: dict) -> dict | None:
     if line_count <= READ_LINE_THRESHOLD:
         return None
 
-    return {"limit": READ_INJECT_LIMIT}
+    delta = {"limit": READ_INJECT_LIMIT}
+    if read_offset is not None and tool_input.get("offset") is None:
+        delta["offset"] = read_offset
+    return delta
 
 
 def _compress_grep(tool_input: dict) -> dict | None:
@@ -111,33 +122,146 @@ def _compress_bash(tool_input: dict) -> dict | None:
     if not _compress_available():
         return None
 
-    base_cmd = _extract_base_command(command)
-    if base_cmd not in _BASH_REWRITE_COMMANDS:
-        return None
-
-    # For python, only rewrite if it's a test command
-    if base_cmd == "python" and "-m pytest" not in command:
-        return None
-
-    # For npm/npx, only rewrite test-related commands
-    if base_cmd in ("npm", "npx") and not any(kw in command for kw in ("test", "jest", "vitest")):
-        return None
-
-    if base_cmd == "go" and not command.lstrip().startswith("go test"):
-        return None
-
-    return {"command": f"rclm-compress {command}"}
-
-
-def _extract_base_command(command: str) -> str:
-    """Extract the base command from a potentially complex shell string."""
-    stripped = command.strip()
-    # Handle env var prefixes like "FOO=bar git status"
-    parts = stripped.split()
-    for part in parts:
-        if "=" in part and not part.startswith("-"):
+    shell = _detect_shell(tool_input)
+    for segment in split_command_segments(command, shell=shell):
+        base_cmd = extract_base_command(segment)
+        if base_cmd not in _BASH_REWRITE_COMMANDS:
             continue
-        # Found the actual command
+
+        # For python, only rewrite if it's a test command
+        if base_cmd == "python" and "-m pytest" not in segment:
+            continue
+
+        # For npm/npx, only rewrite test-related commands
+        if base_cmd in ("npm", "npx") and not any(
+            kw in segment for kw in ("test", "jest", "vitest")
+        ):
+            continue
+
+        if base_cmd == "go" and not segment.lstrip().startswith("go test"):
+            continue
+
+        return {"command": f"rclm-compress {command}"}
+
+    return None
+
+
+def split_command_segments(command: str, shell: str = "posix") -> list[str]:
+    """Split a shell command on top-level command separators."""
+    try:
+        if not _is_posix_shell(shell):
+            return []
+
+        stripped = command.strip()
+        if not stripped:
+            return []
+
+        segments: list[str] = []
+        current: list[str] = []
+        quote: str | None = None
+        escaped = False
+        subshell_depth = 0
+        i = 0
+
+        while i < len(command):
+            char = command[i]
+            next_char = command[i + 1] if i + 1 < len(command) else ""
+
+            if escaped:
+                current.append(char)
+                escaped = False
+                i += 1
+                continue
+
+            if char == "\\":
+                current.append(char)
+                escaped = True
+                i += 1
+                continue
+
+            if quote:
+                current.append(char)
+                if char == quote:
+                    quote = None
+                i += 1
+                continue
+
+            if char in ("'", '"'):
+                current.append(char)
+                quote = char
+                i += 1
+                continue
+
+            if char == "$" and next_char == "(":
+                current.append(char)
+                current.append(next_char)
+                subshell_depth += 1
+                i += 2
+                continue
+
+            if subshell_depth and char == ")":
+                current.append(char)
+                subshell_depth -= 1
+                i += 1
+                continue
+
+            if subshell_depth:
+                current.append(char)
+                i += 1
+                continue
+
+            separator_length = 0
+            if char in ("&", "|") and next_char == char:
+                separator_length = 2
+            elif char in ("|", ";"):
+                separator_length = 1
+
+            if separator_length:
+                segment = "".join(current).strip()
+                if segment:
+                    segments.append(segment)
+                current = []
+                i += separator_length
+                continue
+
+            current.append(char)
+            i += 1
+
+        if quote or escaped or subshell_depth:
+            return []
+
+        segment = "".join(current).strip()
+        if segment:
+            segments.append(segment)
+        return segments
+    except Exception:
+        return []
+
+
+def _detect_shell(tool_input: dict) -> str:
+    """Detect shell syntax from hook input, falling back to the current OS."""
+    shell = tool_input.get("shell")
+    if isinstance(shell, str) and shell.strip():
+        return shell
+    return "posix" if os.name == "posix" else os.name
+
+
+def _is_posix_shell(shell: str) -> bool:
+    shell_name = os.path.basename(shell.strip().lower())
+    return shell_name in {"posix", "sh", "bash", "zsh", "dash", "ksh"}
+
+
+def extract_base_command(segment: str) -> str:
+    """Extract the base command from one shell command segment."""
+    try:
+        parts = shlex.split(segment)
+    except Exception:
+        return ""
+
+    assignment_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+    for part in parts:
+        if assignment_pattern.match(part):
+            continue
         return os.path.basename(part)
     return ""
 

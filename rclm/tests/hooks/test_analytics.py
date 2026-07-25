@@ -92,11 +92,21 @@ class TestComputeSessionAnalytics:
 
 class TestMechanismSavingEvent:
     def test_shape(self):
-        ev = mechanism_saving_event("H1_read_cache", applied=True, tokens_saved_estimate=42)
+        ev = mechanism_saving_event(
+            "range_cache",
+            applied=True,
+            tokens_saved_estimate=42,
+            measurement_kind="measured",
+            file_path="src/api.py",
+            raw_token_estimate=50,
+            compressed_token_estimate=8,
+        )
         assert ev["event_type"] == "MechanismSaving"
-        assert ev["mechanism"] == "H1_read_cache"
+        assert ev["mechanism"] == "range_cache"
         assert ev["applied"] is True
         assert ev["tokens_saved_estimate"] == 42
+        assert ev["measurement_kind"] == "measured"
+        assert ev["file_path"] == "src/api.py"
         assert "timestamp" in ev
 
 
@@ -121,11 +131,45 @@ class TestAggregateMechanismSavings:
             "applied_count": 2,
             "shadow_count": 0,
             "tokens_saved_estimate": 1500,
+            "measurement_kind": "estimated",
         }
         assert result["H3_exec_compaction"] == {
             "applied_count": 1,
             "shadow_count": 0,
             "tokens_saved_estimate": 200,
+            "measurement_kind": "estimated",
+        }
+
+    def test_aggregates_measured_file_attribution(self):
+        events = [
+            mechanism_saving_event(
+                "range_cache",
+                applied=True,
+                tokens_saved_estimate=120,
+                measurement_kind="measured",
+                file_path="src/api.py",
+            ),
+            mechanism_saving_event(
+                "range_cache",
+                applied=True,
+                tokens_saved_estimate=30,
+                measurement_kind="measured",
+                file_path="src/api.py",
+            ),
+        ]
+        result = aggregate_mechanism_savings(events)
+        assert result["range_cache"] == {
+            "applied_count": 2,
+            "shadow_count": 0,
+            "tokens_saved_estimate": 150,
+            "measurement_kind": "measured",
+            "files": {
+                "src/api.py": {
+                    "applied_count": 2,
+                    "shadow_count": 0,
+                    "tokens_saved_estimate": 150,
+                }
+            },
         }
 
     def test_shadow_vs_applied_counts_separately(self):

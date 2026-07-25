@@ -22,14 +22,19 @@ import asyncio
 import difflib
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import dedupe, dlp, session_store
-from rclm.hooks._analytics import estimate_tokens, mechanism_saving_event
+from rclm.hooks import dedupe, dlp, read_cache, session_store
+from rclm.hooks._analytics import (
+    aggregate_mechanism_savings,
+    estimate_tokens,
+    mechanism_saving_event,
+)
 from rclm.hooks.updater import schedule_session_end_update
 
 logger = logging.getLogger(__name__)
@@ -115,6 +120,7 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
             "tool_name": tool_name,
             "tool_input": payload.get("tool_input", {}),
             "tool_response": tool_response,
+            "tool_use_id": payload.get("tool_use_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
@@ -125,6 +131,8 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
     # DLP runs first so dedupe only ever hashes secret-free content.
     effective_text = tool_response
     replaced = False
+    tool_input = payload.get("tool_input", {})
+    tool_use_id = payload.get("tool_use_id") or f"gemini-tool-{len(prior_events)}"
 
     if cfg.get("dlp", False) and tool_name in _DLP_SCRUB_TOOLS:
         try:
@@ -135,8 +143,53 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
         except Exception:
             pass  # Never let DLP disrupt Gemini CLI
 
+    if cfg.get("read_cache", False) and tool_name in {"write_file", "replace"}:
+        try:
+            state = session_store.read_read_cache_state(session_id)
+            mapped_name = "Write" if tool_name == "write_file" else "Edit"
+            state = read_cache.invalidate_tool_path(state, mapped_name, tool_input, cwd=cwd)
+            session_store.write_read_cache_state(session_id, state)
+        except Exception:
+            pass
+
+    range_claimed = False
+    if cfg.get("read_cache", False) and tool_name in {"read_file", "run_shell_command"}:
+        try:
+            if tool_name == "read_file":
+                request = read_cache.native_read_request(tool_input, cwd=cwd)
+            else:
+                command = tool_input.get("command", "")
+                shell = tool_input.get("shell") or ("posix" if os.name == "posix" else os.name)
+                request = (
+                    read_cache.parse_shell_read(command, cwd=cwd, shell=shell)
+                    if isinstance(command, str)
+                    else None
+                )
+            if request is not None:
+                range_claimed = True
+                state = session_store.read_read_cache_state(session_id)
+                turn = (
+                    sum(1 for event in prior_events if event.get("event_type") == "AfterTool") + 1
+                )
+                application = read_cache.apply_range_cache(
+                    request,
+                    effective_text,
+                    state,
+                    turn=turn,
+                    tool_use_id=tool_use_id,
+                    shadow=shadow,
+                )
+                session_store.write_read_cache_state(session_id, application.state)
+                for event in application.events:
+                    session_store.append_event(session_id, event)
+                if application.replacement is not None:
+                    effective_text = application.replacement
+                    replaced = True
+        except Exception:
+            logger.exception("range cache failed; passing through tool result")
+
     compression = _config.compression_config(cfg)
-    if compression["dedupe"]:
+    if compression["dedupe"] and not range_claimed:
         try:
             state = session_store.read_dedupe_state(session_id)
             turn = sum(1 for ev in prior_events if ev.get("event_type") == "AfterTool") + 1
@@ -156,8 +209,26 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
                 session_store.append_event(
                     session_id,
                     mechanism_saving_event(
-                        "hash_dedupe", applied=not shadow, tokens_saved_estimate=saved
+                        "hash_dedupe",
+                        applied=not shadow,
+                        tokens_saved_estimate=saved,
+                        measurement_kind="measured",
                     ),
+                )
+                session_store.append_event(
+                    session_id,
+                    {
+                        "event_type": "ToolTransformation",
+                        "tool_use_id": tool_use_id,
+                        "was_compressed": True,
+                        "compression_strategy": "hash_dedupe",
+                        "raw_token_estimate": raw_tokens,
+                        "compressed_token_estimate": compressed_tokens,
+                        "tokens_saved_estimate": saved,
+                        "compression_ratio": len(replacement) / max(1, len(effective_text)),
+                        "measurement_kind": "measured",
+                        "applied": not shadow,
+                    },
                 )
                 if not shadow:
                     effective_text = replacement
@@ -253,18 +324,39 @@ def _build_messages(events: list[dict]) -> list[dict]:
 def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
     """Build ToolCall list from AfterTool events (each has both input and response)."""
     tool_calls = []
+    transformations = {
+        event.get("tool_use_id"): event
+        for event in events
+        if event.get("event_type") == "ToolTransformation" and event.get("tool_use_id")
+    }
     for i, ev in enumerate(events):
         if ev.get("event_type") != "AfterTool":
             continue
-        tool_calls.append(
-            ToolCall(
-                tool_use_id=f"gemini-tool-{i}",
-                tool_name=ev.get("tool_name", ""),
-                tool_input=ev.get("tool_input", {}),
-                tool_result=ev.get("tool_response"),
-                timestamp=ev.get("timestamp", ""),
-            )
+        tool_use_id = ev.get("tool_use_id") or f"gemini-tool-{i}"
+        call = ToolCall(
+            tool_use_id=tool_use_id,
+            tool_name=ev.get("tool_name", ""),
+            tool_input=ev.get("tool_input", {}),
+            tool_result=ev.get("tool_response"),
+            timestamp=ev.get("timestamp", ""),
         )
+        transformation = transformations.get(tool_use_id)
+        if transformation:
+            for key in (
+                "was_compressed",
+                "compression_strategy",
+                "raw_token_estimate",
+                "compressed_token_estimate",
+                "tokens_saved_estimate",
+                "compression_ratio",
+            ):
+                setattr(call, key, transformation.get(key))
+            call.extra_fields["compression_applied"] = transformation.get("applied", True)
+            if transformation.get("measurement_kind"):
+                call.extra_fields["measurement_kind"] = transformation["measurement_kind"]
+            if transformation.get("file_path"):
+                call.extra_fields["compression_file_path"] = transformation["file_path"]
+        tool_calls.append(call)
     return tool_calls
 
 
@@ -359,6 +451,7 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
         file_diffs=_extract_file_diffs(events),
         total_input_tokens=transcript_data["total_input_tokens"],
         total_output_tokens=transcript_data["total_output_tokens"],
+        mechanism_savings=aggregate_mechanism_savings(events),
     )
 
     asyncio.run(upload_single(record))

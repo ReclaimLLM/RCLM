@@ -529,3 +529,53 @@ def test_codex_post_tool_use_dedupe_off_by_default(monkeypatch, tmp_path, capsys
     _run_handler("PostToolUse", dict(payload, tool_use_id="call-2", turn_id="turn-2"), monkeypatch)
 
     assert capsys.readouterr().out == ""
+
+
+def test_codex_post_tool_use_range_cache_blocks_repeated_read(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"read_cache": True})
+    target = tmp_path / "source.py"
+    content = "".join(f"line {line}: {'x' * 32}\n" for line in range(1, 81))
+    target.write_text(content)
+
+    def _pre(turn_id: str) -> dict:
+        return {
+            "session_id": "sid-codex-range",
+            "cwd": str(tmp_path),
+            "hook_event_name": "PreToolUse",
+            "tool_input": {"cmd": f"cat {target.name}"},
+            "turn_id": turn_id,
+            "timestamp": "2026-04-10T00:00:00Z",
+        }
+
+    def _post(turn_id: str) -> dict:
+        return {
+            "session_id": "sid-codex-range",
+            "cwd": str(tmp_path),
+            "hook_event_name": "PostToolUse",
+            "model": "gpt-5.4",
+            "permission_mode": "default",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": f"cat {target.name}"},
+            "tool_response": content,
+            "tool_use_id": f"call-{turn_id}",
+            "transcript_path": None,
+            "turn_id": turn_id,
+        }
+
+    _run_handler("PreToolUse", _pre("turn-1"), monkeypatch)
+    _run_handler("PostToolUse", _post("turn-1"), monkeypatch)
+    assert capsys.readouterr().out == ""
+    _run_handler("PreToolUse", _pre("turn-2"), monkeypatch)
+    _run_handler("PostToolUse", _post("turn-2"), monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CODEX_POST_TOOL_USE_OUTPUT_SCHEMA)
+    assert output["decision"] == "block"
+    assert "[RCLM] Lines 1-80 of source.py unchanged since turn 1." in output["reason"]
+    events = session_store.read_events("sid-codex-range")
+    transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
+    assert transformation["compression_strategy"] == "range_cache"
+    assert transformation["measurement_kind"] == "measured"

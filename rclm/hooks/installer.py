@@ -18,9 +18,11 @@ Usage:
     rclm-hooks-install --no-with-mcp               # skip installing ReclaimLLM MCP server
     rclm-hooks-install --no-statusline             # skip the Claude Code statusline
     rclm-hooks-install --no-handoff-advisor        # skip Claude handoff suggestions
+    rclm-hooks-install --brevity                   # inject brevity instruction at session start (Claude only)
 
 --with-mcp, --read-cache, --loop-breaker, --compress, --statusline, and --handoff-advisor are on by default;
-pass the --no-<flag> form to opt out. Credentials and preferences are stored in
+pass the --no-<flag> form to opt out. --dlp, --context-pack, --shadow-mode, and --brevity are off by
+default; pass the flag to opt in. Credentials and preferences are stored in
 ~/.reclaimllm/config.json and reused on subsequent runs.
 """
 
@@ -57,6 +59,7 @@ _CLAUDE_HOOKS_TO_INJECT: dict[str, list[dict]] = {
             "hooks": [{"type": "command", "command": "rclm-claude-hooks SessionStart"}],
         },
     ],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "rclm-claude-hooks SessionEnd"}]}],
     "PreToolUse": [
         {
             "matcher": "",
@@ -261,6 +264,15 @@ Subsequent installs without --api-key reuse the saved config.""",
         "--dlp",
         action="store_true",
         help="Enable Data Loss Prevention: redact secrets from .env files before they reach the model",
+    )
+    parser.add_argument(
+        "--brevity",
+        action="store_true",
+        help=(
+            "Claude Code only: inject a brevity instruction at session start to reduce "
+            "verbose output. Advisory only, off by default. Savings are a cohort estimate, "
+            "not a per-session measured figure"
+        ),
     )
     parser.add_argument(
         "--loop-breaker",
@@ -694,6 +706,7 @@ def main() -> None:
     saved_compression = _config.compression_config(saved)
     compress_enabled = args.compress if args.compress is not None else saved_compression["enabled"]
     dlp_enabled = args.dlp or saved.get("dlp", False)
+    brevity_enabled = args.brevity or saved.get("brevity", False)
     loop_breaker_enabled = (
         args.loop_breaker if args.loop_breaker is not None else saved.get("loop_breaker", True)
     )
@@ -731,6 +744,7 @@ def main() -> None:
             "dedupe": dedupe_enabled,
         },
         "dlp": dlp_enabled,
+        "brevity": brevity_enabled,
         "loop_breaker": loop_breaker_enabled,
         "read_cache": read_cache_enabled,
         "statusline": statusline_enabled,

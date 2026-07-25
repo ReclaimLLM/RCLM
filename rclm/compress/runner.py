@@ -117,6 +117,11 @@ def track_savings(
     append_event(
         session_id,
         mechanism_saving_event(
-            mechanism, applied=applied, tokens_saved_estimate=tokens_saved_estimate
+            mechanism,
+            applied=applied,
+            tokens_saved_estimate=tokens_saved_estimate,
+            measurement_kind="measured",
+            raw_token_estimate=max(0, len(original) // 4),
+            compressed_token_estimate=max(0, len(compressed) // 4),
         ),
     )

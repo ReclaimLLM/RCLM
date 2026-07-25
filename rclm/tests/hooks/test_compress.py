@@ -2,7 +2,11 @@
 
 from unittest.mock import patch
 
-from rclm.hooks.compress import maybe_compress
+from rclm.hooks.compress import (
+    extract_base_command,
+    maybe_compress,
+    split_command_segments,
+)
 
 # ---------------------------------------------------------------------------
 # Read compression
@@ -136,6 +140,46 @@ class TestCompressBash:
         assert "rclm-compress" in result["command"]
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_pipeline_rewritten_when_later_segment_matches(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "echo TODO | grep TODO"})
+        assert result is not None
+        assert result["command"] == "rclm-compress echo TODO | grep TODO"
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_chain_rewritten_when_later_segment_matches(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "echo first && git status"})
+        assert result is not None
+        assert result["command"] == "rclm-compress echo first && git status"
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_semicolon_chain_rewritten_when_later_segment_matches(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "echo first; git status"})
+        assert result is not None
+        assert result["command"] == "rclm-compress echo first; git status"
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_nl_sed_pipeline_not_rewritten_without_allowlist(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "nl f | sed -n '1,80p'"})
+        assert result is None
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_posix_shell_from_payload_rewritten(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "git status", "shell": "/bin/zsh"})
+        assert result is not None
+        assert result["command"] == "rclm-compress git status"
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_non_posix_shell_from_payload_not_rewritten(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "git status", "shell": "powershell"})
+        assert result is None
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    @patch("rclm.hooks.compress.os.name", "nt")
+    def test_non_posix_os_fallback_not_rewritten(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "git status"})
+        assert result is None
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_already_wrapped_skipped(self, mock_avail):
         result = maybe_compress("Bash", {"command": "rclm-compress git status"})
         assert result is None
@@ -168,6 +212,73 @@ class TestCompressBash:
     def test_empty_command(self):
         result = maybe_compress("Bash", {"command": ""})
         assert result is None
+
+
+class TestShellCommandParsing:
+    def test_plain_command_base(self):
+        assert split_command_segments("git status") == ["git status"]
+        assert extract_base_command("git status") == "git"
+
+    def test_env_var_prefix_base(self):
+        assert extract_base_command("FOO=bar BAR=baz git status") == "git"
+
+    def test_flag_containing_equals_is_not_skipped(self):
+        assert extract_base_command("--color=always git status") == "--color=always"
+
+    def test_pipeline_segments(self):
+        assert split_command_segments("nl f | sed -n '1,80p'") == [
+            "nl f",
+            "sed -n '1,80p'",
+        ]
+
+    def test_non_posix_shell_returns_empty_segments(self):
+        assert split_command_segments("git status | grep clean", shell="powershell") == []
+        assert split_command_segments("git status | findstr clean", shell="cmd") == []
+
+    def test_and_chain_segments(self):
+        assert split_command_segments("echo first && git status") == [
+            "echo first",
+            "git status",
+        ]
+
+    def test_semicolon_chain_segments(self):
+        assert split_command_segments("echo first; git status") == [
+            "echo first",
+            "git status",
+        ]
+
+    def test_separator_inside_single_quotes_not_split(self):
+        assert split_command_segments("printf 'a|b && c; d' | grep a") == [
+            "printf 'a|b && c; d'",
+            "grep a",
+        ]
+
+    def test_separator_inside_double_quotes_not_split(self):
+        assert split_command_segments('printf "a|b && c; d" | grep a') == [
+            'printf "a|b && c; d"',
+            "grep a",
+        ]
+
+    def test_subshell_separators_not_split(self):
+        assert split_command_segments("echo $(git status | head -1) && grep x f") == [
+            "echo $(git status | head -1)",
+            "grep x f",
+        ]
+
+    def test_or_chain_segments(self):
+        assert split_command_segments("echo first || git status") == [
+            "echo first",
+            "git status",
+        ]
+
+    def test_parse_failure_returns_empty(self):
+        assert split_command_segments("echo 'unterminated") == []
+        assert split_command_segments("echo $(git status | head -1") == []
+
+    def test_empty_or_whitespace_input(self):
+        assert split_command_segments("") == []
+        assert split_command_segments("   ") == []
+        assert extract_base_command("") == ""
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,100 @@
+{
+  "source": "production session_tool_calls via Supabase MCP, sampled 2026-07-24",
+  "commands": [
+    {
+      "family": "sed",
+      "command": "sed -n '130,190p' rclm/hooks/claude_handler.py",
+      "recognized": true,
+      "path": "rclm/hooks/claude_handler.py",
+      "start": 130,
+      "end": 190
+    },
+    {
+      "family": "sed",
+      "command": "sed -n '1,8p' uv.lock",
+      "recognized": true,
+      "path": "uv.lock",
+      "start": 1,
+      "end": 8
+    },
+    {
+      "family": "nl",
+      "command": "nl -ba rclm/hooks/compress.py | sed -n '1,240p'",
+      "recognized": true,
+      "path": "rclm/hooks/compress.py",
+      "start": 1,
+      "end": 240
+    },
+    {
+      "family": "nl",
+      "command": "nl -ba CHANGELOG.md | sed -n '18,30p'",
+      "recognized": true,
+      "path": "CHANGELOG.md",
+      "start": 18,
+      "end": 30
+    },
+    {
+      "family": "cat",
+      "command": "cat diff.txt",
+      "recognized": true,
+      "path": "diff.txt",
+      "start": 1,
+      "end": null
+    },
+    {
+      "family": "cat",
+      "command": "cat CHANGELOG.md",
+      "recognized": true,
+      "path": "CHANGELOG.md",
+      "start": 1,
+      "end": null
+    },
+    {
+      "family": "head",
+      "command": "head -n 40 public/envelope.svg",
+      "recognized": true,
+      "path": "public/envelope.svg",
+      "start": 1,
+      "end": 40
+    },
+    {
+      "family": "tail",
+      "command": "tail -n 180 .ralph/progress.md",
+      "recognized": true,
+      "path": ".ralph/progress.md",
+      "start": 180,
+      "end": null,
+      "tail_count": true
+    },
+    {
+      "family": "cat",
+      "command": "cat scripts/ralph/progress.txt 2>/dev/null | tail -150",
+      "recognized": false
+    },
+    {
+      "family": "cat",
+      "command": "cat package.json | grep -i \"theme\\|tailwind\"; echo \"---tailwind config---\"; cat tailwind.config.ts 2>/dev/null | head -40",
+      "recognized": false
+    },
+    {
+      "family": "head",
+      "command": "head -20 tests/test_records.py; echo \"---\"; grep -n \"api/records\\|api/sessions\" tests/test_ingest.py | head -5",
+      "recognized": false
+    },
+    {
+      "family": "tail",
+      "command": "tail -120 .ralph/progress.md",
+      "recognized": false
+    },
+    {
+      "family": "nl",
+      "command": "nl -ba rclm/hooks/redaction.py | sed -n '242,265p'; nl -ba rclm/tests/test_uploader_redaction.py | sed -n '130,145p'",
+      "recognized": false
+    },
+    {
+      "family": "sed",
+      "command": "sed -n '1,240p' browser/SKILL.md && sed -n '1,260p' computer-use/SKILL.md",
+      "recognized": false
+    }
+  ]
+}

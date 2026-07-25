@@ -72,6 +72,7 @@ def test_all_expected_events_present(tmp_path, monkeypatch):
     settings = _read_settings(tmp_path / ".claude" / "settings.json")
     expected = {
         "SessionStart",
+        "SessionEnd",
         "PreToolUse",
         "PostToolUse",
         "PostToolUseFailure",
@@ -553,6 +554,22 @@ def test_no_loop_breaker_disables(tmp_path, monkeypatch):
 
     config = json.loads((tmp_path / "config.json").read_text())
     assert config["loop_breaker"] is False
+
+
+def test_brevity_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path)
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["brevity"] is False
+
+
+def test_brevity_flag_enables(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--brevity")
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["brevity"] is True
 
 
 def test_with_mcp_on_by_default(tmp_path, monkeypatch):

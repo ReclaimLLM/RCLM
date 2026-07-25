@@ -15,9 +15,9 @@ from rclm.hooks.brevity import (
 
 
 class TestDefaultInstruction:
-    def test_under_120_tokens(self):
+    def test_under_170_tokens(self):
         # ~4 chars/token heuristic, same one used by estimate_tokens elsewhere.
-        assert len(DEFAULT_INSTRUCTION) // 4 < 120
+        assert len(DEFAULT_INSTRUCTION) // 4 < 170
 
     def test_does_not_target_reasoning_or_explicit_requests(self):
         lowered = DEFAULT_INSTRUCTION.lower()

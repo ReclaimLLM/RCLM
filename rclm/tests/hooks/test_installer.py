@@ -9,6 +9,20 @@ from rclm import _config, auth
 from rclm.hooks import installer
 
 # ---------------------------------------------------------------------------
+# Codex hook registration
+# ---------------------------------------------------------------------------
+
+
+def test_codex_pre_and_post_tool_use_matchers_are_unrestricted():
+    """Guard against silently narrowing back to "Bash" — codex_handler.py's
+    MCP image-lifecycle measurement branch depends on Codex actually firing
+    these hooks for non-Bash tool calls, confirmed empirically only when the
+    matcher is unrestricted."""
+    assert installer._CODEX_HOOKS_TO_INJECT["PreToolUse"][0]["matcher"] == ""
+    assert installer._CODEX_HOOKS_TO_INJECT["PostToolUse"][0]["matcher"] == ""
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

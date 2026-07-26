@@ -2,8 +2,10 @@
 
 from rclm._models import FileDiff, ToolCall
 from rclm.hooks._analytics import (
+    FALLBACK_IMAGE_TOKENS,
     aggregate_mechanism_savings,
     compute_session_analytics,
+    estimate_image_tokens,
     estimate_tokens,
     mechanism_saving_event,
 )
@@ -34,6 +36,44 @@ class TestEstimateTokens:
 
     def test_empty_string(self):
         assert estimate_tokens("") == 0
+
+
+# ---------------------------------------------------------------------------
+# estimate_image_tokens
+# ---------------------------------------------------------------------------
+
+
+class TestEstimateImageTokens:
+    def test_unknown_dimensions_falls_back(self):
+        assert estimate_image_tokens(None, None) == FALLBACK_IMAGE_TOKENS
+        assert estimate_image_tokens(0, 100) == FALLBACK_IMAGE_TOKENS
+        assert estimate_image_tokens(100, -5) == FALLBACK_IMAGE_TOKENS
+
+    def test_anthropic_formula_matches_published_width_times_height_over_750(self):
+        # https://docs.anthropic.com/en/docs/build-with-claude/vision
+        assert estimate_image_tokens(1000, 750, provider="anthropic") == 1000
+
+    def test_anthropic_is_default_and_fallback_for_unknown_providers(self):
+        assert estimate_image_tokens(1000, 750) == 1000
+        assert estimate_image_tokens(1000, 750, provider="some-other-vendor") == 1000
+
+    def test_openai_low_detail_is_flat_85_regardless_of_size(self):
+        assert estimate_image_tokens(4000, 4000, provider="openai", detail="low") == 85
+        assert estimate_image_tokens(10, 10, provider="openai", detail="low") == 85
+
+    def test_openai_high_detail_small_image_one_tile(self):
+        # 512x512 needs no scaling (under 2048 fit, under 768 shortest-side) —
+        # exactly one 512x512 tile: 85 base + 170*1*1.
+        assert estimate_image_tokens(512, 512, provider="openai", detail="high") == 255
+
+    def test_openai_high_detail_scales_shortest_side_then_tiles(self):
+        # 1024x1024: already under the 2048 fit; shortest side 1024 > 768, so
+        # scaled to 768x768 -> ceil(768/512)=2 tiles per side -> 85 + 170*4.
+        assert estimate_image_tokens(1024, 1024, provider="openai", detail="high") == 765
+
+    def test_openai_high_detail_never_upscales_a_small_image(self):
+        # Already-small image (both scale steps are no-ops) stays a single tile.
+        assert estimate_image_tokens(100, 100, provider="openai", detail="high") == 255
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +148,20 @@ class TestMechanismSavingEvent:
         assert ev["measurement_kind"] == "measured"
         assert ev["file_path"] == "src/api.py"
         assert "timestamp" in ev
+
+    def test_modeled_cost_estimate_included_only_when_set(self):
+        with_cost = mechanism_saving_event(
+            "image_eviction",
+            applied=False,
+            tokens_saved_estimate=0,
+            measurement_kind="estimated",
+            raw_token_estimate=800,
+            modeled_cost_estimate=1000,
+        )
+        assert with_cost["modeled_cost_estimate"] == 1000
+
+        without_cost = mechanism_saving_event("hash_dedupe", applied=True, tokens_saved_estimate=42)
+        assert "modeled_cost_estimate" not in without_cost
 
 
 class TestAggregateMechanismSavings:
@@ -188,3 +242,19 @@ class TestAggregateMechanismSavings:
         result = aggregate_mechanism_savings(events)
         assert result is not None
         assert "unknown" in result
+
+    def test_modeled_cost_estimate_is_not_summed_into_the_rollup(self):
+        events = [
+            mechanism_saving_event(
+                "image_eviction",
+                applied=False,
+                tokens_saved_estimate=0,
+                measurement_kind="estimated",
+                raw_token_estimate=800,
+                modeled_cost_estimate=1000,
+            ),
+        ]
+        result = aggregate_mechanism_savings(events)
+        assert result is not None
+        assert "modeled_cost_estimate" not in result["image_eviction"]
+        assert result["image_eviction"]["tokens_saved_estimate"] == 0

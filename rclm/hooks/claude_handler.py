@@ -24,6 +24,8 @@ from rclm.hooks import (
     brevity,
     dedupe,
     dlp,
+    image_eviction,
+    image_lifecycle,
     read_cache,
     session_store,
     transcript,  # noqa: E402
@@ -345,6 +347,84 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     shadow = cfg.get("shadow_mode", False)
     hook_output: dict = {"hookEventName": "PostToolUse"}
     context_notes: list[str] = []
+
+    # Image-shaped results (Read of an image file, screenshot-tool MCP results)
+    # have no meaningful text form — DLP/read-cache/dedupe below all operate on
+    # `_response_text()`, which would otherwise stringify the raw base64
+    # payload for no benefit. Handle them separately and return early.
+    if cfg.get("image_lifecycle", False) and image_lifecycle.find_image(tool_response) is not None:
+        try:
+            image_result = image_lifecycle.maybe_downscale_image_result(
+                tool_response,
+                max_dim=int(cfg.get("image_max_dim", image_lifecycle.DEFAULT_MAX_DIM)),
+            )
+        except Exception:
+            logger.exception("image downscale failed; passing through tool result")
+            image_result = None
+
+        if image_result is not None:
+            session_store.append_event(
+                session_id,
+                mechanism_saving_event(
+                    image_lifecycle.MECHANISM,
+                    applied=not shadow,
+                    tokens_saved_estimate=image_result.tokens_saved_estimate,
+                    measurement_kind="measured",
+                    raw_token_estimate=image_result.raw_token_estimate,
+                    compressed_token_estimate=image_result.compressed_token_estimate,
+                ),
+            )
+            session_store.append_event(
+                session_id,
+                {
+                    "event_type": "ToolTransformation",
+                    "tool_use_id": payload.get("tool_use_id"),
+                    "was_compressed": True,
+                    "compression_strategy": image_lifecycle.MECHANISM,
+                    "raw_token_estimate": image_result.raw_token_estimate,
+                    "compressed_token_estimate": image_result.compressed_token_estimate,
+                    "tokens_saved_estimate": image_result.tokens_saved_estimate,
+                    "compression_ratio": image_result.compression_ratio,
+                    "measurement_kind": "measured",
+                    "applied": not shadow,
+                },
+            )
+            if not shadow:
+                hook_output["updatedToolOutput"] = image_result.new_tool_response
+
+        try:
+            eviction_state = session_store.read_image_eviction_state(session_id)
+            turn = sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
+            eviction_measurement, eviction_state = image_eviction.maybe_track_eviction(
+                tool_response,
+                eviction_state,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                turn=turn,
+            )
+            session_store.write_image_eviction_state(session_id, eviction_state)
+            if eviction_measurement is not None:
+                session_store.append_event(
+                    session_id,
+                    mechanism_saving_event(
+                        image_eviction.MECHANISM,
+                        # Task 2 never applies, unconditionally — not gated by
+                        # shadow_mode. It has no rewrite path at all in this
+                        # change; enforcement ships separately once the modeled
+                        # cost formula is validated against real cache telemetry.
+                        applied=False,
+                        tokens_saved_estimate=eviction_measurement["net_tokens"],
+                        measurement_kind="estimated",
+                        raw_token_estimate=eviction_measurement["would_save_tokens"],
+                        modeled_cost_estimate=eviction_measurement["modeled_cost_tokens"],
+                    ),
+                )
+        except Exception:
+            logger.exception("image eviction tracking failed; no-op")
+
+        if len(hook_output) > 1:
+            print(json.dumps({"hookSpecificOutput": hook_output}))
+        return
 
     # DLP runs first so every downstream mechanism (read-cache included) only
     # ever sees secret-free content — never the raw response.

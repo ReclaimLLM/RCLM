@@ -579,3 +579,169 @@ def test_codex_post_tool_use_range_cache_blocks_repeated_read(monkeypatch, tmp_p
     transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
     assert transformation["compression_strategy"] == "range_cache"
     assert transformation["measurement_kind"] == "measured"
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse — MCP image-lifecycle measurement (never a rewrite)
+# ---------------------------------------------------------------------------
+
+
+def _b64_noise_image(width: int, height: int) -> str:
+    import base64
+    import io
+    import os
+
+    import PIL.Image
+
+    img = PIL.Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _mcp_image_payload(
+    session_id, *, turn_id="turn-mcp-1", width=2000, height=2000, url="http://x"
+):
+    return {
+        "session_id": session_id,
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.4",
+        "permission_mode": "default",
+        "tool_name": "mcp__playwright__browser_take_screenshot",
+        "tool_input": {"url": url},
+        "tool_response": {
+            "content": [
+                {"type": "image", "data": _b64_noise_image(width, height), "mimeType": "image/png"}
+            ],
+            "isError": False,
+        },
+        "tool_use_id": f"call-{turn_id}",
+        "transcript_path": None,
+        "turn_id": turn_id,
+    }
+
+
+def test_codex_mcp_image_result_measures_but_never_rewrites(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(
+        "rclm._config.load", lambda: {"image_lifecycle": True, "image_max_dim": 100}
+    )
+
+    payload = _mcp_image_payload("sid-codex-img")
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    # Critical regression guard: Codex must never attempt the rewrite —
+    # updatedMCPToolOutput is confirmed broken on Codex CLI, and "decision:
+    # block" (the Bash text-replacement mechanism) must not fire either.
+    assert capsys.readouterr().out == ""
+
+    events = session_store.read_events("sid-codex-img")
+    saving = next(
+        e
+        for e in events
+        if e.get("event_type") == "MechanismSaving" and e.get("mechanism") == "image_downscale"
+    )
+    assert saving["applied"] is False
+    assert saving["measurement_kind"] == "measured"
+    assert saving["tokens_saved_estimate"] > 0
+
+
+def test_codex_mcp_image_eviction_measured_unapplied_on_supersession(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(
+        "rclm._config.load", lambda: {"image_lifecycle": True, "image_max_dim": 100}
+    )
+
+    _run_handler(
+        "PostToolUse",
+        _mcp_image_payload("sid-codex-evict", turn_id="turn-1", width=800, height=600),
+        monkeypatch,
+    )
+    capsys.readouterr()
+    _run_handler(
+        "PostToolUse",
+        _mcp_image_payload("sid-codex-evict", turn_id="turn-2", width=400, height=300),
+        monkeypatch,
+    )
+    assert capsys.readouterr().out == ""
+
+    events = session_store.read_events("sid-codex-evict")
+    eviction_savings = [
+        e
+        for e in events
+        if e.get("event_type") == "MechanismSaving" and e.get("mechanism") == "image_eviction"
+    ]
+    assert len(eviction_savings) == 1
+    assert eviction_savings[0]["applied"] is False
+    assert eviction_savings[0]["measurement_kind"] == "estimated"
+
+
+def test_codex_bash_pipeline_unaffected_by_mcp_branch(monkeypatch, tmp_path, capsys):
+    """Regression guard: adding the MCP branch must not disturb the existing
+    Bash-shaped pipeline (DLP/read-cache/dedupe), including for the
+    "exec_command" tool-name spelling used elsewhere in this file — only the
+    unambiguous "mcp__" prefix should ever divert away from it."""
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"dedupe": True}})
+
+    text = "result line\n" * 100
+    payload = {
+        "session_id": "sid-codex-examec",
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.4",
+        "permission_mode": "default",
+        "tool_name": "exec_command",
+        "tool_input": {"command": "cat build.log"},
+        "tool_response": text,
+        "tool_use_id": "call-1",
+        "transcript_path": None,
+        "turn_id": "turn-1",
+    }
+    _run_handler("PostToolUse", payload, monkeypatch)
+    assert capsys.readouterr().out == ""
+    _run_handler("PostToolUse", dict(payload, tool_use_id="call-2", turn_id="turn-2"), monkeypatch)
+
+    output = capsys.readouterr().out.strip()
+    parsed = json.loads(output)
+    assert parsed["decision"] == "block"
+    assert "Identical to the result of `Bash`" in parsed["reason"]
+
+
+def test_codex_build_tool_calls_preserves_real_tool_name(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+    from rclm.hooks.codex_handler import _build_tool_calls
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+
+    events = [
+        {"event_type": "PreToolUse", "turn_id": "t1", "tool_input": {"url": "http://x"}},
+        {
+            "event_type": "PostToolUse",
+            "turn_id": "t1",
+            "tool_name": "mcp__playwright__browser_take_screenshot",
+            "tool_response": {"content": []},
+        },
+        {"event_type": "PreToolUse", "turn_id": "t2", "tool_input": {"command": "ls"}},
+        {
+            "event_type": "PostToolUse",
+            "turn_id": "t2",
+            "tool_name": "Bash",
+            "tool_response": "file.py",
+        },
+        # No tool_name at all -> pre-change session data, defaults to "Bash".
+        {"event_type": "PreToolUse", "turn_id": "t3", "tool_input": {"command": "pwd"}},
+        {"event_type": "PostToolUse", "turn_id": "t3", "tool_response": "/repo"},
+    ]
+    tool_calls = _build_tool_calls(events)
+    by_turn = {tc.tool_use_id: tc.tool_name for tc in tool_calls}
+    assert by_turn["codex-turn-t1"] == "mcp__playwright__browser_take_screenshot"
+    assert by_turn["codex-turn-t2"] == "Bash"
+    assert by_turn["codex-turn-t3"] == "Bash"

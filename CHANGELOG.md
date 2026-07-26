@@ -3,6 +3,28 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.22] — 2026-07-26
+
+### Added
+- Added shared, provider-agnostic image detection and downscale-at-capture for oversized tool-result images — native file reads, MCP `ImageContent` blocks, and MCP `CallToolResult` wrappers with `structuredContent` mirrors — gated behind `--image-lifecycle`/`--image-max-dim`, off by default (`rclm/hooks/image_lifecycle.py`, `rclm/hooks/installer.py`)
+- Added `estimate_image_tokens()` using published Anthropic and OpenAI per-provider image-token formulas, isolated from the existing `estimate_tokens()` relied on by other mechanisms (`rclm/hooks/_analytics.py`)
+- Added session-scoped, LRU-capped stale-image eviction tracking keyed by (tool, page/URL, viewport), reporting shadow-only estimated savings via a modeled prompt-cache-write cost — never applied, regardless of `shadow_mode` (`rclm/hooks/image_eviction.py`, `rclm/hooks/session_store.py`)
+- Added the `image_downscale` (measured) and `image_eviction` (estimated) mechanisms to the `PostToolUse` pipeline, with a real output rewrite on Claude and measurement-only reporting on Codex, whose own MCP output-rewrite contract does not apply the change (`rclm/hooks/claude_handler.py`, `rclm/hooks/codex_handler.py`)
+- Added tests covering image detection/downscale across all supported wire shapes, eviction-tracking supersession logic, Claude/Codex measurement paths, and the measured-vs-estimated mechanism classification (`rclm/tests/hooks/test_image_lifecycle.py`, `rclm/tests/hooks/test_image_eviction.py`, `rclm/tests/hooks/test_handler.py`, `rclm/tests/hooks/test_codex_handler.py`, `rclm/tests/hooks/test_analytics.py`)
+
+### Changed
+- Widened Codex's `PreToolUse`/`PostToolUse` hook matcher from `Bash`-only to unrestricted, and switched Codex's tool routing from an `!= "Bash"` check to matching the unambiguous `mcp__<server>__<tool>` prefix, so shell tool-name variants (e.g. `exec_command`) can't be misrouted away from the existing DLP/read-cache/dedupe pipeline (`rclm/hooks/installer.py`, `rclm/hooks/codex_handler.py`)
+- Changed Codex's `_build_tool_calls()` to preserve the real recorded `tool_name` instead of hardcoding `"Bash"` for every tool call (`rclm/hooks/codex_handler.py`)
+- Reformatted the default brevity instruction into a structured `## Skip` / `## Keep` markdown list and changed whitespace collapsing to preserve newlines instead of flattening the instruction to one line (`rclm/hooks/brevity.py`)
+
+### Performance
+- Bounded worst-case image-decode latency with a header-only pixel-count check before raster decode, instead of a wall-clock timer (`rclm/hooks/image_lifecycle.py`)
+
+### Deps
+- Added Pillow as an optional `images` extra (`rclm[images]`) and to the `dev` extras, rather than a hard dependency, since most installs never enable `--image-lifecycle` (`pyproject.toml`)
+
+---
+
 ## [v0.1.21] — 2026-07-24
 
 ### Added

@@ -7,8 +7,14 @@ This process always exits 0.
 Event mapping from Codex CLI → ReclaimLLM:
   SessionStart     → record cwd + started_at + model
   UserPromptSubmit → record user prompt
-  PreToolUse       → record tool invocation (Bash only)
-  PostToolUse      → record tool result (Bash only)
+  PreToolUse       → record tool invocation (Bash; also MCP tool calls when
+                     --image-lifecycle is enabled, since the hook matcher is
+                     unrestricted — see _CODEX_HOOKS_TO_INJECT in installer.py)
+  PostToolUse      → record tool result (same scope as PreToolUse). Non-Bash
+                     tool calls only ever get image-lifecycle measurement
+                     (never a rewrite: Codex's updatedMCPToolOutput field is
+                     parsed but not applied by Codex CLI — confirmed by direct
+                     reproduction, not just this comment).
   Stop             → assemble HookSessionRecord from accumulated events + upload
 
 Codex stdin schema (all events):
@@ -49,7 +55,15 @@ from datetime import datetime, timezone
 from rclm import _config
 from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import codex_transcript, dedupe, dlp, read_cache, session_store
+from rclm.hooks import (
+    codex_transcript,
+    dedupe,
+    dlp,
+    image_eviction,
+    image_lifecycle,
+    read_cache,
+    session_store,
+)
 from rclm.hooks._analytics import (
     aggregate_mechanism_savings,
     estimate_tokens,
@@ -100,13 +114,17 @@ def _handle_user_prompt_submit(session_id: str, payload: dict) -> None:
 
 
 def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
-    # Codex nests the bash command inside tool_input: {"command": "..."}
+    # Codex nests the bash command inside tool_input: {"command": "..."}. For
+    # non-Bash (MCP) tool calls, tool_input carries whatever args that tool
+    # takes (e.g. url/viewport for a screenshot tool) — captured here so
+    # _handle_post_tool_use can look it up by turn_id for eviction keying.
+    tool_name = payload.get("tool_name") or "Bash"
     tool_input = payload.get("tool_input", {})
     session_store.append_event(
         session_id,
         {
             "event_type": "PreToolUse",
-            "tool_name": "Bash",
+            "tool_name": tool_name,
             "tool_input": tool_input,
             "turn_id": payload.get("turn_id"),
             "timestamp": _now(),
@@ -115,6 +133,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
 
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
+    tool_name = payload.get("tool_name") or "Bash"
     tool_response = payload.get("tool_response")
     prior_events = session_store.read_events(session_id)
 
@@ -122,7 +141,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         session_id,
         {
             "event_type": "PostToolUse",
-            "tool_name": "Bash",
+            "tool_name": tool_name,
             "tool_response": tool_response,
             "turn_id": payload.get("turn_id"),
             "timestamp": _now(),
@@ -141,6 +160,71 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         None,
     )
     tool_input = pre_event.get("tool_input", {}) if pre_event else {}
+
+    # MCP tool calls carry the unambiguous "mcp__<server>__<tool>" naming
+    # convention (confirmed empirically). Everything else — "Bash",
+    # "exec_command", or any other shell-tool spelling Codex may use across
+    # versions/platforms — stays on the unchanged pipeline below, which
+    # assumes tool_input.command/.cmd and a text result. Matching only the
+    # unambiguous MCP prefix (rather than an exhaustive "!= Bash" check) means
+    # this branch can never accidentally divert a real shell call.
+    if tool_name.startswith("mcp__"):
+        # MCP tool results: measurement-only, never a rewrite. Codex's
+        # updatedMCPToolOutput field is parsed but not applied by Codex CLI
+        # (confirmed by direct reproduction, not just this comment — the hook
+        # run is marked failed and the original output passes through
+        # unchanged).
+        if cfg.get("image_lifecycle", False):
+            try:
+                if image_lifecycle.find_image(tool_response) is not None:
+                    image_result = image_lifecycle.maybe_downscale_image_result(
+                        tool_response,
+                        max_dim=int(cfg.get("image_max_dim", image_lifecycle.DEFAULT_MAX_DIM)),
+                    )
+                    if image_result is not None:
+                        session_store.append_event(
+                            session_id,
+                            mechanism_saving_event(
+                                image_lifecycle.MECHANISM,
+                                # Codex can never apply this — a platform
+                                # limitation (broken updatedMCPToolOutput), not
+                                # a shadow_mode choice.
+                                applied=False,
+                                tokens_saved_estimate=image_result.tokens_saved_estimate,
+                                measurement_kind="measured",
+                                raw_token_estimate=image_result.raw_token_estimate,
+                                compressed_token_estimate=image_result.compressed_token_estimate,
+                            ),
+                        )
+
+                    turn = (
+                        sum(1 for ev in prior_events if ev.get("event_type") == "PostToolUse") + 1
+                    )
+                    eviction_state = session_store.read_image_eviction_state(session_id)
+                    eviction_measurement, eviction_state = image_eviction.maybe_track_eviction(
+                        tool_response,
+                        eviction_state,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        turn=turn,
+                    )
+                    session_store.write_image_eviction_state(session_id, eviction_state)
+                    if eviction_measurement is not None:
+                        session_store.append_event(
+                            session_id,
+                            mechanism_saving_event(
+                                image_eviction.MECHANISM,
+                                applied=False,
+                                tokens_saved_estimate=eviction_measurement["net_tokens"],
+                                measurement_kind="estimated",
+                                raw_token_estimate=eviction_measurement["would_save_tokens"],
+                                modeled_cost_estimate=eviction_measurement["modeled_cost_tokens"],
+                            ),
+                        )
+            except Exception:
+                logger.exception("codex image lifecycle measurement failed; no-op")
+        return
+
     cwd = _resolve_cwd(session_id, payload)
     # DLP runs first so dedupe only ever hashes secret-free content.
     effective_text = tool_response if isinstance(tool_response, str) else str(tool_response or "")
@@ -276,9 +360,17 @@ def _build_messages(events: list[dict], last_assistant_message: str) -> list[dic
 def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
     """Pair PreToolUse + PostToolUse events by turn_id to build ToolCall list.
 
-    Codex fires PreToolUse then PostToolUse for each Bash invocation. They
+    Codex fires PreToolUse then PostToolUse for each tool invocation (Bash, or
+    an MCP tool call when --image-lifecycle widens the hook matcher). They
     share the same turn_id. Unmatched PreToolUse events (no PostToolUse) are
     still recorded with tool_result=None.
+
+    tool_name is read from the PostToolUse event, not the paired PreToolUse
+    event: PostToolUse is guaranteed to carry it going forward, while
+    PreToolUse pairing can legitimately fail (session killed mid-tool).
+    Sessions captured before this change have no tool_name field on either
+    event, hence the "Bash" fallback — every event recorded back when this
+    pipeline was hardcoded Bash-only really was a Bash call.
     """
     pre_events: dict[str | None, dict] = {}  # turn_id → event
     tool_calls: list[ToolCall] = []
@@ -298,7 +390,7 @@ def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
             tool_calls.append(
                 ToolCall(
                     tool_use_id=f"codex-turn-{turn_id}",
-                    tool_name="Bash",
+                    tool_name=ev.get("tool_name") or "Bash",
                     tool_input=tool_input,
                     tool_result=ev.get("tool_response"),
                     timestamp=timestamp,
@@ -311,7 +403,7 @@ def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
         tool_calls.append(
             ToolCall(
                 tool_use_id=f"codex-tool-{counter}",
-                tool_name="Bash",
+                tool_name=pre.get("tool_name") or "Bash",
                 tool_input=pre.get("tool_input", {}),
                 tool_result=None,
                 timestamp=pre.get("timestamp", ""),

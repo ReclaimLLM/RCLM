@@ -21,9 +21,9 @@ Usage:
     rclm-hooks-install --brevity                   # inject brevity instruction at session start (Claude only)
 
 --with-mcp, --read-cache, --loop-breaker, --compress, --statusline, and --handoff-advisor are on by default;
-pass the --no-<flag> form to opt out. --dlp, --context-pack, --shadow-mode, and --brevity are off by
-default; pass the flag to opt in. Credentials and preferences are stored in
-~/.reclaimllm/config.json and reused on subsequent runs.
+pass the --no-<flag> form to opt out. --dlp, --context-pack, --shadow-mode, --brevity, and
+--image-lifecycle are off by default; pass the flag to opt in. Credentials and preferences are
+stored in ~/.reclaimllm/config.json and reused on subsequent runs.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from pathlib import Path
 
 from rclm import _config, auth
 from rclm.auth import DEFAULT_BACKEND_SERVER_URL, DEFAULT_FRONTEND_URL
+from rclm.hooks import image_lifecycle
 from rclm.hooks.handoff_advisor import (
     DEFAULT_TOKEN_THRESHOLD,
     DEFAULT_TOOL_CALL_THRESHOLD,
@@ -120,13 +121,21 @@ _CODEX_HOOKS_TO_INJECT: dict[str, list[dict]] = {
     ],
     "PreToolUse": [
         {
-            "matcher": "Bash",
+            # Was "Bash" — widened so tool_input (URL/viewport args) is captured
+            # for non-Bash (MCP) tool calls too, e.g. for --image-lifecycle
+            # measurement. Matches Gemini's own AfterTool empty-matcher
+            # convention above. Confirmed empirically that Codex CLI fires this
+            # hook for MCP tool calls once unrestricted.
+            "matcher": "",
             "hooks": [{"type": "command", "command": "rclm-codex-hooks PreToolUse"}],
         }
     ],
     "PostToolUse": [
         {
-            "matcher": "Bash",
+            # Was "Bash" — same reasoning as PreToolUse above. codex_handler.py's
+            # _handle_post_tool_use branches on the real tool_name and leaves the
+            # Bash-shaped pipeline (DLP/read-cache/dedupe) untouched.
+            "matcher": "",
             "hooks": [{"type": "command", "command": "rclm-codex-hooks PostToolUse"}],
         }
     ],
@@ -328,6 +337,23 @@ Subsequent installs without --api-key reuse the saved config.""",
         help=(
             "Claude handoff advisor suggesting the ReclaimLLM `handoff` MCP tool once a "
             "session has grown large. On by default; pass --no-handoff-advisor to disable"
+        ),
+    )
+    parser.add_argument(
+        "--image-lifecycle",
+        action="store_true",
+        help=(
+            "Downscale oversized images (screenshots, view_image results) before they enter "
+            "the transcript. Off by default; pass --image-lifecycle to enable"
+        ),
+    )
+    parser.add_argument(
+        "--image-max-dim",
+        type=int,
+        default=None,
+        help=(
+            f"Max image dimension in pixels when --image-lifecycle is enabled "
+            f"(default {image_lifecycle.DEFAULT_MAX_DIM}). Images are never upscaled"
         ),
     )
     parser.add_argument(
@@ -731,6 +757,12 @@ def main() -> None:
         DEFAULT_TOOL_CALL_THRESHOLD,
     )
     shadow_mode_enabled = args.shadow_mode or saved.get("shadow_mode", False)
+    image_lifecycle_enabled = args.image_lifecycle or saved.get("image_lifecycle", False)
+    image_max_dim = (
+        args.image_max_dim
+        if args.image_max_dim is not None
+        else saved.get("image_max_dim", image_lifecycle.DEFAULT_MAX_DIM)
+    )
     dedupe_enabled = args.dedupe if args.dedupe is not None else saved_compression["dedupe"]
     redaction_config = _redaction_config_with_folder_filters(
         saved,
@@ -753,6 +785,8 @@ def main() -> None:
         TOKEN_THRESHOLD_KEY: handoff_advisor_token_threshold,
         TOOL_CALL_THRESHOLD_KEY: handoff_advisor_tool_call_threshold,
         "shadow_mode": shadow_mode_enabled,
+        "image_lifecycle": image_lifecycle_enabled,
+        "image_max_dim": image_max_dim,
     }
     if redaction_config is not None:
         config_extra["redaction"] = redaction_config

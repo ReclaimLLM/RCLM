@@ -50,7 +50,10 @@ CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA = {
             "properties": {
                 "hookEventName": {"const": "PostToolUse"},
                 "additionalContext": {"type": "string"},
-                "updatedToolOutput": {"type": "string"},
+                # Confirmed empirically that Claude Code (2.1.205) honors an
+                # object here for image results (unlike a plain string, which
+                # is ignored for native Read) — see image_lifecycle.py.
+                "updatedToolOutput": {"type": ["string", "object"]},
             },
         },
     },
@@ -1525,3 +1528,179 @@ def test_unknown_event_exits_0(monkeypatch):
     with pytest.raises(SystemExit) as exc_info:
         handler.main()
     assert exc_info.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse — image lifecycle (Task 1 downscale + Task 2 eviction)
+# ---------------------------------------------------------------------------
+
+
+def _b64_test_image(width: int, height: int) -> str:
+    import base64
+    import io
+    import os
+
+    import PIL.Image
+
+    # Random noise, not a solid color: PNG compresses a flat color down to a
+    # few hundred bytes regardless of dimensions, which would trip the
+    # min_size_bytes gate before ever reaching the resize logic.
+    img = PIL.Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _image_payload(session_id, *, width=2000, height=2000, tool_use_id="tool-img"):
+    return {
+        "session_id": session_id,
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/tmp/screenshot.png"},
+        "tool_response": {
+            "type": "image",
+            "file": {
+                "base64": _b64_test_image(width, height),
+                "type": "image/png",
+                "originalSize": 1,
+                "dimensions": {
+                    "originalWidth": width,
+                    "originalHeight": height,
+                    "displayWidth": width,
+                    "displayHeight": height,
+                },
+            },
+        },
+        "tool_use_id": tool_use_id,
+        "cwd": "/tmp",
+        "timestamp": "2024-01-01T00:00:00Z",
+    }
+
+
+def test_image_lifecycle_off_by_default_falls_through_to_normal_pipeline(
+    monkeypatch, tmp_path, capsys
+):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+
+    payload = _image_payload("sid-img-off")
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    events = session_store.read_events("sid-img-off")
+    assert not any(e.get("event_type") == "MechanismSaving" for e in events)
+    # Falls through to the normal (DLP/read-cache/dedupe) pipeline, which
+    # produces no output here since none of those flags are on either.
+    assert capsys.readouterr().out == ""
+
+
+def test_image_downscale_emits_measured_saving_and_rewrites_output(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"image_lifecycle": True, "image_max_dim": 100}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = _image_payload("sid-img-1")
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    new_tool_output = output["hookSpecificOutput"]["updatedToolOutput"]
+    assert new_tool_output["file"]["dimensions"]["displayWidth"] == 100
+
+    events = session_store.read_events("sid-img-1")
+    saving = next(e for e in events if e.get("event_type") == "MechanismSaving")
+    assert saving["mechanism"] == "image_downscale"
+    assert saving["applied"] is True
+    assert saving["measurement_kind"] == "measured"
+    transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
+    assert transformation["compression_strategy"] == "image_downscale"
+    assert transformation["applied"] is True
+
+
+def test_image_downscale_shadow_mode_measures_but_does_not_rewrite(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"image_lifecycle": True, "image_max_dim": 100, "shadow_mode": True})
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    payload = _image_payload("sid-img-shadow")
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    assert capsys.readouterr().out == ""
+    events = session_store.read_events("sid-img-shadow")
+    saving = next(e for e in events if e.get("event_type") == "MechanismSaving")
+    assert saving["mechanism"] == "image_downscale"
+    assert saving["applied"] is False
+    assert saving["tokens_saved_estimate"] > 0
+
+
+def test_image_eviction_measurement_always_unapplied_even_without_shadow_mode(
+    monkeypatch, tmp_path, capsys
+):
+    """Task 2 must never apply, unconditionally — not gated by shadow_mode.
+
+    This is the constraint most likely to regress silently: a future refactor
+    that merges the Task 1/Task 2 branches could accidentally apply `not
+    shadow` to both. shadow_mode is deliberately OFF here (image_downscale
+    above IS applied under these same settings) to prove image_eviction's
+    applied=False is independent of that flag.
+    """
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"image_lifecycle": True, "image_max_dim": 100}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    # Same file_path (eviction key) across two calls -> second call supersedes the first.
+    _run_handler("PostToolUse", _image_payload("sid-evict", width=800, height=600), monkeypatch)
+    capsys.readouterr()
+    _run_handler("PostToolUse", _image_payload("sid-evict", width=400, height=300), monkeypatch)
+    capsys.readouterr()
+
+    events = session_store.read_events("sid-evict")
+    eviction_savings = [
+        e
+        for e in events
+        if e.get("event_type") == "MechanismSaving" and e.get("mechanism") == "image_eviction"
+    ]
+    assert len(eviction_savings) == 1
+    assert eviction_savings[0]["applied"] is False
+    assert eviction_savings[0]["measurement_kind"] == "estimated"
+    assert "modeled_cost_estimate" in eviction_savings[0]
+
+
+def test_image_branch_skips_dlp_and_dedupe(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "image_lifecycle": True,
+                "image_max_dim": 100,
+                "dlp": True,
+                "compression": {"enabled": True, "dedupe": True},
+            }
+        )
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    _run_handler("PostToolUse", _image_payload("sid-img-nodlp"), monkeypatch)
+    capsys.readouterr()
+
+    # Dedupe state should never have been touched for an image-shaped result.
+    assert session_store.read_dedupe_state("sid-img-nodlp") == {}

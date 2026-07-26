@@ -56,6 +56,7 @@ def test_cleanup_events_preserves_session_sidecars():
     session_store.write_dedupe_state("sess-4", {"hash": {}})
     session_store.write_read_cache_state("sess-4", {"files": {}})
     session_store.write_mechanism_savings_state("sess-4", {"range_cache": {}})
+    session_store.write_image_eviction_state("sess-4", {"key": {}})
     path = session_store._session_path("sess-4")
     assert path.exists()
     session_store.cleanup_events("sess-4")
@@ -63,6 +64,7 @@ def test_cleanup_events_preserves_session_sidecars():
     assert session_store._dedupe_path("sess-4").exists()
     assert session_store._read_cache_path("sess-4").exists()
     assert session_store._mechanism_savings_path("sess-4").exists()
+    assert session_store._image_eviction_path("sess-4").exists()
 
 
 def test_cleanup_removes_events_and_session_sidecars():
@@ -70,6 +72,7 @@ def test_cleanup_removes_events_and_session_sidecars():
     session_store.write_dedupe_state("sess-final", {"hash": {}})
     session_store.write_read_cache_state("sess-final", {"files": {}})
     session_store.write_mechanism_savings_state("sess-final", {"range_cache": {}})
+    session_store.write_image_eviction_state("sess-final", {"key": {}})
 
     session_store.cleanup("sess-final")
 
@@ -77,6 +80,7 @@ def test_cleanup_removes_events_and_session_sidecars():
     assert not session_store._dedupe_path("sess-final").exists()
     assert not session_store._read_cache_path("sess-final").exists()
     assert not session_store._mechanism_savings_path("sess-final").exists()
+    assert not session_store._image_eviction_path("sess-final").exists()
 
 
 def test_cleanup_noop_if_already_gone():
@@ -111,14 +115,32 @@ def test_hook_health_retains_only_newest_bounded_records(monkeypatch):
 def test_prune_stale_sidecars_removes_only_expired_state():
     session_store.write_dedupe_state("stale", {"hash": {}})
     session_store.write_mechanism_savings_state("stale", {"range_cache": {}})
+    session_store.write_image_eviction_state("stale", {"key": {}})
     session_store.write_read_cache_state("fresh", {"files": {}})
     stale = session_store._dedupe_path("stale")
     stale_mechanisms = session_store._mechanism_savings_path("stale")
+    stale_eviction = session_store._image_eviction_path("stale")
     os.utime(stale, (0, 0))
     os.utime(stale_mechanisms, (0, 0))
+    os.utime(stale_eviction, (0, 0))
 
     session_store.prune_stale_sidecars(max_age_s=5)
 
     assert not stale.exists()
     assert not stale_mechanisms.exists()
+    assert not stale_eviction.exists()
     assert session_store._read_cache_path("fresh").exists()
+
+
+def test_read_image_eviction_state_missing_or_corrupt_returns_empty():
+    assert session_store.read_image_eviction_state("no-such-session") == {}
+    path = session_store._image_eviction_path("corrupt")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("NOT_JSON")
+    assert session_store.read_image_eviction_state("corrupt") == {}
+
+
+def test_write_read_image_eviction_state_roundtrip():
+    state = {"tool::page::viewport": {"content_hash": "abc123", "token_estimate": 500, "turn": 3}}
+    session_store.write_image_eviction_state("sess-evict", state)
+    assert session_store.read_image_eviction_state("sess-evict") == state

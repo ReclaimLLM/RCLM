@@ -35,6 +35,10 @@ def _mechanism_savings_path(session_id: str) -> Path:
     return _SESSIONS_DIR / f"{session_id}.mechanisms.json"
 
 
+def _image_eviction_path(session_id: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.imageeviction.json"
+
+
 def _hook_health_dir() -> Path:
     """Return the persistent Claude hook-health directory.
 
@@ -108,6 +112,23 @@ def write_mechanism_savings_state(session_id: str, state: dict) -> None:
     os.replace(temporary, destination)
 
 
+def read_image_eviction_state(session_id: str) -> dict:
+    try:
+        data = json.loads(_image_eviction_path(session_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_image_eviction_state(session_id: str, state: dict) -> None:
+    """Atomically persist image-eviction LRU state for one session."""
+    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    destination = _image_eviction_path(session_id)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    os.replace(temporary, destination)
+
+
 def write_hook_health(session_id: str, record: dict) -> None:
     """Atomically persist one metadata-only hook-health record and bound history."""
     directory = _hook_health_dir()
@@ -142,7 +163,12 @@ def read_hook_health(session_id: str) -> dict:
 def prune_stale_sidecars(*, max_age_s: int = _ORPHANED_SIDECAR_MAX_AGE_S) -> None:
     """Remove session sidecars abandoned by sessions that never emitted SessionEnd."""
     cutoff = time.time() - max_age_s
-    for pattern in ("*.dedupe.json", "*.readcache.json", "*.mechanisms.json"):
+    for pattern in (
+        "*.dedupe.json",
+        "*.readcache.json",
+        "*.mechanisms.json",
+        "*.imageeviction.json",
+    ):
         for path in _SESSIONS_DIR.glob(pattern):
             try:
                 if path.stat().st_mtime < cutoff:
@@ -193,3 +219,5 @@ def cleanup(session_id: str) -> None:
         _read_cache_path(session_id).unlink()
     with contextlib.suppress(FileNotFoundError):
         _mechanism_savings_path(session_id).unlink()
+    with contextlib.suppress(FileNotFoundError):
+        _image_eviction_path(session_id).unlink()

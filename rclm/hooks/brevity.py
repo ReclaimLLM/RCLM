@@ -24,14 +24,20 @@ from rclm.hooks._analytics import estimate_tokens
 BREVITY_INSTRUCTION_KEY = "brevity_instruction"
 
 DEFAULT_INSTRUCTION = (
-    "[rclm] Be concise in your responses: skip preamble restating the request before "
-    "acting, don't summarize a change when the diff already shows it, don't offer "
-    "unrequested alternatives or caveats, and use minimal markdown (no headers or bullet "
-    "lists) on short answers. This does not apply to reasoning, error analysis, or "
-    "anything the user explicitly asked for — keep those as thorough as they need to be."
-    ' No pleasantries: Ban words like "Sure," "I can help," or "Hope this helps." '
-    'No meta-talk: Block phrases like "Let\'s break this down" or "First, I will think about..." '
-    "Direct output: Require the system to start immediately with the core facts or steps."
+    "[rclm] Be concise in your responses.\n"
+    "\n"
+    "## Skip\n"
+    "- Preamble that restates the request before acting\n"
+    "- Summarizing a change when the diff already shows it\n"
+    '- Unrequested alternatives, caveats, or "next steps" suggestions\n'
+    '- Pleasantries and filler: "Sure," "I can help," "Hope this helps"\n'
+    '- Meta-talk: "Let\'s break this down," "First, I will think about..."\n'
+    "- Markdown headers or bullet lists on short answers — plain prose is enough\n"
+    "\n"
+    "## Keep\n"
+    "- Reasoning and error analysis, as thorough as they need to be\n"
+    "- Anything the user explicitly asked for, in the depth they asked for\n"
+    "- Direct output: start with the core facts or steps, not a lead-in\n"
 )
 
 # Existing project instructions containing any of these are assumed to already cover
@@ -79,7 +85,10 @@ def instruction_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-_WHITESPACE_RE = re.compile(r"\s+")
+# Collapses runs of spaces/tabs only — newlines are preserved so DEFAULT_INSTRUCTION's
+# markdown (headers, bullet lists) survives injection instead of being flattened to one line.
+_WHITESPACE_RE = re.compile(r"[ \t]+")
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
 
 
 def build_session_start_context(cwd: str, cfg: dict) -> dict | None:
@@ -94,7 +103,8 @@ def build_session_start_context(cwd: str, cfg: dict) -> dict | None:
         return None
 
     text = cfg.get(BREVITY_INSTRUCTION_KEY) or DEFAULT_INSTRUCTION
-    text = _WHITESPACE_RE.sub(" ", text).strip()
+    text = _WHITESPACE_RE.sub(" ", text)
+    text = _BLANK_LINES_RE.sub("\n\n", text).strip()
     if not text:
         return None
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from datetime import datetime, timezone
 
 from rclm._models import FileDiff, ToolCall
@@ -24,6 +25,71 @@ def estimate_tokens(content: str | dict | list | None) -> int:
         return max(1, len(json.dumps(content)) // 4)
     except (TypeError, ValueError):
         return 0
+
+
+# Used only when an image's pixel dimensions can't be determined (e.g. a decode
+# failure upstream). Roughly a single 768x768 tile under the OpenAI high-detail
+# formula, and a mid-size photo under the Anthropic formula — a deliberately
+# rough middle ground, not a substitute for real dimensions.
+FALLBACK_IMAGE_TOKENS = 800
+
+
+def _scale_to_fit(width: int, height: int, max_side: int) -> tuple[int, int]:
+    """Scale down (never up) so neither dimension exceeds max_side."""
+    scale = min(1.0, max_side / max(width, height))
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _scale_shortest_side(width: int, height: int, target: int) -> tuple[int, int]:
+    """Scale down (never up) so the shortest side is target."""
+    shortest = min(width, height)
+    if shortest <= target:
+        return width, height
+    scale = target / shortest
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def estimate_image_tokens(
+    width: int | None,
+    height: int | None,
+    *,
+    provider: str = "anthropic",
+    detail: str = "high",
+) -> int:
+    """Estimate an image's token cost from its pixel dimensions.
+
+    This is a separate, isolated entry point from `estimate_tokens()` — it is
+    not wired into that function's dict/list branch, so existing mechanisms
+    (dedupe, loop-breaker, exec-compaction) that already depend on
+    `estimate_tokens()`'s behavior for non-image content are unaffected.
+
+    Formulas (both published, approximate by the vendors' own admission):
+    - Anthropic: tokens ~= (width * height) / 750.
+      https://docs.anthropic.com/en/docs/build-with-claude/vision
+    - OpenAI (gpt-4o/gpt-4-vision, "high" detail): image is scaled to fit
+      within 2048x2048, then scaled so its shortest side is 768px, then tiled
+      into 512x512 tiles at 170 tokens/tile plus an 85-token base. "low"
+      detail is a flat 85 tokens regardless of size.
+      https://platform.openai.com/docs/guides/vision
+
+    Falls back to `FALLBACK_IMAGE_TOKENS` when dimensions are unavailable —
+    callers should treat that case as unmeasured, not precise.
+    """
+    if not width or not height or width <= 0 or height <= 0:
+        return FALLBACK_IMAGE_TOKENS
+
+    if provider == "openai":
+        if detail == "low":
+            return 85
+        fit_w, fit_h = _scale_to_fit(width, height, 2048)
+        scaled_w, scaled_h = _scale_shortest_side(fit_w, fit_h, 768)
+        tiles_x = math.ceil(scaled_w / 512)
+        tiles_y = math.ceil(scaled_h / 512)
+        return 85 + 170 * tiles_x * tiles_y
+
+    # Anthropic default; also used as the fallback for unrecognized providers
+    # since it's the simpler, more conservative of the two published formulas.
+    return max(1, (width * height) // 750)
 
 
 def compute_session_analytics(
@@ -70,11 +136,17 @@ def mechanism_saving_event(
     file_path: str | None = None,
     raw_token_estimate: int | None = None,
     compressed_token_estimate: int | None = None,
+    modeled_cost_estimate: int | None = None,
 ) -> dict:
     """Build a MechanismSaving event dict, ready for session_store.append_event.
 
     `applied=False` marks a shadow-mode measurement: the mechanism detected an
     opportunity and estimated the savings, but did not rewrite anything.
+
+    `modeled_cost_estimate` is diagnostic-only (e.g. image_eviction's modeled
+    prompt-cache-write cost) — it rides along on the raw event but is not
+    summed by aggregate_mechanism_savings/merge_mechanism_savings, which only
+    ever roll up tokens_saved_estimate.
     """
     event = {
         "event_type": "MechanismSaving",
@@ -90,6 +162,8 @@ def mechanism_saving_event(
         event["raw_token_estimate"] = raw_token_estimate
     if compressed_token_estimate is not None:
         event["compressed_token_estimate"] = compressed_token_estimate
+    if modeled_cost_estimate is not None:
+        event["modeled_cost_estimate"] = modeled_cost_estimate
     return event
 
 

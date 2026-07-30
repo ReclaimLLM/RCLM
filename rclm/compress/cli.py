@@ -34,7 +34,7 @@ def main() -> None:
 
     original = stdout + stderr
     result = apply_filter(command, stdout, stderr, exit_code=exit_code)
-    shadow = _config.load().get("shadow_mode", False)
+    shadow = _config.effective_hook_policy().shadow_for("exec_compaction")
 
     with contextlib.suppress(Exception):
         track_savings(original, result.text, result.mechanism, applied=not shadow)

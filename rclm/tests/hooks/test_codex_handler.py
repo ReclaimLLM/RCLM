@@ -249,6 +249,73 @@ def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
     assert data.file_diffs[0].timestamp == "2026-04-07T12:52:34.670Z"
 
 
+def test_codex_transcript_parses_model_and_cumulative_usage_with_reset(tmp_path):
+    transcript_path = tmp_path / "usage.jsonl"
+    entries = [
+        {
+            "timestamp": "2026-04-29T09:11:18Z",
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.4"},
+        },
+        {
+            "timestamp": "2026-04-29T09:12:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 40,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 5,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-29T09:13:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 180,
+                        "cached_input_tokens": 80,
+                        "output_tokens": 30,
+                        "reasoning_output_tokens": 8,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-04-29T09:14:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 10,
+                        "cached_input_tokens": 2,
+                        "output_tokens": 4,
+                        "reasoning_output_tokens": 1,
+                    }
+                },
+            },
+        },
+    ]
+    transcript_path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert data.model == "gpt-5.4"
+    assert data.usage == codex_transcript.CodexUsage(
+        input_tokens=190,
+        cached_input_tokens=82,
+        output_tokens=34,
+        reasoning_output_tokens=9,
+    )
+
+
 def test_codex_stop_prefers_transcript_data(monkeypatch, tmp_path):
     from rclm.hooks import session_store
 

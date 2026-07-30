@@ -50,12 +50,16 @@ def main() -> None:
 
     if session_id:
         try:
+            policy = _config.effective_hook_policy()
+            if not policy.enabled("range_cache"):
+                print(output, end="")
+                sys.exit(result.returncode)
             request = read_cache.parse_shell_read(command, cwd=os.getcwd(), shell="posix")
             if request is not None:
                 state = session_store.read_read_cache_state(session_id)
                 events = session_store.read_events(session_id)
                 turn = sum(1 for event in events if event.get("event_type") == "PostToolUse") + 1
-                shadow = _config.load().get("shadow_mode", False)
+                shadow = policy.shadow_for("range_cache")
                 application = read_cache.apply_range_cache(
                     request,
                     output,

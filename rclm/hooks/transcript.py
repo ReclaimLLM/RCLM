@@ -30,6 +30,17 @@ class TranscriptData:
     usage_source: str | None = None  # "provider" when real per-message usage was found
 
 
+def _usage_int(usage: dict, key: str) -> int:
+    """Return a defensive non-negative provider usage value."""
+    value = usage.get(key, 0)
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_transcript(transcript_path: str | None) -> TranscriptData:
     """Parse a Claude Code JSONL transcript file.
 
@@ -87,10 +98,24 @@ def _extract(entries: list[dict]) -> TranscriptData:
         msg = entry.get("message", {})
         timestamp = entry.get("timestamp", "")
 
+        usage = entry.get("usage") or msg.get("usage") or {}
+
         if entry_type in ("user", "assistant"):
             role = msg.get("role", entry_type)
             content = msg.get("content")
-            data.messages.append({"role": role, "content": content, "timestamp": timestamp})
+            captured_message = {"role": role, "content": content, "timestamp": timestamp}
+            if entry_type == "assistant" and usage:
+                uncached_input = _usage_int(usage, "input_tokens")
+                cache_read = _usage_int(usage, "cache_read_input_tokens")
+                cache_creation = _usage_int(usage, "cache_creation_input_tokens")
+                captured_message["usage"] = {
+                    "input_tokens": uncached_input,
+                    "output_tokens": _usage_int(usage, "output_tokens"),
+                    "cache_read_tokens": cache_read,
+                    "cache_creation_tokens": cache_creation,
+                    "context_tokens": uncached_input + cache_read + cache_creation,
+                }
+            data.messages.append(captured_message)
 
         if entry_type == "assistant":
             # Extract model from first assistant entry.
@@ -102,13 +127,12 @@ def _extract(entries: list[dict]) -> TranscriptData:
 
             # Accumulate token usage.
             # Claude Code stores usage inside message{}, not at top level.
-            usage = entry.get("usage") or msg.get("usage") or {}
             if usage:
                 has_tokens = True
-                total_in += usage.get("input_tokens", 0)
-                total_out += usage.get("output_tokens", 0)
-                total_cache_read += usage.get("cache_read_input_tokens", 0)
-                total_cache_creation += usage.get("cache_creation_input_tokens", 0)
+                total_in += _usage_int(usage, "input_tokens")
+                total_out += _usage_int(usage, "output_tokens")
+                total_cache_read += _usage_int(usage, "cache_read_input_tokens")
+                total_cache_creation += _usage_int(usage, "cache_creation_input_tokens")
 
             # Extract tool_use blocks and pair with results.
             content = msg.get("content", [])

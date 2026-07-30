@@ -19,6 +19,7 @@ Gemini's tool names for file operations:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
 import logging
@@ -29,7 +30,7 @@ from datetime import datetime, timezone
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import dedupe, dlp, read_cache, session_store
+from rclm.hooks import bootstrap, dedupe, dlp, read_cache, session_store
 from rclm.hooks._analytics import (
     aggregate_mechanism_savings,
     estimate_tokens,
@@ -52,6 +53,17 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
             "cwd": payload.get("cwd", ""),
             "timestamp": payload.get("timestamp", _now()),
         },
+    )
+    with contextlib.suppress(Exception):
+        asyncio.run(
+            asyncio.wait_for(
+                bootstrap.fetch(payload.get("cwd", ""), include_context=False),
+                3.0,
+            )
+        )
+    session_store.append_event(
+        session_id,
+        {"event_type": "HookPolicySnapshot", "policy": bootstrap.policy_snapshot("gemini")},
     )
 
 
@@ -126,7 +138,8 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
     )
 
     cfg = _config.load()
-    shadow = cfg.get("shadow_mode", False)
+    policy = _config.effective_hook_policy(cfg, provider="gemini")
+    shadow = policy.legacy_shadow
     cwd = _resolve_cwd(session_id, payload)
     # DLP runs first so dedupe only ever hashes secret-free content.
     effective_text = tool_response
@@ -143,7 +156,7 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
         except Exception:
             pass  # Never let DLP disrupt Gemini CLI
 
-    if cfg.get("read_cache", False) and tool_name in {"write_file", "replace"}:
+    if policy.enabled("range_cache") and tool_name in {"write_file", "replace"}:
         try:
             state = session_store.read_read_cache_state(session_id)
             mapped_name = "Write" if tool_name == "write_file" else "Edit"
@@ -153,7 +166,8 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
             pass
 
     range_claimed = False
-    if cfg.get("read_cache", False) and tool_name in {"read_file", "run_shell_command"}:
+    if policy.enabled("range_cache") and tool_name in {"read_file", "run_shell_command"}:
+        shadow = policy.shadow_for("range_cache")
         try:
             if tool_name == "read_file":
                 request = read_cache.native_read_request(tool_input, cwd=cwd)
@@ -189,7 +203,8 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
             logger.exception("range cache failed; passing through tool result")
 
     compression = _config.compression_config(cfg)
-    if compression["dedupe"] and not range_claimed:
+    if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
+        shadow = policy.shadow_for("hash_dedupe")
         try:
             state = session_store.read_dedupe_state(session_id)
             turn = sum(1 for ev in prior_events if ev.get("event_type") == "AfterTool") + 1
@@ -452,6 +467,7 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
         total_input_tokens=transcript_data["total_input_tokens"],
         total_output_tokens=transcript_data["total_output_tokens"],
         mechanism_savings=aggregate_mechanism_savings(events),
+        hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "gemini"),
     )
 
     asyncio.run(upload_single(record))

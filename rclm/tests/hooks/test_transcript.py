@@ -178,6 +178,13 @@ def test_captures_cache_tokens_and_usage_source(tmp_path):
     assert data.cache_read_tokens == 4000
     assert data.cache_creation_tokens == 200
     assert data.usage_source == "provider"
+    assert data.messages[0]["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_tokens": 4000,
+        "cache_creation_tokens": 200,
+        "context_tokens": 4210,
+    }
 
 
 def test_accumulates_cache_tokens_across_entries(tmp_path):

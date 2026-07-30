@@ -20,9 +20,15 @@ def _run(monkeypatch, argv):
     return exc_info.value.code
 
 
+def _configure_read_cache(monkeypatch, tmp_path, *, shadow=False):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True, "shadow_mode": shadow}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+
 def test_first_read_prints_raw_output(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _configure_read_cache(monkeypatch, tmp_path)
     monkeypatch.setenv("CLAUDE_SESSION_ID", "sid-cli-1")
 
     target = tmp_path / "a.py"
@@ -39,7 +45,7 @@ def test_first_read_prints_raw_output(monkeypatch, tmp_path, capsys):
 
 def test_unchanged_reread_replaced_with_notice(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _configure_read_cache(monkeypatch, tmp_path)
     monkeypatch.setenv("CLAUDE_SESSION_ID", "sid-cli-2")
 
     target = tmp_path / "a.py"
@@ -64,9 +70,7 @@ def test_unchanged_reread_replaced_with_notice(monkeypatch, tmp_path, capsys):
 
 def test_shadow_mode_prints_raw_output_but_records_shadow_saving(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
-    config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({"shadow_mode": True}))
-    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    _configure_read_cache(monkeypatch, tmp_path, shadow=True)
     monkeypatch.setenv("CLAUDE_SESSION_ID", "sid-cli-shadow")
 
     target = tmp_path / "a.py"
@@ -92,7 +96,7 @@ def test_shadow_mode_prints_raw_output_but_records_shadow_saving(monkeypatch, tm
 
 def test_changed_reread_invalidates_and_returns_fresh_content(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _configure_read_cache(monkeypatch, tmp_path)
     monkeypatch.setenv("CLAUDE_SESSION_ID", "sid-cli-3")
 
     target = tmp_path / "a.py"
@@ -108,6 +112,26 @@ def test_changed_reread_invalidates_and_returns_fresh_content(monkeypatch, tmp_p
     assert code == 0
     out = capsys.readouterr().out
     assert out == changed
+
+
+def test_disabled_read_cache_prints_raw_output_without_events(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": False}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "sid-cli-disabled")
+
+    target = tmp_path / "a.py"
+    content = _content()
+    target.write_text(content)
+
+    _run(monkeypatch, ["cat", str(target)])
+    capsys.readouterr()
+    code = _run(monkeypatch, ["cat", str(target)])
+
+    assert code == 0
+    assert capsys.readouterr().out == content
+    assert session_store.read_events("sid-cli-disabled") == []
 
 
 def test_no_session_id_falls_through_to_raw_output(monkeypatch, tmp_path, capsys):

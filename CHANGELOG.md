@@ -3,6 +3,33 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.23] — 2026-07-29
+
+### Added
+- Added bounded `changed_files` metadata to MCP session-search results so agents can identify likely implementation files and explicitly follow their latest history with `search_by_filename` (`rclm/mcp_server.py`)
+- Added inclusive `date_from` and exclusive `date_to` ingestion-date filters to both `search_sessions` and `search_by_filename`, with shared `YYYY-MM-DD` validation and invalid-range handling (`rclm/mcp_server.py`)
+- Added focused MCP tests for changed-file result shaping, backend filter forwarding, valid date windows, malformed dates, and reversed or empty ranges (`rclm/tests/test_mcp_server.py`)
+
+- Added the `transfer_session` MCP tool for moving a complete captured session between Claude Code and Codex as a versioned local JSON artifact, preserving captured messages, tool calls/results, file diffs, and metadata without re-executing historical actions (`rclm/mcp_server.py`, `rclm/_session_transfer.py`)
+- Added the `signals` MCP tool plus best-effort Signal enrichment for `file_brief` and automatic acted-state reporting after successful handoffs, so agents can surface workflow-efficiency evidence and close the loop when a prescribed handoff is used (`rclm/mcp_server.py`)
+- Added tests for streamed transfer integrity, size limits, secure artifact lifecycle, MCP registration, Signal shaping and failure isolation, and handoff acted-state reporting (`rclm/tests/test_session_transfer.py`, `rclm/tests/test_mcp_server.py`)
+
+### Changed
+- Updated MCP routing instructions and the bundled ReclaimLLM memory skill to use semantic search first, then filename history for likely changed files, and to translate relative periods such as “last 3 weeks” into concrete ingestion-date bounds (`rclm/mcp_server.py`, `plugins/reclaimllm/skills/reclaimllm-memory/SKILL.md`)
+- Clarified that `convert-session` and `handoff` produce compact context documents while `transfer_session` loads the full captured record, and documented transfer limits, artifact expiry, image-lifecycle installation, and provider-specific rewrite behavior (`README.md`, `plugins/reclaimllm/skills/reclaimllm-memory/SKILL.md`)
+- Expanded MCP routing instructions to reserve full-session transfer and workflow Signals for explicit user requests (`rclm/mcp_server.py`, `plugins/reclaimllm/skills/reclaimllm-memory/SKILL.md`)
+
+### Security
+- Wrote transfer artifacts atomically with owner-only permissions, enforced configurable byte ceilings without silent truncation, verified backend byte counts and SHA-256 manifests, and added bounded expiry cleanup (`rclm/_session_transfer.py`, `rclm/mcp_server.py`)
+
+### Performance
+- Streamed full-session downloads in bounded chunks instead of buffering complete captures in memory (`rclm/mcp_server.py`, `rclm/_session_transfer.py`)
+
+### Deps
+- Updated the lockfile with Pillow 11.3.0 for the existing optional `images` and development extras (`uv.lock`)
+
+---
+
 ## [v0.1.22] — 2026-07-26
 
 ### Added

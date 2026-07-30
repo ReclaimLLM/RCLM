@@ -93,9 +93,13 @@ def test_session_start_appends_event(monkeypatch, tmp_path):
     _run_handler("SessionStart", payload, monkeypatch)
 
     events = session_store.read_events("gsid-1")
-    assert len(events) == 1
+    assert [event["event_type"] for event in events] == [
+        "SessionStart",
+        "HookPolicySnapshot",
+    ]
     assert events[0]["event_type"] == "SessionStart"
     assert events[0]["cwd"] == "/projects/gemini"
+    assert isinstance(events[1]["policy"], dict)
 
 
 # ---------------------------------------------------------------------------

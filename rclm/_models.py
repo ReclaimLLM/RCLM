@@ -98,4 +98,5 @@ class HookSessionRecord:
     mechanism_savings: dict | None = (
         None  # {mechanism: {"applied_count": N, "shadow_count": N, "tokens_saved_estimate": N}}
     )
+    hook_policy_snapshot: dict | None = None
     is_sync: bool = False  # True for historical sync uploads; server skips if session exists

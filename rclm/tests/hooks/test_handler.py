@@ -103,9 +103,10 @@ def test_session_start_appends_event(monkeypatch, tmp_path):
     _run_handler("SessionStart", payload, monkeypatch)
 
     events = session_store.read_events("sid-1")
-    assert len(events) == 1
+    assert len(events) == 2
     assert events[0]["event_type"] == "SessionStart"
     assert events[0]["cwd"] == "/projects/foo"
+    assert events[1]["event_type"] == "HookPolicySnapshot"
 
 
 # ---------------------------------------------------------------------------
@@ -140,15 +141,15 @@ def test_context_pack_injects_highlights_when_enabled(monkeypatch, tmp_path, cap
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
 
     async def fake_request(self, method, path, *, params=None):
-        assert path == "/api/sessions/search"
-        assert (params or {})["file_path"] == "/repo"
+        assert path == "/api/settings/bootstrap"
+        assert (params or {})["cwd"] == "/repo"
         return {
-            "sessions": [
+            "context_sessions": [
                 {"session_id": "s1", "title": "Fixed auth", "session_summary": "Fixed the bug."}
             ]
         }
 
-    monkeypatch.setattr(handler.ReclaimLLMClient, "_request", fake_request)
+    monkeypatch.setattr(handler.bootstrap.ReclaimLLMClient, "_request", fake_request)
 
     payload = {"session_id": "sid-cp2", "cwd": "/repo", "timestamp": "2024-01-01T00:00:00Z"}
     _run_handler("SessionStart", payload, monkeypatch)
@@ -170,9 +171,9 @@ def test_context_pack_no_sessions_found_prints_nothing(monkeypatch, tmp_path, ca
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
 
     async def fake_request(self, method, path, *, params=None):
-        return {"sessions": []}
+        return {"context_sessions": []}
 
-    monkeypatch.setattr(handler.ReclaimLLMClient, "_request", fake_request)
+    monkeypatch.setattr(handler.bootstrap.ReclaimLLMClient, "_request", fake_request)
 
     payload = {"session_id": "sid-cp3", "cwd": "/repo", "timestamp": "2024-01-01T00:00:00Z"}
     _run_handler("SessionStart", payload, monkeypatch)
@@ -419,12 +420,12 @@ def test_brevity_enabled_injects_and_merges_with_context_pack(monkeypatch, tmp_p
 
     async def fake_request(self, method, path, *, params=None):
         return {
-            "sessions": [
+            "context_sessions": [
                 {"session_id": "s1", "title": "Fixed auth", "session_summary": "Fixed the bug."}
             ]
         }
 
-    monkeypatch.setattr(handler.ReclaimLLMClient, "_request", fake_request)
+    monkeypatch.setattr(handler.bootstrap.ReclaimLLMClient, "_request", fake_request)
 
     payload = {"session_id": "sid-brv2", "cwd": str(tmp_path), "timestamp": "2024-01-01T00:00:00Z"}
     _run_handler("SessionStart", payload, monkeypatch)

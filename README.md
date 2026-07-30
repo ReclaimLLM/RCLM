@@ -7,6 +7,7 @@ Every time you use an AI coding assistant, you produce valuable reasoning and co
 - **Native Hooks:** Zero-config integration into Claude Code, Gemini CLI, Codex CLI, and OpenClaw.
 - **Historical Sync:** One-command backfill for all your past AI sessions.
 - **DLP & Privacy:** Automatic redaction of secrets from `.env` files before they reach the model.
+- **Context Compression:** Read caching, result dedup, exec-output compaction, and automatic image downscaling cut token usage without losing information — see [Context Compression & DLP](#context-compression--dlp).
 - **Context Conversion:** Export any captured session as a Markdown context document to continue work in a different tool.
 - **Local Proxy:** Experimental LiteLLM-based proxy for OpenAI-compatible tools.
 
@@ -37,7 +38,7 @@ rclm-sync
 
 ## Session Conversion (New!)
 
-`rclm convert-session` allows you to take a session captured in one tool (e.g., Claude Code) and instantly resume it in another (e.g., Gemini CLI) by generating a structured context document.
+`rclm convert-session` generates a compact context document for starting a new session in another tool. It does not restore the source tool's private runtime state.
 
 ```bash
 # Export a session for Claude Code
@@ -76,6 +77,10 @@ rclm-hooks-install --with-mcp
 
 Start a new agent thread and confirm the `reclaimllm` plugin and MCP server are enabled.
 
+When you need the complete captured session instead of a summary, ask the target agent to call `transfer_session` with the ReclaimLLM session ID. The tool streams a versioned JSON artifact containing every captured message, tool call/result, file diff, and metadata field into an owner-only temporary file. The target agent reads that file as historical context; recorded tool calls are never re-executed automatically.
+
+`SESSION_TRANSFER_MAX_BYTES` controls the backend and local download ceiling and defaults to 100 MiB. Transfers are never silently truncated. `SESSION_TRANSFER_TTL_SECONDS` controls when local artifacts become eligible for bounded opportunistic cleanup and defaults to one hour.
+
 ---
 
 ## CLI Reference
@@ -95,9 +100,13 @@ Start a new agent thread and confirm the `reclaimllm` plugin and MCP server are 
 ### Context Compression & DLP
 Enable advanced features during installation:
 ```bash
-rclm-hooks-install --compress  # Reduces token usage for Claude Code
-rclm-hooks-install --dlp       # Enables Data Loss Prevention for .env files
+rclm-hooks-install --compress                          # Reduces token usage for Claude Code
+rclm-hooks-install --dlp                                # Enables Data Loss Prevention for .env files
+rclm-hooks-install --image-lifecycle                    # Downscales oversized screenshots/images before they reach the model
+rclm-hooks-install --image-lifecycle --image-max-dim=1280  # Set the max image dimension in pixels (default 1280)
 ```
+
+Image downscaling (`--image-lifecycle`) resizes and re-encodes oversized tool-result images — full-page screenshots, MCP screenshot-tool output — before they enter the model's context, and never upscales. It applies for real on Claude Code sessions; on Codex it currently reports measured before/after savings only, since Codex CLI does not yet apply hook-driven rewrites of MCP tool output. Requires the optional `images` extra: `pip install 'rclm[images]'`.
 
 ### Folder Capture Filters
 Limit uploads to specific project folders during installation:

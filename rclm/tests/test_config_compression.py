@@ -33,3 +33,40 @@ def test_save_migrates_flat_compression_keys(tmp_path, monkeypatch):
     assert "compress" not in saved
     assert "dedupe" not in saved
     assert saved["compression"]["dedupe"] is False
+
+
+def test_org_force_enforcement_overrides_legacy_shadow_mode():
+    policy = _config.effective_hook_policy(
+        {
+            "shadow_mode": True,
+            "read_cache": True,
+            "compression": {"enabled": True, "dedupe": True, "test_filter": True},
+            "org_hook_policy": {
+                "force_compression_enforcement": True,
+                "policy_version": 4,
+                "compression_modes": {},
+            },
+        },
+        provider="claude",
+    )
+
+    assert policy.legacy_shadow is False
+    assert policy.policy_version == 4
+    assert policy.mechanisms["range_cache"]["mode"] == "enforce"
+    assert policy.mechanisms["hash_dedupe"]["mode"] == "enforce"
+
+
+def test_codex_unsupported_image_rewrite_stays_observe_only():
+    policy = _config.effective_hook_policy(
+        {
+            "image_lifecycle": True,
+            "org_hook_policy": {"force_compression_enforcement": True},
+        },
+        provider="codex",
+    )
+
+    assert policy.mechanisms["image_downscale"] == {
+        "enabled": True,
+        "mode": "observe",
+        "supported": False,
+    }

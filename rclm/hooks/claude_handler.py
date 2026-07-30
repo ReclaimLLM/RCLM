@@ -21,6 +21,7 @@ from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
 from rclm.hooks import (
+    bootstrap,
     brevity,
     dedupe,
     dlp,
@@ -41,7 +42,6 @@ from rclm.hooks.compress import maybe_compress
 from rclm.hooks.handoff_advisor import thresholds_from_config
 from rclm.hooks.loop_breaker import analyze as analyze_loop
 from rclm.hooks.updater import schedule_session_end_update
-from rclm.mcp_server import ReclaimLLMClient, ReclaimLLMError
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,6 @@ THRESHOLD_ZERO_DURATION = (
 )
 
 CONTEXT_PACK_TIMEOUT_S = 3.0  # SessionStart blocks Claude Code's startup; keep this tight.
-CONTEXT_PACK_LIMIT = 3
 
 # Handoff-advisor thresholds use transcript-estimated tokens. This undercounts
 # real billed tokens, but is a fine relative growth signal within one session.
@@ -72,41 +71,6 @@ def _resolve_cwd(session_id: str, payload: dict) -> str:
     return ""
 
 
-async def _build_context_pack(cwd: str) -> str | None:
-    """Recent ReclaimLLM sessions that touched this project, as SessionStart additionalContext.
-
-    Reuses the same search-by-filename backend call as the search_by_filename MCP tool, passing
-    cwd as the path — RCLM already indexes sessions by the file paths they touched, and cwd is a
-    reasonable proxy for "this project" without needing the server-side project_name resolution.
-    """
-    try:
-        client = ReclaimLLMClient()
-    except ReclaimLLMError:
-        return None  # no MCP credentials configured; skip silently, don't block startup
-
-    try:
-        result = await client.search_sessions(
-            None,
-            project_name=None,
-            file_path=cwd,
-            record_type="session",
-            limit=CONTEXT_PACK_LIMIT,
-        )
-    except ReclaimLLMError:
-        return None
-
-    sessions = result.get("sessions") or []
-    if not sessions:
-        return None
-
-    lines = ["[rclm] Recent sessions in this project (via ReclaimLLM):"]
-    for s in sessions:
-        title = s.get("title") or "Untitled session"
-        highlight = s.get("highlight") or ""
-        lines.append(f"- {title}" + (f" — {highlight}" if highlight else ""))
-    return "\n".join(lines)
-
-
 def _handle_session_start(session_id: str, payload: dict) -> None:
     # Optimization cleanup must never block Claude Code startup.
     with contextlib.suppress(OSError):
@@ -125,16 +89,29 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
     cwd = payload.get("cwd", "")
     cfg = _config.load()
     context_blocks: list[str] = []
-
-    if cfg.get("context_pack", False) and cwd:
-        try:
-            context = asyncio.run(
-                asyncio.wait_for(_build_context_pack(cwd), CONTEXT_PACK_TIMEOUT_S)
+    try:
+        bootstrap_data = asyncio.run(
+            asyncio.wait_for(
+                bootstrap.fetch(
+                    cwd,
+                    include_context=bool(cfg.get("context_pack", False) and cwd),
+                ),
+                CONTEXT_PACK_TIMEOUT_S,
             )
-        except Exception:
-            context = None  # Never let a slow/failed backend call disrupt Claude Code startup.
+        )
+    except Exception:
+        bootstrap_data = {}
+    session_store.append_event(
+        session_id,
+        {"event_type": "HookPolicySnapshot", "policy": bootstrap.policy_snapshot("claude")},
+    )
+    if cfg.get("context_pack", False):
+        context = bootstrap.context_text(bootstrap_data)
         if context:
             context_blocks.append(context)
+    nudge = bootstrap.signal_nudge_text(bootstrap_data, cfg)
+    if nudge:
+        context_blocks.append(nudge)
 
     try:
         brevity_result = brevity.build_session_start_context(cwd, cfg)
@@ -183,7 +160,10 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     )
 
     cfg = _config.load()
-    shadow = cfg.get("shadow_mode", False)
+    policy = _config.effective_hook_policy(cfg, provider="claude")
+    # Loop-breaker is not a compression mechanism; org compression policy
+    # must not silently change its legacy shadow behavior.
+    shadow = bool(cfg.get("shadow_mode", False))
     # Accumulate delta updates from DLP and compress.  DLP runs first (security
     # takes priority over optimisation, and is never shadow-suppressed); compress
     # sees the DLP-adjusted input.
@@ -206,7 +186,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
             pass  # Never let DLP disrupt Claude Code
 
     read_offset: int | None = None
-    if cfg.get("read_cache", False):
+    if policy.enabled("range_cache"):
         try:
             read_state = session_store.read_read_cache_state(session_id)
             if tool_name in {"Write", "Edit", "NotebookEdit"}:
@@ -214,7 +194,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
                     read_state, tool_name, effective_input, cwd=cwd
                 )
                 session_store.write_read_cache_state(session_id, read_state)
-            elif tool_name == "Read" and not shadow:
+            elif tool_name == "Read" and not policy.shadow_for("range_cache"):
                 read_offset, read_state = read_cache.next_unseen_offset(
                     effective_input, read_state, cwd=cwd
                 )
@@ -258,7 +238,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             pass  # Never let read-cache state handling disrupt Claude Code
 
-    if _config.compression_config(cfg)["enabled"]:
+    if policy.enabled("exec_compaction"):
         try:
             # Bash rewrites always apply — they route through rclm-compress, which
             # measures and makes its own shadow/enforce output decision. Native
@@ -266,7 +246,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
             compress_delta = maybe_compress(
                 tool_name,
                 effective_input,
-                shadow=shadow,
+                shadow=policy.shadow_for("exec_compaction"),
                 read_offset=read_offset,
             )
             if compress_delta:
@@ -344,7 +324,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     )
 
     cfg = _config.load()
-    shadow = cfg.get("shadow_mode", False)
+    policy = _config.effective_hook_policy(cfg, provider="claude")
+    shadow = policy.legacy_shadow
     hook_output: dict = {"hookEventName": "PostToolUse"}
     context_notes: list[str] = []
 
@@ -352,7 +333,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     # have no meaningful text form — DLP/read-cache/dedupe below all operate on
     # `_response_text()`, which would otherwise stringify the raw base64
     # payload for no benefit. Handle them separately and return early.
-    if cfg.get("image_lifecycle", False) and image_lifecycle.find_image(tool_response) is not None:
+    if policy.enabled("image_downscale") and image_lifecycle.find_image(tool_response) is not None:
+        shadow = policy.shadow_for("image_downscale")
         try:
             image_result = image_lifecycle.maybe_downscale_image_result(
                 tool_response,
@@ -447,7 +429,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         event.get("event_type") == "ReadCacheWrapped" and event.get("tool_use_id") == tool_use_id
         for event in prior_events
     )
-    if cfg.get("read_cache", False) and tool_name in {"Read", "Bash"}:
+    if policy.enabled("range_cache") and tool_name in {"Read", "Bash"}:
         try:
             request = None
             if tool_name == "Read":
@@ -481,7 +463,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             logger.exception("range cache failed; passing through tool result")
 
     compression = _config.compression_config(cfg)
-    if compression["dedupe"] and not range_claimed:
+    if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
+        shadow = policy.shadow_for("hash_dedupe")
         try:
             state = session_store.read_dedupe_state(session_id)
             turn = sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
@@ -796,6 +779,7 @@ def _handle_stop(
         unique_files_modified=analytics.get("unique_files_modified"),
         dominant_tool=analytics.get("dominant_tool"),
         mechanism_savings=mechanism_savings,
+        hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "claude"),
     )
 
     asyncio.run(upload_single(record))

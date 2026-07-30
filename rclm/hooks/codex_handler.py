@@ -46,6 +46,7 @@ Codex records file edits as ``apply_patch`` tool calls in the transcript
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ from rclm import _config
 from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
 from rclm.hooks import (
+    bootstrap,
     codex_transcript,
     dedupe,
     dlp,
@@ -98,6 +100,17 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
             "model": payload.get("model"),
             "timestamp": _now(),
         },
+    )
+    with contextlib.suppress(Exception):
+        asyncio.run(
+            asyncio.wait_for(
+                bootstrap.fetch(payload.get("cwd", ""), include_context=False),
+                3.0,
+            )
+        )
+    session_store.append_event(
+        session_id,
+        {"event_type": "HookPolicySnapshot", "policy": bootstrap.policy_snapshot("codex")},
     )
 
 
@@ -149,7 +162,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     )
 
     cfg = _config.load()
-    shadow = cfg.get("shadow_mode", False)
+    policy = _config.effective_hook_policy(cfg, provider="codex")
+    shadow = policy.legacy_shadow
     turn_id = payload.get("turn_id")
     pre_event = next(
         (
@@ -174,7 +188,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         # (confirmed by direct reproduction, not just this comment — the hook
         # run is marked failed and the original output passes through
         # unchanged).
-        if cfg.get("image_lifecycle", False):
+        if policy.enabled("image_downscale"):
             try:
                 if image_lifecycle.find_image(tool_response) is not None:
                     image_result = image_lifecycle.maybe_downscale_image_result(
@@ -240,7 +254,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             pass  # Never let DLP disrupt Codex CLI
 
     range_claimed = False
-    if cfg.get("read_cache", False):
+    if policy.enabled("range_cache"):
+        shadow = policy.shadow_for("range_cache")
         try:
             command = tool_input.get("command") or tool_input.get("cmd")
             shell = tool_input.get("shell") or ("posix" if os.name == "posix" else os.name)
@@ -273,7 +288,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             logger.exception("range cache failed; passing through tool result")
 
     compression = _config.compression_config(cfg)
-    if compression["dedupe"] and not range_claimed:
+    if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
+        shadow = policy.shadow_for("hash_dedupe")
         try:
             state = session_store.read_dedupe_state(session_id)
             turn = sum(1 for ev in prior_events if ev.get("event_type") == "PostToolUse") + 1
@@ -519,6 +535,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     _attach_transformations(tool_calls, fallback_tool_calls, events)
     file_diffs = transcript_data.file_diffs
     model = transcript_data.model or model
+    usage = transcript_data.usage
 
     record = HookSessionRecord(
         session_id=session_id,
@@ -531,9 +548,12 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         messages=messages,
         tool_calls=tool_calls,
         file_diffs=file_diffs,
-        total_input_tokens=None,
-        total_output_tokens=None,
+        total_input_tokens=usage.input_tokens if usage else None,
+        total_output_tokens=usage.output_tokens if usage else None,
+        cache_read_tokens=usage.cached_input_tokens if usage else None,
+        usage_source="provider" if usage else None,
         mechanism_savings=aggregate_mechanism_savings(events),
+        hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "codex"),
     )
 
     asyncio.run(upload_single(record))

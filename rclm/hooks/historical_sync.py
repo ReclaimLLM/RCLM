@@ -658,8 +658,14 @@ def _parse_codex_session(path: Path) -> HookSessionRecord | None:
         messages=transcript_data.messages,
         tool_calls=transcript_data.tool_calls,
         file_diffs=transcript_data.file_diffs,
-        total_input_tokens=None,
-        total_output_tokens=None,
+        total_input_tokens=(transcript_data.usage.input_tokens if transcript_data.usage else None),
+        total_output_tokens=(
+            transcript_data.usage.output_tokens if transcript_data.usage else None
+        ),
+        cache_read_tokens=(
+            transcript_data.usage.cached_input_tokens if transcript_data.usage else None
+        ),
+        usage_source="provider" if transcript_data.usage else None,
         tool_token_stats=analytics.get("tool_token_stats"),
         tool_call_count=analytics.get("tool_call_count"),
         unique_files_modified=analytics.get("unique_files_modified"),

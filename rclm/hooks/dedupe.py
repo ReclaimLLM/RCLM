@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import re
 from collections import OrderedDict
 
 MIN_DEDUPE_CHARS = 500
 MAX_DEDUPE_ENTRIES = 500
+
+# Varied plain-language phrasings for the same fact (a duplicate result wasn't
+# repeated) so the message doesn't read as a canned/robotic string every time.
+_DUPLICATE_PHRASES = (
+    "{count:,} chars skipped",
+    "{count:,} chars left out — same as before",
+    "{count:,} chars not repeated",
+)
 
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b")
@@ -63,9 +72,10 @@ def maybe_dedupe(
     seen = lru.get(digest)
     if seen:
         lru.move_to_end(digest)
+        phrase = random.choice(_DUPLICATE_PHRASES).format(count=seen["char_count"])
         pointer = (
             f"[RCLM] Identical to the result of `{seen['tool_name']}` at turn "
-            f"{seen['turn']} ({seen['char_count']:,} chars elided)."
+            f"{seen['turn']} ({phrase})."
         )
         return pointer, dict(lru), {"result_hash": digest, **seen}
     lru[digest] = {"tool_name": tool_name or "tool", "turn": turn, "char_count": len(result)}

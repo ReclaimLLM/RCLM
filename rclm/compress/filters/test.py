@@ -6,9 +6,23 @@ output in that case, especially for a non-zero exit status.
 
 from __future__ import annotations
 
+import random
 import re
 
 DEFAULT_MAX_CHARS = 8_000
+
+# Varied plain-language phrasings for the same fact, so repeated cap/summary
+# messages within one session don't all read as the same canned string.
+_CAP_MESSAGES = (
+    "{dropped} more output lines cut off (limit: {max_chars:,} characters).",
+    "{dropped} additional lines left out to stay under the {max_chars:,}-character limit.",
+    "{dropped} more lines not shown (output capped at {max_chars:,} characters).",
+)
+_DETAILS_OMITTED_PHRASES = (
+    "details left out to save space",
+    "details skipped to keep this short",
+    "details not shown here",
+)
 
 _PYTEST_SUMMARY = re.compile(r"=+ .*?(?:passed|failed|error|errors).*?=+$", re.IGNORECASE)
 _PYTEST_COUNTS = re.compile(r"(?:(\d+) failed)?(?:.*?(\d+) passed)?", re.IGNORECASE)
@@ -44,10 +58,14 @@ def _cap(lines: list[str], max_chars: int) -> str:
         kept.append(line)
         used += extra
     if dropped:
-        kept.append(
-            f"[RCLM] {dropped} additional output lines elided (output cap: {max_chars:,} chars)."
-        )
+        message = random.choice(_CAP_MESSAGES).format(dropped=dropped, max_chars=max_chars)
+        kept.append(f"[RCLM] {message}")
     return "\n".join(kept)
+
+
+def _passed_line(count: int | str) -> str:
+    phrase = random.choice(_DETAILS_OMITTED_PHRASES)
+    return f"{count} passed ({phrase})"
 
 
 def _filter_pytest(output: str, *, exit_code: int, max_chars: int) -> str | None:
@@ -74,7 +92,7 @@ def _filter_pytest(output: str, *, exit_code: int, max_chars: int) -> str | None
         passed = re.search(r"(\d+) passed", summary)
         if not passed:
             return None
-        kept = [summary, f"{passed.group(1)} passed (details elided by RCLM)"]
+        kept = [summary, _passed_line(passed.group(1))]
     elif summary not in kept:
         kept.append(summary)
     return _cap(kept, max_chars)
@@ -107,7 +125,7 @@ def _filter_js(output: str, *, exit_code: int, max_chars: int) -> str | None:
             return None
         match = re.search(r"(\d+) passed", tests)
         if match:
-            kept.append(f"{match.group(1)} passed (details elided by RCLM)")
+            kept.append(_passed_line(match.group(1)))
     return _cap(kept, max_chars)
 
 
@@ -129,7 +147,7 @@ def _filter_go(output: str, *, exit_code: int, max_chars: int) -> str | None:
     kept.extend(summaries)
     if not has_failure:
         passed = sum(1 for line in lines if line.startswith("ok\t"))
-        kept.append(f"{passed} passed (details elided by RCLM)")
+        kept.append(_passed_line(passed))
     return _cap(kept, max_chars)
 
 

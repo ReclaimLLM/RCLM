@@ -8,7 +8,7 @@ import os
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -22,12 +22,27 @@ from rclm._session_transfer import (
     delete_transfer_artifact,
     write_transfer_stream,
 )
+from rclm.replay import eligibility as replay_eligibility_mod
+from rclm.replay import verdict as replay_verdict
+from rclm.replay.engine import ALL_MECHANISMS, Mechanism, replay_blob
+from rclm.replay.provenance import build_provenance
 
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 25
 _MAX_HIGHLIGHT_CHARS = 500
-_VALID_RECORD_TYPES = {"session", "proxy", "browser-chat"}
 _VALID_SCOPES = {"mine", "team", "org"}
+
+_DEFAULT_REPLAY_CORPUS_LIMIT = 50
+# Tool-layer defaults, deliberately lower than eligibility.MIN_TURNS/
+# MIN_TOOL_CALLS (10/10, the PRD §6 floors). Exposed as explicit, visible
+# min_turns/min_tool_calls arguments so a looser evidence bar is a caller
+# choice, not silent drift.
+_DEFAULT_REPLAY_MIN_TURNS = 1
+_DEFAULT_REPLAY_MIN_TOOL_CALLS = 1
+_MAX_REPLAY_CORPUS_LIMIT = 100
+_REPLAY_CANDIDATE_SCAN_MULTIPLIER = 4
+_MAX_REPLAY_CANDIDATE_SCAN = 200  # backend cap on GET /api/sessions/search
+_REPLAY_INGEST_LAG_MARGIN_DAYS = 7
 _MCP_INSTRUCTIONS = (
     "ReclaimLLM tools recall prior captured AI sessions. Use them sparingly and only when prior "
     "session context is likely useful. Prefer normal reasoning and local repo inspection for the "
@@ -71,8 +86,26 @@ _MCP_INSTRUCTIONS = (
     "9. signals: use only when the user asks why a session or project is expensive, what workflow "
     "efficiency issues exist, or explicitly asks about ReclaimLLM Signals. Not for general status "
     "checks. Returns up to 5 open signals (evidence + prescribed fix) for the current project and "
-    "the caller's own -- read-only, does not change anything."
+    "the caller's own -- read-only, does not change anything. "
+    "10. replay_eligibility: use first, before replay_session/replay_corpus, whenever the user asks "
+    "'would compression help here' or 'verify the token-savings claim on my sessions'. Cheap "
+    "metadata-only check -- fast, no blob fetch. "
+    "11. replay_session: reproduce the shipped compression mechanisms over one captured session and "
+    "report the real tool-result token reduction. Read-only, no model calls, never re-executes "
+    "historical commands. A verdict of insufficient_data or no_effect must be reported plainly, "
+    "never softened into a positive-sounding result. Always surface the response's cannot_tell_you "
+    "line to the user on a 'helps' verdict. "
+    "12. replay_corpus: same as replay_session but over a filtered window of sessions (days/source/"
+    "model_family/project/session_category). Always state the eligibility funnel (considered vs "
+    "eligible vs excluded) alongside the number -- a low eligible count is itself the finding. "
+    "13. replay_compare: use only when the user wants multiple mechanism configurations compared "
+    "against the same corpus in one call (e.g. shell compaction alone vs. combined with range "
+    "cache)."
 )
+
+
+def _bounded_replay_target(limit: int) -> int:
+    return min(max(1, limit), _MAX_REPLAY_CORPUS_LIMIT)
 
 
 class ReclaimLLMError(RuntimeError):
@@ -190,6 +223,15 @@ def _session_search_result(session: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _require_session_record(session: dict[str, Any], session_id: str) -> None:
+    record_type = session.get("record_type")
+    if record_type != "session":
+        raise ReclaimLLMError(
+            "ReclaimLLM MCP operations currently support record_type=session only; "
+            f"{session_id} has record_type={record_type!r}."
+        )
+
+
 class ReclaimLLMClient:
     def __init__(self) -> None:
         creds = _load_credentials()
@@ -234,7 +276,6 @@ class ReclaimLLMClient:
         *,
         project_name: str | None,
         file_path: str | None,
-        record_type: str | None,
         limit: int,
         date_from: str | None = None,
         date_to: str | None = None,
@@ -244,6 +285,7 @@ class ReclaimLLMClient:
         params: dict[str, Any] = {
             "limit": max(1, min(limit, _MAX_LIMIT)),
             "include_changed_files": "true",
+            "record_type": "session",
         }
         if query:
             params["text_query"] = query
@@ -255,12 +297,6 @@ class ReclaimLLMClient:
             params["date_from"] = date_from
         if date_to:
             params["date_to"] = date_to
-        if record_type:
-            if record_type not in _VALID_RECORD_TYPES:
-                raise ReclaimLLMError(
-                    f"record_type must be one of: {', '.join(sorted(_VALID_RECORD_TYPES))}"
-                )
-            params["record_type"] = record_type
         if scope:
             if scope not in _VALID_SCOPES:
                 raise ReclaimLLMError(f"scope must be one of: {', '.join(sorted(_VALID_SCOPES))}")
@@ -281,11 +317,7 @@ class ReclaimLLMClient:
         return await self._request("GET", "/api/settings/bootstrap", params=params)
 
     async def get_session(self, session_id: str) -> dict[str, Any]:
-        data = await self._request(
-            "GET",
-            f"/api/sessions/{session_id}",
-            params={"include_blob": "false"},
-        )
+        data = await self.fetch_session_metadata(session_id)
         summary = data.get("session_summary") or data.get("description") or ""
         return {
             "session_id": data.get("session_id") or session_id,
@@ -306,6 +338,7 @@ class ReclaimLLMClient:
         max_diff_lines: int,
         force_regenerate: bool,
     ) -> dict[str, Any]:
+        await self.fetch_session_metadata(session_id)
         return await self._request(
             "POST",
             f"/api/sessions/{session_id}/export-context",
@@ -338,7 +371,6 @@ class ReclaimLLMClient:
             None,
             project_name=None,
             file_path=path,
-            record_type="session",
             limit=limit,
             scope=scope,
         )
@@ -391,6 +423,7 @@ class ReclaimLLMClient:
 
     async def transfer_session(self, session_id: str) -> dict[str, Any]:
         """Download a complete captured session into a secure local artifact."""
+        await self.fetch_session_metadata(session_id)
         encoded_id = quote(session_id, safe="")
         path = f"/api/sessions/{encoded_id}/transfer"
         url = f"{self.server_url}{path}"
@@ -484,6 +517,240 @@ class ReclaimLLMClient:
             ]
         }
 
+    async def fetch_session_metadata(self, session_id: str) -> dict[str, Any]:
+        """Raw SessionOut fields (no blob) — the cheap Tier 1 replay eligibility
+        check operates on this alone."""
+        session = await self._request(
+            "GET", f"/api/sessions/{session_id}", params={"include_blob": "false"}
+        )
+        _require_session_record(session, session_id)
+        return session
+
+    async def fetch_blob(self, session_id: str) -> dict[str, Any] | None:
+        """Full session blob for replay's Tier 2 checks and actual computation."""
+        session = await self._request(
+            "GET", f"/api/sessions/{session_id}", params={"include_blob": "true"}
+        )
+        return session.get("blob")
+
+    async def most_recent_complete_session_id(self) -> str | None:
+        data = await self.search_sessions(None, project_name=None, file_path=None, limit=_MAX_LIMIT)
+        for session in data.get("sessions", []):
+            session_id = session.get("session_id")
+            if not session_id:
+                continue
+            meta = await self.fetch_session_metadata(session_id)
+            if meta.get("ended_at") is not None:
+                return session_id
+        return None
+
+    async def enumerate_corpus(
+        self,
+        *,
+        days: int,
+        source: str | None,
+        model_family: str | None,
+        project_name: str | None,
+        session_category: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Candidate session metadata for corpus replay.
+
+        Windowed on `started_at` per Report 2's method
+        (docs/whitepaper/report-2-token-savings-data-collection.md,
+        scripts/report2_collection_status.py): page the indexed `ingested_at`
+        boundary with an ingest-lag margin, then filter each candidate
+        locally by its exact `started_at`. `/api/sessions/search` itself
+        filters `date_from`/`date_to` on `ingested_at`, not `started_at` —
+        the local filter below is what makes the `days` window mean session
+        activity time.
+        """
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(days=days)
+        ingested_from = window_start - timedelta(days=_REPLAY_INGEST_LAG_MARGIN_DAYS)
+        target_limit = _bounded_replay_target(limit)
+        scan_limit = min(
+            target_limit * _REPLAY_CANDIDATE_SCAN_MULTIPLIER,
+            _MAX_REPLAY_CANDIDATE_SCAN,
+        )
+
+        params: dict[str, Any] = {
+            "date_from": ingested_from.date().isoformat(),
+            "limit": scan_limit,
+            "record_type": "session",
+        }
+        if model_family:
+            params["model_family"] = model_family
+        if project_name:
+            params["project_name"] = project_name
+        if session_category:
+            params["session_category"] = session_category
+        if source and source != "all":
+            params["provider"] = source
+
+        data = await self._request("GET", "/api/sessions/search", params=params)
+        return [
+            session
+            for session in data.get("sessions", [])
+            if session.get("record_type") == "session"
+            and _started_at_in_window(session, window_start, now)
+        ]
+
+
+def _started_at_in_window(
+    session: dict[str, Any], window_start: datetime, window_end: datetime
+) -> bool:
+    started_raw = session.get("started_at")
+    if not started_raw:
+        return False
+    try:
+        started = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return window_start <= started <= window_end
+
+
+def _parse_mechanisms(mechanisms: list[str] | None) -> tuple[Mechanism, ...]:
+    if not mechanisms:
+        return ALL_MECHANISMS
+    valid = set(ALL_MECHANISMS)
+    invalid = [m for m in mechanisms if m not in valid]
+    if invalid:
+        raise ReclaimLLMError(f"Unknown mechanism(s) {invalid}; must be from {sorted(valid)}")
+    return tuple(mechanisms)  # type: ignore[return-value]
+
+
+async def _replay_one_session(
+    client: ReclaimLLMClient,
+    session_id: str,
+    mechanisms: tuple[Mechanism, ...],
+    *,
+    min_turns: int,
+    min_tool_calls: int,
+) -> dict[str, Any]:
+    """Fetch, gate, and replay one session; always returns a PRD §9-shaped dict."""
+    provenance = build_provenance(mechanisms, min_turns=min_turns, min_tool_calls=min_tool_calls)
+    meta = await client.fetch_session_metadata(session_id)
+    tier1 = replay_eligibility_mod.session_metadata_eligibility(
+        meta, min_turns=min_turns, min_tool_calls=min_tool_calls
+    )
+
+    blob: dict[str, Any] | None = None
+    if not tier1.eligible and (
+        tier1.failing_constraint == "session_state"
+        or (
+            tier1.actual_value is None
+            and tier1.failing_constraint in {"turn_count", "tool_call_count"}
+        )
+    ):
+        # Historical rows can have incomplete roll-up metadata even though
+        # the captured blob is complete. Retry missing fields from the blob;
+        # present row values remain authoritative.
+        blob = await client.fetch_blob(session_id)
+        if blob:
+            tier1 = replay_eligibility_mod.session_metadata_eligibility(
+                meta, min_turns=min_turns, min_tool_calls=min_tool_calls, blob=blob
+            )
+
+    if not tier1.eligible:
+        funnel = replay_eligibility_mod.build_funnel(1, {tier1.failing_constraint: 1})
+        return replay_verdict.build_insufficient_data_output(funnel, tier1, provenance)
+
+    if blob is None:
+        blob = await client.fetch_blob(session_id)
+    if not blob:
+        tier1_fail = replay_eligibility_mod.EligibilityResult(False, "blob_unavailable", None)
+        funnel = replay_eligibility_mod.build_funnel(1, {"blob_unavailable": 1})
+        return replay_verdict.build_insufficient_data_output(funnel, tier1_fail, provenance)
+
+    # A null row-level tool_call_count is incomplete metadata, not zero.
+    # Re-run Tier 1 with the blob so the captured tool-call list supplies the
+    # real count before replaying.
+    tier1 = replay_eligibility_mod.session_metadata_eligibility(
+        meta, min_turns=min_turns, min_tool_calls=min_tool_calls, blob=blob
+    )
+    if not tier1.eligible:
+        funnel = replay_eligibility_mod.build_funnel(1, {tier1.failing_constraint: 1})
+        return replay_verdict.build_insufficient_data_output(funnel, tier1, provenance)
+
+    result = replay_blob(blob, mechanisms=mechanisms)
+    tier2 = replay_eligibility_mod.blob_eligibility(result)
+    if not tier2.eligible:
+        funnel = replay_eligibility_mod.build_funnel(1, {tier2.failing_constraint: 1})
+        return replay_verdict.build_insufficient_data_output(funnel, tier2, provenance)
+
+    funnel = replay_eligibility_mod.build_funnel(1, {})
+    return replay_verdict.build_result_output([(blob, result)], funnel, provenance)
+
+
+async def _replay_corpus_pairs(
+    client: ReclaimLLMClient,
+    *,
+    days: int,
+    source: str | None,
+    model_family: str | None,
+    project: str | None,
+    session_category: str | None,
+    limit: int,
+    min_turns: int,
+    min_tool_calls: int,
+) -> tuple[list[tuple[dict[str, Any], Any]], dict[str, Any]]:
+    """Shared corpus fetch/gate step for replay_corpus and replay_compare —
+    fetch each eligible blob once regardless of how many mechanism configs
+    get replayed over it."""
+    candidates = await client.enumerate_corpus(
+        days=days,
+        source=source,
+        model_family=model_family,
+        project_name=project,
+        session_category=session_category,
+        limit=limit,
+    )
+    excluded: dict[str, int] = {}
+    pairs: list[tuple[dict[str, Any], Any]] = []
+    considered = 0
+    target_limit = _bounded_replay_target(limit)
+    for session in candidates:
+        considered += 1
+        tier1 = replay_eligibility_mod.session_metadata_eligibility(
+            session, min_turns=min_turns, min_tool_calls=min_tool_calls
+        )
+        session_id = session.get("session_id")
+        needs_metadata_fallback = not tier1.eligible and (
+            tier1.failing_constraint == "session_state"
+            or (
+                tier1.actual_value is None
+                and tier1.failing_constraint in {"turn_count", "tool_call_count"}
+            )
+        )
+        if not tier1.eligible and not needs_metadata_fallback:
+            excluded[tier1.failing_constraint] = excluded.get(tier1.failing_constraint, 0) + 1
+            continue
+        blob = await client.fetch_blob(session_id) if session_id else None
+        if not blob:
+            excluded["blob_unavailable"] = excluded.get("blob_unavailable", 0) + 1
+            continue
+        tier1 = replay_eligibility_mod.session_metadata_eligibility(
+            session,
+            min_turns=min_turns,
+            min_tool_calls=min_tool_calls,
+            blob=blob,
+        )
+        if not tier1.eligible:
+            excluded[tier1.failing_constraint] = excluded.get(tier1.failing_constraint, 0) + 1
+            continue
+        result = replay_blob(blob, mechanisms=ALL_MECHANISMS)
+        tier2 = replay_eligibility_mod.blob_eligibility(result)
+        if not tier2.eligible:
+            excluded[tier2.failing_constraint] = excluded.get(tier2.failing_constraint, 0) + 1
+            continue
+        pairs.append((blob, result))
+        if len(pairs) >= target_limit:
+            break
+    return pairs, replay_eligibility_mod.build_funnel(considered, excluded)
+
 
 def build_mcp_server():
     from mcp.server.fastmcp import FastMCP
@@ -498,7 +765,6 @@ def build_mcp_server():
         query: str,
         project_name: str | None = None,
         file_path: str | None = None,
-        record_type: (Literal["session", "proxy", "browser-chat"] | None) = "session",
         limit: int = _DEFAULT_LIMIT,
         date_from: str | None = None,
         date_to: str | None = None,
@@ -529,7 +795,6 @@ def build_mcp_server():
             query,
             project_name=project_name,
             file_path=file_path,
-            record_type=record_type,
             limit=limit,
             date_from=date_from,
             date_to=date_to,
@@ -540,7 +805,6 @@ def build_mcp_server():
     async def search_by_filename(
         file_path: str,
         project_name: str | None = None,
-        record_type: (Literal["session", "proxy", "browser-chat"] | None) = "session",
         limit: int = _DEFAULT_LIMIT,
         date_from: str | None = None,
         date_to: str | None = None,
@@ -565,7 +829,6 @@ def build_mcp_server():
             None,
             project_name=project_name,
             file_path=file_path,
-            record_type=record_type,
             limit=limit,
             date_from=date_from,
             date_to=date_to,
@@ -682,6 +945,252 @@ def build_mcp_server():
         resolved_cwd = cwd or os.getcwd()
         client = ReclaimLLMClient()
         return await client.signals(cwd=resolved_cwd)
+
+    @mcp.tool()
+    async def replay_eligibility(
+        session_id: str | None = None,
+        days: int = 30,
+        source: Literal["claude", "codex", "cursor", "all"] = "all",
+        model_family: str | None = None,
+        project: str | None = None,
+        session_category: Literal["fix", "feat", "perf"] | None = None,
+        limit: int = _DEFAULT_REPLAY_CORPUS_LIMIT,
+        min_turns: int = _DEFAULT_REPLAY_MIN_TURNS,
+        min_tool_calls: int = _DEFAULT_REPLAY_MIN_TOOL_CALLS,
+    ) -> dict[str, Any]:
+        """Cheap read-only check of whether replaying compression mechanisms on
+        captured sessions is worth doing — call this before replay_session or
+        replay_corpus. Checks only session metadata (turn count, tool-call
+        count, completion state, model), never fetches the full session blob,
+        so it's fast.
+
+        Pass session_id to check one session. Omit it to check a corpus window
+        instead, using the same days/source/model_family/project/
+        session_category/limit filters as replay_corpus. Always returns the
+        funnel of sessions considered vs excluded and why — a session or
+        corpus with few eligible sessions is itself the finding; do not keep
+        loosening filters to force a number.
+
+        min_turns/min_tool_calls override the turn-count and tool-call-count
+        floors (default 1/1; PRD §6's documented floors are 10/10). Lowering
+        them trades evidence quality for sample size — state the values used
+        alongside any result, don't drop them silently.
+        """
+        client = ReclaimLLMClient()
+        if session_id:
+            meta = await client.fetch_session_metadata(session_id)
+            tier1 = replay_eligibility_mod.session_metadata_eligibility(
+                meta, min_turns=min_turns, min_tool_calls=min_tool_calls
+            )
+            if not tier1.eligible and (
+                tier1.failing_constraint == "session_state"
+                or (
+                    tier1.actual_value is None
+                    and tier1.failing_constraint in {"turn_count", "tool_call_count"}
+                )
+            ):
+                # A single-session check can cheaply recover incomplete
+                # historical roll-ups from the captured blob.
+                blob = await client.fetch_blob(session_id)
+                if blob:
+                    tier1 = replay_eligibility_mod.session_metadata_eligibility(
+                        meta, min_turns=min_turns, min_tool_calls=min_tool_calls, blob=blob
+                    )
+            funnel = replay_eligibility_mod.build_funnel(
+                1, {} if tier1.eligible else {tier1.failing_constraint: 1}
+            )
+            return {
+                "eligible": tier1.eligible,
+                "failing_constraint": tier1.failing_constraint,
+                "actual_value": tier1.actual_value,
+                "eligibility": funnel,
+                "min_turns_applied": min_turns,
+                "min_tool_calls_applied": min_tool_calls,
+                "note": "Metadata-only check; run replay_session for the reduction figure.",
+            }
+
+        candidates = await client.enumerate_corpus(
+            days=days,
+            source=source,
+            model_family=model_family,
+            project_name=project,
+            session_category=session_category,
+            limit=limit,
+        )
+        excluded: dict[str, int] = {}
+        eligible_count = 0
+        for session in candidates:
+            tier1 = replay_eligibility_mod.session_metadata_eligibility(
+                session, min_turns=min_turns, min_tool_calls=min_tool_calls
+            )
+            if tier1.eligible:
+                eligible_count += 1
+            else:
+                excluded[tier1.failing_constraint] = excluded.get(tier1.failing_constraint, 0) + 1
+        funnel = replay_eligibility_mod.build_funnel(len(candidates), excluded)
+        confidence = replay_eligibility_mod.corpus_confidence(eligible_count)
+        return {
+            "eligible": eligible_count > 0,
+            "eligibility": funnel,
+            "confidence": {"level": confidence.level, "note": confidence.note},
+            "min_turns_applied": min_turns,
+            "min_tool_calls_applied": min_tool_calls,
+            "note": "Metadata-only check; run replay_corpus for the reduction figure.",
+        }
+
+    @mcp.tool()
+    async def replay_session(
+        session_id: str | None = None,
+        mechanisms: list[str] | None = None,
+        min_turns: int = _DEFAULT_REPLAY_MIN_TURNS,
+        min_tool_calls: int = _DEFAULT_REPLAY_MIN_TOOL_CALLS,
+    ) -> dict[str, Any]:
+        """Reproduce the shipped compression mechanisms over one captured
+        session's tool calls and report the real tool-result token reduction.
+        Strictly read-only: no model calls, no writes, no re-execution of
+        historical commands.
+
+        session_id defaults to your most recent complete session. mechanisms
+        defaults to all three (range_cache, shell_compaction, hash_dedupe);
+        pass a subset (e.g. ["shell_compaction"]) to isolate one mechanism's
+        effect. A session below the size/turn thresholds is refused with the
+        specific failing constraint (verdict "insufficient_data") rather than
+        given an unstable number.
+
+        min_turns/min_tool_calls override the turn-count and tool-call-count
+        floors (default 1/1; PRD §6's documented floors are 10/10) —
+        reported in the output's provenance.
+        """
+        client = ReclaimLLMClient()
+        resolved_id = session_id or await client.most_recent_complete_session_id()
+        if not resolved_id:
+            raise ReclaimLLMError("No complete session found to replay.")
+        parsed_mechanisms = _parse_mechanisms(mechanisms)
+        return await _replay_one_session(
+            client,
+            resolved_id,
+            parsed_mechanisms,
+            min_turns=min_turns,
+            min_tool_calls=min_tool_calls,
+        )
+
+    @mcp.tool()
+    async def replay_corpus(
+        days: int = 30,
+        source: Literal["claude", "codex", "cursor", "all"] = "all",
+        model_family: str | None = None,
+        project: str | None = None,
+        session_category: Literal["fix", "feat", "perf"] | None = None,
+        mechanisms: list[str] | None = None,
+        limit: int = _DEFAULT_REPLAY_CORPUS_LIMIT,
+        min_turns: int = _DEFAULT_REPLAY_MIN_TURNS,
+        min_tool_calls: int = _DEFAULT_REPLAY_MIN_TOOL_CALLS,
+    ) -> dict[str, Any]:
+        """Reproduce the shipped compression mechanisms across a filtered
+        corpus of captured sessions and report the aggregate real tool-result
+        token reduction. Strictly read-only.
+
+        days is a session-activity window (measured on when each session
+        started, default 30). source/model_family/project/session_category
+        narrow the corpus. limit is the target fully eligible session count
+        (max 100); Replay scans up to 4x that many recent session records,
+        capped at 200, and stops when it reaches the target or exhausts the
+        scan. Every result states sessions considered vs eligible and why the
+        rest were excluded.
+
+        min_turns/min_tool_calls override the turn-count and tool-call-count
+        floors (default 1/1; PRD §6's documented floors are 10/10) —
+        reported in the output's provenance.
+        """
+        client = ReclaimLLMClient()
+        parsed_mechanisms = _parse_mechanisms(mechanisms)
+        pairs, funnel = await _replay_corpus_pairs(
+            client,
+            days=days,
+            source=source,
+            model_family=model_family,
+            project=project,
+            session_category=session_category,
+            limit=limit,
+            min_turns=min_turns,
+            min_tool_calls=min_tool_calls,
+        )
+        provenance = build_provenance(
+            parsed_mechanisms, min_turns=min_turns, min_tool_calls=min_tool_calls
+        )
+        if not pairs:
+            fail = replay_eligibility_mod.EligibilityResult(False, "eligible_sessions", 0)
+            return replay_verdict.build_insufficient_data_output(funnel, fail, provenance)
+
+        reselected = [(blob, replay_blob(blob, mechanisms=parsed_mechanisms)) for blob, _ in pairs]
+        output = replay_verdict.build_result_output(reselected, funnel, provenance)
+        confidence = replay_eligibility_mod.corpus_confidence(len(pairs))
+        output["confidence"] = {"level": confidence.level, "note": confidence.note}
+        return output
+
+    @mcp.tool()
+    async def replay_compare(
+        days: int = 30,
+        source: Literal["claude", "codex", "cursor", "all"] = "all",
+        model_family: str | None = None,
+        project: str | None = None,
+        session_category: Literal["fix", "feat", "perf"] | None = None,
+        configs: list[list[str]] | None = None,
+        limit: int = _DEFAULT_REPLAY_CORPUS_LIMIT,
+        min_turns: int = _DEFAULT_REPLAY_MIN_TURNS,
+        min_tool_calls: int = _DEFAULT_REPLAY_MIN_TOOL_CALLS,
+    ) -> dict[str, Any]:
+        """Replay the same session corpus under multiple mechanism
+        configurations in one call, so bundles stay attributable — e.g.
+        compare shell compaction alone against shell compaction plus range
+        cache. Strictly read-only; fetches each eligible session's blob once
+        and reuses it across every config.
+
+        configs is a list of mechanism-name lists, e.g.
+        [["shell_compaction"], ["shell_compaction", "range_cache"]]. Defaults
+        to comparing each mechanism individually plus the full combined set
+        if omitted. days/source/model_family/project/session_category/limit
+        select the corpus, same as replay_corpus.
+
+        min_turns/min_tool_calls override the turn-count and tool-call-count
+        floors (default 1/1; PRD §6's documented floors are 10/10) —
+        reported in each config row's provenance.
+        """
+        client = ReclaimLLMClient()
+        parsed_configs: list[tuple[Mechanism, ...]]
+        if configs:
+            parsed_configs = [_parse_mechanisms(config) for config in configs]
+        else:
+            parsed_configs = [(mechanism,) for mechanism in ALL_MECHANISMS]
+            parsed_configs.append(ALL_MECHANISMS)
+        pairs, funnel = await _replay_corpus_pairs(
+            client,
+            days=days,
+            source=source,
+            model_family=model_family,
+            project=project,
+            session_category=session_category,
+            limit=limit,
+            min_turns=min_turns,
+            min_tool_calls=min_tool_calls,
+        )
+        if not pairs:
+            fail = replay_eligibility_mod.EligibilityResult(False, "eligible_sessions", 0)
+            provenance = build_provenance(
+                ALL_MECHANISMS, min_turns=min_turns, min_tool_calls=min_tool_calls
+            )
+            return replay_verdict.build_insufficient_data_output(funnel, fail, provenance)
+
+        rows = []
+        for config in parsed_configs:
+            reselected = [(blob, replay_blob(blob, mechanisms=config)) for blob, _ in pairs]
+            provenance = build_provenance(
+                config, min_turns=min_turns, min_tool_calls=min_tool_calls
+            )
+            row = replay_verdict.build_result_output(reselected, funnel, provenance)
+            row["mechanisms"] = list(config)
+            rows.append(row)
+        return {"configs": rows}
 
     return mcp
 

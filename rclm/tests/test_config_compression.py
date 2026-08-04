@@ -70,3 +70,15 @@ def test_codex_unsupported_image_rewrite_stays_observe_only():
         "mode": "observe",
         "supported": False,
     }
+
+
+def test_codex_and_cursor_support_exec_compaction():
+    config = {"compression": {"enabled": True}}
+
+    for provider in ("codex", "cursor"):
+        policy = _config.effective_hook_policy(config, provider=provider)
+        assert policy.mechanisms["exec_compaction"] == {
+            "enabled": True,
+            "mode": "enforce",
+            "supported": True,
+        }

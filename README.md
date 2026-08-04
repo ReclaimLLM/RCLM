@@ -100,13 +100,15 @@ When you need the complete captured session instead of a summary, ask the target
 ### Context Compression & DLP
 Enable advanced features during installation:
 ```bash
-rclm-hooks-install --compress                          # Reduces token usage for Claude Code
+rclm-hooks-install --compress                          # Reduces tool-result tokens in Claude Code, Codex, and Cursor
 rclm-hooks-install --dlp                                # Enables Data Loss Prevention for .env files
 rclm-hooks-install --image-lifecycle                    # Downscales oversized screenshots/images before they reach the model
 rclm-hooks-install --image-lifecycle --image-max-dim=1280  # Set the max image dimension in pixels (default 1280)
 ```
 
 Image downscaling (`--image-lifecycle`) resizes and re-encodes oversized tool-result images — full-page screenshots, MCP screenshot-tool output — before they enter the model's context, and never upscales. It applies for real on Claude Code sessions; on Codex it currently reports measured before/after savings only, since Codex CLI does not yet apply hook-driven rewrites of MCP tool output. Requires the optional `images` extra: `pip install 'rclm[images]'`.
+
+Text compression uses each coding client's native hooks; it does not require proxy or LLM-gateway traffic. Claude Code and Codex support recognized shell-output compaction. Cursor wraps recognized shell commands before execution and limits post-result replacement to structured MCP output. Unknown commands, failures, images, and ambiguous structured results pass through unchanged. Identical-result dedupe remains off by default (`--dedupe`).
 
 ### Folder Capture Filters
 Limit uploads to specific project folders during installation:

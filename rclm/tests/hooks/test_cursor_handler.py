@@ -1,5 +1,6 @@
 """Tests for rclm.hooks.cursor_handler."""
 
+import base64
 import json
 from io import StringIO
 from unittest.mock import MagicMock, patch
@@ -7,6 +8,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from rclm.hooks import cursor_handler, session_store
+
+
+def _wrapped(command: str, session_id: str) -> str:
+    encoded = base64.urlsafe_b64encode(command.encode()).decode()
+    return f"rclm-compress --session-id {session_id} --encoded-command {encoded}"
 
 
 def _run_handler(event_name: str, payload: dict, monkeypatch):
@@ -128,8 +134,58 @@ def test_generic_cursor_hook_event_is_recorded(monkeypatch, tmp_path):
 
     events = session_store.read_events("conv-1")
     assert len(events) == 1
-    assert events[0]["event_type"] == "preToolUse"
-    assert events[0]["payload"] == payload
+    assert events[0]["event_type"] == "PreToolUse"
+    assert events[0]["tool_name"] == "read_file"
+    assert events[0]["tool_input"] == {}
+
+
+def test_pre_tool_use_rewrites_recognized_shell_input(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"enabled": True}})
+    monkeypatch.setattr("rclm.hooks.compress._compress_available", lambda: True)
+
+    _run_handler(
+        "preToolUse",
+        {
+            "conversation_id": "conv-pre",
+            "tool_name": "Shell",
+            "tool_input": {"command": "cat build.log", "timeout": 10_000},
+            "tool_use_id": "call-1",
+        },
+        monkeypatch,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["updated_input"] == {
+        "command": _wrapped("cat build.log", "conv-pre"),
+        "timeout": 10_000,
+    }
+
+
+def test_post_tool_use_dedupes_structured_mcp_output(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"dedupe": True}})
+    text = "result line\n" * 100
+    payload = {
+        "conversation_id": "conv-mcp",
+        "tool_name": "MCP:filesystem:read_file",
+        "tool_input": {"path": "build.log"},
+        "tool_output": {
+            "content": [{"type": "text", "text": text}],
+            "isError": False,
+            "metadata": {"source": "filesystem"},
+        },
+        "tool_use_id": "call-1",
+    }
+
+    _run_handler("postToolUse", payload, monkeypatch)
+    assert capsys.readouterr().out == ""
+    _run_handler("postToolUse", {**payload, "tool_use_id": "call-2"}, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    updated = output["updated_mcp_tool_output"]
+    assert "Identical to the result" in updated["content"][0]["text"]
+    assert updated["metadata"] == {"source": "filesystem"}
 
 
 @patch("rclm.hooks.cursor_handler.upload_single")
@@ -155,7 +211,6 @@ def test_stop_uploads_record(mock_upload, monkeypatch, tmp_path):
             "timestamp": "2024-01-01T00:00:01Z",
         },
     )
-
     payload = {
         "conversation_id": session_id,
         "cwd": "/test/dir",
@@ -292,4 +347,4 @@ def test_stop_uses_payload_transcript_path_and_derives_session_id(
     assert record.cwd == "/repo/from/transcript"
     assert record.transcript_path == transcript_path
     assert record.messages[0]["content"] == "from payload transcript"
-    assert "rclm-cursor-hooks TEMP event=stop payload=" in capsys.readouterr().err
+    assert transcript_path not in capsys.readouterr().err

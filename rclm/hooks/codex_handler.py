@@ -7,14 +7,10 @@ This process always exits 0.
 Event mapping from Codex CLI → ReclaimLLM:
   SessionStart     → record cwd + started_at + model
   UserPromptSubmit → record user prompt
-  PreToolUse       → record tool invocation (Bash; also MCP tool calls when
-                     --image-lifecycle is enabled, since the hook matcher is
-                     unrestricted — see _CODEX_HOOKS_TO_INJECT in installer.py)
-  PostToolUse      → record tool result (same scope as PreToolUse). Non-Bash
-                     tool calls only ever get image-lifecycle measurement
-                     (never a rewrite: Codex's updatedMCPToolOutput field is
-                     parsed but not applied by Codex CLI — confirmed by direct
-                     reproduction, not just this comment).
+  PreToolUse       → record tool invocation and conservatively rewrite supported
+                     Bash input through the shared compression CLI.
+  PostToolUse      → record tool result and replace recognized text results via
+                     Codex's documented feedback + continue:false contract.
   Stop             → assemble HookSessionRecord from accumulated events + upload
 
 Codex stdin schema (all events):
@@ -65,12 +61,14 @@ from rclm.hooks import (
     image_lifecycle,
     read_cache,
     session_store,
+    tool_result_transform,
 )
 from rclm.hooks._analytics import (
     aggregate_mechanism_savings,
     estimate_tokens,
     mechanism_saving_event,
 )
+from rclm.hooks.compress import maybe_compress
 from rclm.hooks.updater import schedule_session_end_update
 
 logger = logging.getLogger(__name__)
@@ -130,7 +128,8 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     # Codex nests the bash command inside tool_input: {"command": "..."}. For
     # non-Bash (MCP) tool calls, tool_input carries whatever args that tool
     # takes (e.g. url/viewport for a screenshot tool) — captured here so
-    # _handle_post_tool_use can look it up by turn_id for eviction keying.
+    # _handle_post_tool_use can look it up by tool_use_id (with a legacy
+    # turn_id fallback) for compaction and eviction keying.
     tool_name = payload.get("tool_name") or "Bash"
     tool_input = payload.get("tool_input", {})
     session_store.append_event(
@@ -139,10 +138,43 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
             "event_type": "PreToolUse",
             "tool_name": tool_name,
             "tool_input": tool_input,
+            "tool_use_id": payload.get("tool_use_id"),
             "turn_id": payload.get("turn_id"),
             "timestamp": _now(),
         },
     )
+
+    cfg = _config.load()
+    policy = _config.effective_hook_policy(cfg, provider="codex")
+    if not policy.enabled("exec_compaction") or not isinstance(tool_input, dict):
+        return
+
+    try:
+        compression_tool = (
+            "Bash" if tool_name in {"Bash", "exec", "exec_command", "shell"} else tool_name
+        )
+        delta = maybe_compress(
+            compression_tool,
+            tool_input,
+            shadow=policy.shadow_for("exec_compaction"),
+            session_id=session_id,
+        )
+        if not delta:
+            return
+        updated_input = {**tool_input, **delta}
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "updatedInput": updated_input,
+                    }
+                }
+            )
+        )
+    except Exception:
+        logger.exception("Codex input compaction failed; passing through tool input")
 
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
@@ -165,14 +197,27 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     policy = _config.effective_hook_policy(cfg, provider="codex")
     shadow = policy.legacy_shadow
     turn_id = payload.get("turn_id")
-    pre_event = next(
-        (
-            event
-            for event in reversed(prior_events)
-            if event.get("event_type") == "PreToolUse" and event.get("turn_id") == turn_id
-        ),
-        None,
-    )
+    tool_use_id = payload.get("tool_use_id")
+    pre_event = None
+    if tool_use_id:
+        pre_event = next(
+            (
+                event
+                for event in reversed(prior_events)
+                if event.get("event_type") == "PreToolUse"
+                and event.get("tool_use_id") == tool_use_id
+            ),
+            None,
+        )
+    if pre_event is None:
+        pre_event = next(
+            (
+                event
+                for event in reversed(prior_events)
+                if event.get("event_type") == "PreToolUse" and event.get("turn_id") == turn_id
+            ),
+            None,
+        )
     tool_input = pre_event.get("tool_input", {}) if pre_event else {}
 
     # MCP tool calls carry the unambiguous "mcp__<server>__<tool>" naming
@@ -287,6 +332,29 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             logger.exception("range cache failed; passing through tool result")
 
+    if policy.enabled("exec_compaction") and not range_claimed:
+        shadow = policy.shadow_for("exec_compaction")
+        try:
+            transform_input = effective_text if replaced else tool_response
+            decision = tool_result_transform.compact_tool_result(
+                tool_name,
+                tool_input,
+                transform_input,
+            )
+            if decision is not None:
+                for event in tool_result_transform.analytics_events(
+                    decision,
+                    tool_use_id=payload.get("tool_use_id"),
+                    applied=not shadow,
+                    turn_id=turn_id,
+                ):
+                    session_store.append_event(session_id, event)
+                if not shadow:
+                    effective_text = decision.model_text
+                    replaced = True
+        except Exception:
+            logger.exception("tool-result compaction failed; passing through tool result")
+
     compression = _config.compression_config(cfg)
     if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
         shadow = policy.shadow_for("hash_dedupe")
@@ -338,11 +406,10 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             logger.exception("hash dedupe failed; passing through tool result")
 
     if replaced:
-        # updatedMCPToolOutput is parsed but not applied by Codex CLI (hook run
-        # is marked failed and the original output passes through unchanged).
-        # decision:"block" + reason is the documented, supported way to
-        # replace PostToolUse output.
-        print(json.dumps({"decision": "block", "reason": effective_text}))
+        # Codex documents this pair as model-visible feedback replacement.
+        # continue:false prevents normal processing of the original result and,
+        # unlike block-only output, does not reject a nested code-mode promise.
+        print(json.dumps({"continue": False, "decision": "block", "reason": effective_text}))
 
 
 # ---------------------------------------------------------------------------

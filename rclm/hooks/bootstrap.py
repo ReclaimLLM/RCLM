@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import date
 
 from rclm import _config
+from rclm.hooks.updater import installed_version
 from rclm.mcp_server import ReclaimLLMClient, ReclaimLLMError
+
+POLICY_SNAPSHOT_SCHEMA_VERSION = 1
 
 
 async def fetch(cwd: str, *, include_context: bool) -> dict:
@@ -15,9 +18,9 @@ async def fetch(cwd: str, *, include_context: bool) -> dict:
         )
     except ReclaimLLMError:
         return {}
-    policy = result.get("org_hook_policy")
-    if isinstance(policy, dict):
-        _config.patch(org_hook_policy=policy)
+    if "org_hook_policy" in result:
+        policy = result.get("org_hook_policy")
+        _config.patch(org_hook_policy=policy if isinstance(policy, dict) else None)
     return result
 
 
@@ -52,7 +55,15 @@ def signal_nudge_text(result: dict, cfg: dict) -> str | None:
 
 
 def policy_snapshot(provider: str) -> dict:
-    return _config.effective_hook_policy(_config.load(), provider=provider).snapshot()
+    snapshot = _config.effective_hook_policy(_config.load(), provider=provider).snapshot()
+    snapshot.update(
+        {
+            "snapshot_schema_version": POLICY_SNAPSHOT_SCHEMA_VERSION,
+            "capture_client_version": installed_version(),
+            "capture_provider": provider,
+        }
+    )
+    return snapshot
 
 
 def policy_snapshot_from_events(events: list[dict], provider: str) -> dict:

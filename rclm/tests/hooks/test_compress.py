@@ -1,5 +1,7 @@
 """Tests for rclm.hooks.compress (PreToolUse compression engine)."""
 
+import base64
+import shlex
 from unittest.mock import patch
 
 from rclm.hooks.compress import (
@@ -7,6 +9,13 @@ from rclm.hooks.compress import (
     maybe_compress,
     split_command_segments,
 )
+
+
+def _wrapped(command: str, session_id: str | None = None) -> str:
+    encoded = base64.urlsafe_b64encode(command.encode()).decode()
+    session_arg = f" --session-id {shlex.quote(session_id)}" if session_id else ""
+    return f"rclm-compress{session_arg} --encoded-command {encoded}"
+
 
 # ---------------------------------------------------------------------------
 # Read compression
@@ -94,14 +103,14 @@ class TestCompressBash:
     def test_git_status_rewritten(self, mock_avail):
         result = maybe_compress("Bash", {"command": "git status"})
         assert result is not None
-        assert result["command"] == "rclm-compress git status"
+        assert result["command"] == _wrapped("git status")
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_bash_rewrite_unaffected_by_shadow(self, mock_avail):
         """Bash always routes through rclm-compress — shadow decision is made there."""
         result = maybe_compress("Bash", {"command": "git status"}, shadow=True)
         assert result is not None
-        assert result["command"] == "rclm-compress git status"
+        assert result["command"] == _wrapped("git status")
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_git_diff_rewritten(self, mock_avail):
@@ -131,7 +140,7 @@ class TestCompressBash:
     def test_rg_rewritten(self, mock_avail):
         result = maybe_compress("Bash", {"command": "rg -n TODO ."})
         assert result is not None
-        assert result["command"] == "rclm-compress rg -n TODO ."
+        assert result["command"] == _wrapped("rg -n TODO .")
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_grep_rewritten(self, mock_avail):
@@ -143,35 +152,66 @@ class TestCompressBash:
     def test_pipeline_rewritten_when_later_segment_matches(self, mock_avail):
         result = maybe_compress("Bash", {"command": "echo TODO | grep TODO"})
         assert result is not None
-        assert result["command"] == "rclm-compress echo TODO | grep TODO"
+        assert result["command"] == _wrapped("echo TODO | grep TODO")
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_chain_rewritten_when_later_segment_matches(self, mock_avail):
         result = maybe_compress("Bash", {"command": "echo first && git status"})
         assert result is not None
-        assert result["command"] == "rclm-compress echo first && git status"
+        assert result["command"] == _wrapped("echo first && git status")
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_semicolon_chain_rewritten_when_later_segment_matches(self, mock_avail):
         result = maybe_compress("Bash", {"command": "echo first; git status"})
         assert result is not None
-        assert result["command"] == "rclm-compress echo first; git status"
+        assert result["command"] == _wrapped("echo first; git status")
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
-    def test_nl_sed_pipeline_not_rewritten_without_allowlist(self, mock_avail):
+    def test_nl_sed_pipeline_rewritten_after_allowlist_expansion(self, mock_avail):
         result = maybe_compress("Bash", {"command": "nl f | sed -n '1,80p'"})
-        assert result is None
+        assert result == {"command": _wrapped("nl f | sed -n '1,80p'")}
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_cat_rewritten(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "cat build.log"})
+        assert result == {"command": _wrapped("cat build.log")}
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_session_id_is_forwarded_and_shell_quoted(self, mock_avail):
+        result = maybe_compress(
+            "Bash",
+            {"command": "cat build.log"},
+            session_id="session with spaces",
+        )
+        assert result == {"command": _wrapped("cat build.log", "session with spaces")}
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_unsafe_session_id_is_omitted_without_blocking_command(self, mock_avail):
+        result = maybe_compress(
+            "Bash",
+            {"command": "cat build.log"},
+            session_id="../../outside",
+        )
+        assert result == {"command": _wrapped("cat build.log")}
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_posix_shell_from_payload_rewritten(self, mock_avail):
         result = maybe_compress("Bash", {"command": "git status", "shell": "/bin/zsh"})
         assert result is not None
-        assert result["command"] == "rclm-compress git status"
+        assert result["command"] == _wrapped("git status")
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_non_posix_shell_from_payload_not_rewritten(self, mock_avail):
         result = maybe_compress("Bash", {"command": "git status", "shell": "powershell"})
         assert result is None
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_powershell_get_content_rewritten(self, mock_avail):
+        result = maybe_compress(
+            "Bash",
+            {"command": "Get-Content build.log", "shell": "powershell"},
+        )
+        assert result == {"command": _wrapped("Get-Content build.log")}
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
     @patch("rclm.hooks.compress.os.name", "nt")

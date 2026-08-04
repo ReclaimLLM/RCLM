@@ -66,6 +66,7 @@ async def test_get_session_returns_summary_and_link(tmp_path, monkeypatch):
         assert params == {"include_blob": "false"}
         return {
             "session_id": "session-1",
+            "record_type": "session",
             "title": "Auth fix",
             "session_summary": "Fixed auth token refresh.",
             "project_name": "ReclaimLLM",
@@ -78,6 +79,21 @@ async def test_get_session_returns_summary_and_link(tmp_path, monkeypatch):
     assert result["summary"] == "Fixed auth token refresh."
     assert result["link"] == "https://app.test/sessions/session-1"
     assert "blob" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_session_rejects_non_session_record(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "key"}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    async def fake_request(self, method, path, *, params=None):
+        return {"session_id": "proxy-1", "record_type": "proxy"}
+
+    monkeypatch.setattr(mcp_server.ReclaimLLMClient, "_request", fake_request)
+
+    with pytest.raises(mcp_server.ReclaimLLMError, match="record_type=session only"):
+        await mcp_server.ReclaimLLMClient().get_session("proxy-1")
 
 
 @pytest.mark.asyncio
@@ -107,13 +123,13 @@ async def test_search_by_filename_path_does_not_send_text_query(tmp_path, monkey
         None,
         project_name=None,
         file_path="auth.tsx",
-        record_type="session",
         limit=8,
     )
 
     assert "text_query" not in seen_params
     assert seen_params["file_path"] == "auth.tsx"
     assert seen_params["include_changed_files"] == "true"
+    assert seen_params["record_type"] == "session"
     assert result["sessions"][0]["title"] == "Touched auth.tsx"
 
 
@@ -134,7 +150,6 @@ async def test_search_sessions_passes_scope_param(tmp_path, monkeypatch):
         "auth bug",
         project_name=None,
         file_path=None,
-        record_type="session",
         limit=5,
         scope="team",
     )
@@ -160,7 +175,6 @@ async def test_search_sessions_omits_scope_param_by_default(tmp_path, monkeypatc
         "auth bug",
         project_name=None,
         file_path=None,
-        record_type="session",
         limit=5,
     )
 
@@ -184,7 +198,6 @@ async def test_search_sessions_passes_ingestion_date_range(tmp_path, monkeypatch
         None,
         project_name=None,
         file_path="src/auth.tsx",
-        record_type="session",
         limit=5,
         date_from="2026-07-08",
         date_to="2026-07-30",
@@ -218,7 +231,6 @@ async def test_search_sessions_rejects_invalid_scope(tmp_path, monkeypatch):
             "auth bug",
             project_name=None,
             file_path=None,
-            record_type="session",
             limit=5,
             scope="everyone",
         )
@@ -408,6 +420,8 @@ async def test_handoff_wraps_export_context(tmp_path, monkeypatch):
 
     async def fake_request(self, method, path, *, params=None):
         calls.append({"method": method, "path": path, "params": params})
+        if method == "GET" and path == "/api/sessions/session-1":
+            return {"session_id": "session-1", "record_type": "session"}
         if path == "/api/signals/mark-acted":
             return {}
         return {"context_document": "## Task Overview\n...", "token_estimate": 1200}
@@ -418,7 +432,7 @@ async def test_handoff_wraps_export_context(tmp_path, monkeypatch):
         "session-1", include_diffs=True, max_diff_lines=50
     )
 
-    assert calls[0]["path"] == "/api/sessions/session-1/export-context"
+    assert calls[1]["path"] == "/api/sessions/session-1/export-context"
     assert result["session_id"] == "session-1"
     assert result["handoff_document"] == "## Task Overview\n..."
     assert result["token_estimate"] == 1200
@@ -437,6 +451,8 @@ async def test_handoff_marks_signals_acted(tmp_path, monkeypatch):
 
     async def fake_request(self, method, path, *, params=None):
         calls.append({"method": method, "path": path, "params": params})
+        if method == "GET" and path == "/api/sessions/session-2":
+            return {"session_id": "session-2", "record_type": "session"}
         if path == "/api/signals/mark-acted":
             return {}
         return {"context_document": "doc", "token_estimate": 10}
@@ -460,6 +476,8 @@ async def test_handoff_survives_mark_acted_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
 
     async def fake_request(self, method, path, *, params=None):
+        if method == "GET" and path == "/api/sessions/session-3":
+            return {"session_id": "session-3", "record_type": "session"}
         if path == "/api/signals/mark-acted":
             raise mcp_server.ReclaimLLMError("boom")
         return {"context_document": "doc", "token_estimate": 10}
@@ -542,6 +560,11 @@ async def test_transfer_session_streams_verified_artifact(tmp_path, monkeypatch)
 
     monkeypatch.setattr(mcp_server, "write_transfer_stream", write_to_test_root)
 
+    async def session_metadata(self, session_id: str):
+        return {"session_id": session_id, "record_type": "session"}
+
+    monkeypatch.setattr(mcp_server.ReclaimLLMClient, "fetch_session_metadata", session_metadata)
+
     result = await mcp_server.ReclaimLLMClient().transfer_session("session-1")
 
     assert result["complete"] is True
@@ -557,6 +580,14 @@ async def test_transfer_session_is_registered_as_mcp_tool():
     tools = await mcp_server.build_mcp_server().list_tools()
 
     assert "transfer_session" in {tool.name for tool in tools}
+
+
+@pytest.mark.asyncio
+async def test_search_tools_do_not_expose_record_type_override():
+    tools = {tool.name: tool for tool in await mcp_server.build_mcp_server().list_tools()}
+
+    for name in ("search_sessions", "search_by_filename"):
+        assert "record_type" not in tools[name].inputSchema.get("properties", {})
 
 
 def test_missing_credentials_raises(tmp_path, monkeypatch):

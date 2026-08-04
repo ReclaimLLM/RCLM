@@ -129,6 +129,35 @@ def test_context_pack_off_by_default(monkeypatch, tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_session_start_clears_stale_org_policy_when_user_has_no_org(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "server_url": "https://api.test",
+                "api_key": "key",
+                "org_hook_policy": {"force_compression_enforcement": True},
+            }
+        )
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    async def fake_request(self, method, path, *, params=None):
+        return {"org_hook_policy": None}
+
+    monkeypatch.setattr(handler.bootstrap.ReclaimLLMClient, "_request", fake_request)
+
+    payload = {"session_id": "sid-no-org", "cwd": "/repo", "timestamp": "2024-01-01Z"}
+    _run_handler("SessionStart", payload, monkeypatch)
+
+    assert _config.load()["org_hook_policy"] is None
+    assert capsys.readouterr().out == ""
+
+
 def test_context_pack_injects_highlights_when_enabled(monkeypatch, tmp_path, capsys):
     from rclm import _config
     from rclm.hooks import session_store
@@ -1010,6 +1039,33 @@ def test_post_tool_use_appends_tool_event(monkeypatch, tmp_path):
     assert events[-1]["tool_response"] == "file.py\n"
 
 
+def test_post_tool_use_compacts_recognized_shell_output(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"enabled": True}})
+    payload = {
+        "session_id": "sid-compact",
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat build.log"},
+        "tool_response": "".join(f"line {line}\n" for line in range(100)),
+        "tool_use_id": "call-compact",
+    }
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    replacement = output["hookSpecificOutput"]["updatedToolOutput"]
+    assert "40 lines omitted" in replacement
+    events = session_store.read_events("sid-compact")
+    transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
+    assert transformation["compression_strategy"] == "H3_exec_compaction"
+    assert transformation["applied"] is True
+
+
 def test_post_tool_use_dlp_output_matches_claude_schema(monkeypatch, tmp_path, capsys):
     from rclm.hooks import dlp, session_store
 
@@ -1106,8 +1162,92 @@ def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
     assert record.usage_source == "provider"
     assert len(record.messages) == 1
 
-    # Cleanup should have removed the session file.
-    assert session_store.read_events("sid-3") == []
+    # Stop must not clear the session's event log: it fires every turn, not
+    # just at session end, and later turns need SessionStart to still be
+    # there to compute started_at correctly. Only SessionEnd clears it.
+    events = session_store.read_events("sid-3")
+    assert any(e.get("event_type") == "SessionStart" for e in events)
+    assert record.started_at == "2024-01-01T00:00:00Z"
+    assert record.ended_at == "2024-01-01T00:01:00Z"
+
+
+def test_stop_preserves_started_at_across_multiple_turns(monkeypatch, tmp_path):
+    """Regression: Stop fires at the end of every turn, not just session end.
+
+    Previously it wiped the whole event log each time, so turn 2+ could
+    never find SessionStart, fell back to started_at=now(), read that as a
+    near-zero duration, and nulled started_at/ended_at on upload — silently
+    breaking every multi-turn session's stored timestamps.
+    """
+    from rclm._models import ToolCall
+    from rclm.hooks import session_store
+    from rclm.hooks.transcript import TranscriptData
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_store.append_event(
+        "sid-multiturn",
+        {"event_type": "SessionStart", "cwd": "/repo", "timestamp": "2024-01-01T00:00:00Z"},
+    )
+    session_store.append_event("sid-multiturn", {"event_type": "PreToolUse"})
+    session_store.append_event("sid-multiturn", {"event_type": "PostToolUse"})
+
+    uploaded = []
+
+    async def fake_upload_single(record):
+        uploaded.append(record)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda _path: TranscriptData(
+            tool_calls=[
+                ToolCall(
+                    tool_use_id="t1",
+                    tool_name="Read",
+                    tool_input={},
+                    tool_result="x",
+                    timestamp="2024-01-01T00:00:30Z",
+                )
+            ]
+        ),
+    )
+
+    # Turn 1's Stop, well past the zero-duration threshold.
+    _run_handler(
+        "Stop",
+        {
+            "session_id": "sid-multiturn",
+            "transcript_path": "/tmp/fake.jsonl",
+            "timestamp": "2024-01-01T00:01:00Z",
+        },
+        monkeypatch,
+    )
+    # A second turn's tool-use events, then a second Stop moments later —
+    # this second call's own start-to-end gap would be well under the
+    # threshold on its own, so it only stays correct if it still finds the
+    # original SessionStart rather than falling back to now().
+    session_store.append_event("sid-multiturn", {"event_type": "PreToolUse"})
+    session_store.append_event("sid-multiturn", {"event_type": "PostToolUse"})
+    _run_handler(
+        "Stop",
+        {
+            "session_id": "sid-multiturn",
+            "transcript_path": "/tmp/fake.jsonl",
+            "timestamp": "2024-01-01T00:01:05Z",
+        },
+        monkeypatch,
+    )
+
+    assert len(uploaded) == 2
+    second = uploaded[1]
+    assert second.started_at == "2024-01-01T00:00:00Z"
+    assert second.ended_at == "2024-01-01T00:01:05Z"
+
+    # Counters must reflect both turns' events exactly once each, not
+    # double-counted now that the event log persists across turns.
+    health = session_store.read_hook_health("sid-multiturn")
+    assert health["pre_tool_use_count"] == 2
+    assert health["post_tool_use_count"] == 2
 
 
 def test_repeated_read_stop_emits_session_and_per_call_range_savings(monkeypatch, tmp_path, capsys):
@@ -1222,7 +1362,10 @@ def test_stop_records_missing_tool_hook_health_without_retaining_content(
     assert health["post_tool_use_count"] == 0
     assert health["read_cache_enabled"] is True
     assert "super-secret" not in json.dumps(health)
-    assert session_store.read_events("sid-missing-hooks") == []
+    # Stop no longer clears the event log (see above) — the tool result
+    # content it might have carried was never appended to it in the first
+    # place, so there's nothing sensitive retained regardless.
+    assert "super-secret" not in json.dumps(session_store.read_events("sid-missing-hooks"))
     output = json.loads(capsys.readouterr().out)
     assert (
         "Read cache and other tool-level mechanisms were inactive"

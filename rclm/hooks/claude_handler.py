@@ -29,6 +29,7 @@ from rclm.hooks import (
     image_lifecycle,
     read_cache,
     session_store,
+    tool_result_transform,
     transcript,  # noqa: E402
 )
 from rclm.hooks._analytics import (
@@ -248,6 +249,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
                 effective_input,
                 shadow=policy.shadow_for("exec_compaction"),
                 read_offset=read_offset,
+                session_id=session_id,
             )
             if compress_delta:
                 effective_input.update(compress_delta)
@@ -461,6 +463,28 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                     session_store.append_event(session_id, event)
         except Exception:
             logger.exception("range cache failed; passing through tool result")
+
+    if policy.enabled("exec_compaction") and not range_claimed:
+        shadow = policy.shadow_for("exec_compaction")
+        try:
+            transform_input = hook_output.get("updatedToolOutput", tool_response)
+            decision = tool_result_transform.compact_tool_result(
+                tool_name,
+                tool_input,
+                transform_input,
+            )
+            if decision is not None:
+                for event in tool_result_transform.analytics_events(
+                    decision,
+                    tool_use_id=tool_use_id,
+                    applied=not shadow,
+                ):
+                    session_store.append_event(session_id, event)
+                if not shadow:
+                    effective_text = decision.compressed_text
+                    hook_output["updatedToolOutput"] = decision.wire_replacement
+        except Exception:
+            logger.exception("tool-result compaction failed; passing through tool result")
 
     compression = _config.compression_config(cfg)
     if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
@@ -683,15 +707,14 @@ def _handle_stop(
 
     transcript_tool_calls = len(transcript_data.tool_calls)
     previous_hook_health = session_store.read_hook_health(session_id)
-    pre_tool_events = previous_hook_health.get("pre_tool_use_count", 0) + sum(
-        1 for event in events if event.get("event_type") == "PreToolUse"
-    )
-    post_tool_events = previous_hook_health.get("post_tool_use_count", 0) + sum(
-        1 for event in events if event.get("event_type") == "PostToolUse"
-    )
-    tool_failure_events = previous_hook_health.get("tool_failure_count", 0) + sum(
-        1 for event in events if event.get("event_type") == "ToolFailure"
-    )
+    # events now holds the whole session's history (the per-turn log is no
+    # longer wiped between turns), so these are already session-cumulative —
+    # do not add previous_hook_health's counts on top, or turn N+1 would
+    # double-count everything through turn N. previous_hook_health is still
+    # read for its status field (below, for the nudge transition check).
+    pre_tool_events = sum(1 for event in events if event.get("event_type") == "PreToolUse")
+    post_tool_events = sum(1 for event in events if event.get("event_type") == "PostToolUse")
+    tool_failure_events = sum(1 for event in events if event.get("event_type") == "ToolFailure")
     completed_tool_events = post_tool_events + tool_failure_events
     if transcript_tool_calls == 0:
         hook_health_status = "no_tool_calls"
@@ -744,6 +767,10 @@ def _handle_stop(
 
     # Compute analytics from tool calls and file diffs.
     analytics = compute_session_analytics(transcript_data.tool_calls, file_diffs)
+    # events now holds the whole session's history, so this is already the
+    # session-cumulative summary — do not also merge in the separately
+    # persisted mechanism_savings_state, or turn N+1 would double-count
+    # every prior turn's savings on top of themselves.
     turn_mechanism_savings = aggregate_mechanism_savings(events)
     brevity_event = next((ev for ev in events if ev.get("event_type") == "BrevityInjected"), None)
     if brevity_event:
@@ -753,10 +780,7 @@ def _handle_stop(
             "instruction_hash": brevity_event.get("instruction_hash"),
             "instruction_tokens": brevity_event.get("instruction_tokens"),
         }
-    mechanism_savings = merge_mechanism_savings(
-        session_store.read_mechanism_savings_state(session_id),
-        turn_mechanism_savings,
-    )
+    mechanism_savings = merge_mechanism_savings(turn_mechanism_savings)
 
     record = HookSessionRecord(
         session_id=session_id,
@@ -831,7 +855,13 @@ def _handle_stop(
             with contextlib.suppress(OSError):
                 os.unlink(ev["path"])
 
-    session_store.cleanup_events(session_id)
+    # Do NOT clear the session's event log here: Stop fires at the end of
+    # every turn, not just session end, and this log is where SessionStart
+    # (needed above to compute started_at) lives. Wiping it per-turn made
+    # every turn after the first fall back to started_at=now(), read as a
+    # near-zero duration, and null out started_at/ended_at on upload.
+    # Full cleanup (including the event log) happens once, in
+    # _handle_session_end, on the host's actual final session-end event.
 
 
 def _handle_session_end(session_id: str, payload: dict) -> None:

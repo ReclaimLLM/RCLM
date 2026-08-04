@@ -71,6 +71,9 @@ class TestTrackSavings:
         assert events[0]["mechanism"] == "H2_search_shaping"
         assert events[0]["applied"] is True
         assert events[0]["tokens_saved_estimate"] == 900  # (4000-400)//4
+        assert events[0]["raw_chars"] == 4000
+        assert events[0]["compressed_chars"] == 400
+        assert events[0]["token_estimator"] == "chars_div_4_v1"
 
     def test_shadow_applied_false(self, monkeypatch, tmp_path):
         monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
@@ -90,3 +93,13 @@ class TestTrackSavings:
 
         events = session_store.read_events("sid-track-env")
         assert len(events) == 1
+
+    def test_uses_provider_neutral_env_session_id_first(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+        monkeypatch.setenv("RCLM_SESSION_ID", "sid-track-rclm")
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "sid-track-claude")
+
+        track_savings("x" * 400, "x" * 40, "legacy_compress", applied=True)
+
+        assert len(session_store.read_events("sid-track-rclm")) == 1
+        assert session_store.read_events("sid-track-claude") == []

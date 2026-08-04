@@ -109,19 +109,24 @@ def track_savings(
     if mechanism is None:
         return
     if session_id is None:
-        session_id = os.environ.get("CLAUDE_SESSION_ID")
+        session_id = os.environ.get("RCLM_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID")
     if not session_id:
         return
 
     tokens_saved_estimate = max(0, (len(original) - len(compressed)) // 4)
-    append_event(
-        session_id,
-        mechanism_saving_event(
-            mechanism,
-            applied=applied,
-            tokens_saved_estimate=tokens_saved_estimate,
-            measurement_kind="measured",
-            raw_token_estimate=max(0, len(original) // 4),
-            compressed_token_estimate=max(0, len(compressed) // 4),
-        ),
+    event = mechanism_saving_event(
+        mechanism,
+        applied=applied,
+        tokens_saved_estimate=tokens_saved_estimate,
+        measurement_kind="measured",
+        raw_token_estimate=max(0, len(original) // 4),
+        compressed_token_estimate=max(0, len(compressed) // 4),
     )
+    event.update(
+        {
+            "raw_chars": len(original),
+            "compressed_chars": len(compressed),
+            "token_estimator": "chars_div_4_v1",
+        }
+    )
+    append_event(session_id, event)

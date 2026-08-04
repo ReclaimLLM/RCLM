@@ -23,7 +23,7 @@ compatibility: Requires Python 3.10+, pip install rclm, authenticated ReclaimLLM
 
 # ReclaimLLM Memory
 
-ReclaimLLM is an app that adds persistent memory to AI applications. It captures AI sessions from coding agents, browser chat, and proxy traffic, then exposes those captured sessions as searchable memory through the local `rclm-mcp` server. Use it when an agent needs arbitrary memory search, prior implementation context, file history, reusable session context, or cross-agent continuity.
+ReclaimLLM is an app that adds persistent memory to AI applications. It captures AI sessions from coding agents, browser chat, and proxy traffic. For now, the local `rclm-mcp` server exposes only records with `record_type="session"` for search and session operations. Use it when an agent needs coding-session memory search, prior implementation context, file history, reusable session context, or cross-agent continuity.
 
 ## Core Pattern
 
@@ -48,7 +48,7 @@ Every ReclaimLLM memory workflow follows the same pattern: retrieve, reason, and
 - Start broad enough to catch useful memories, then use project or file filters when the prompt gives them.
 - For "which session implemented this?", make one semantic search, choose the most relevant returned source file, then make one filename-history search. Report the likely implementation session and any later sessions that updated that file.
 - Translate relative windows such as "last 3 weeks" into concrete `YYYY-MM-DD` values. `date_from` is inclusive and `date_to` is exclusive; both refer to ingestion time, not session start time.
-- Prefer `record_type="session"` for coding-agent memory. Use `record_type="browser-chat"` for browser conversation memory and `record_type="proxy"` for captured API/proxy traffic when the user asks for those sources.
+- All MCP searches and session operations are currently fixed to `record_type="session"`. The tools do not expose a record-type override; browser-chat and proxy records remain outside the MCP surface for now.
 - Keep `limit` small by default. Increase it only when the user asks for a broader recall pass.
 - Run at most one broad semantic search round before asking for a better clue. Do not repeatedly mutate search terms without user input.
 - Treat ReclaimLLM memory as prior context that may be stale. Verify current behavior in the live repo before making code changes or strong claims.

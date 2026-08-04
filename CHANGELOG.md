@@ -3,6 +3,42 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.24] — 2026-08-03
+
+### Added
+- Added `rclm-mcp` replay tools (`replay_eligibility`, `replay_session`, `replay_corpus`, `replay_compare`) that reproduce the shipped compression mechanisms over captured sessions or a filtered corpus and report real tool-result token reduction — read-only, no model calls, no re-execution of historical commands (`rclm/mcp_server.py`)
+- Added a shared, fail-open tool-result transform core and native Claude Code, Codex, and Cursor adapters for recognized shell-output compaction without requiring gateway traffic (`rclm/hooks/tool_result_transform.py`, provider handlers)
+- Added structured-result preservation, image/error/ambiguity gates, provider contract tests, and recorded-session replay evidence for the expanded token-reduction surface
+- Added provider-neutral session attribution for `rclm-compress` wrappers via `--session-id`/`--encoded-command`, including raw/compressed character telemetry and an explicitly labelled runtime token estimator (`rclm/compress/cli.py`, `rclm/compress/runner.py`)
+- Added native Cursor `PreToolUse`/`PostToolUse`/`SessionStart` handling — shell-input compaction, MCP text-result dedupe, and hook-policy bootstrap/snapshot — replacing the prior generic passthrough recording (`rclm/hooks/cursor_handler.py`)
+
+### Changed
+- Expanded conservative command coverage to POSIX `cat`, `nl`, and `sed`, plus simple PowerShell `Get-Content`; Codex and Cursor now treat exec compaction as supported by their effective hook policy (`rclm/_config.py`, `rclm/hooks/compress.py`)
+- Preserved exact shell command text across wrapper execution by passing URL-safe base64-encoded UTF-8 instead of allowing the outer shell to consume quotes, pipes, or chains
+- Codex `PostToolUse` output replacement now pairs `continue: false` with `decision: block` instead of `decision: block` alone, matching Codex's documented model-visible feedback contract (`rclm/hooks/codex_handler.py`)
+- Codex `PreToolUse`/`PostToolUse` correlation now keys on `tool_use_id`, falling back to the legacy `turn_id` match
+- `--shadow-mode` is now a proper on/off flag (`BooleanOptionalAction`) instead of `store_true`, so `--no-shadow-mode` can return to enforcement; help text updated to describe cross-client compression rather than Claude-only (`rclm/hooks/installer.py`)
+- Removed the `record_type` parameter from `search_sessions`/`search_by_filename`; the MCP surface is fixed to `record_type="session"` and now raises on direct session lookups for any other record type (`rclm/mcp_server.py`)
+- Varied the canned elision/cap/dedupe messages (test-output capping, pytest/JS/Go pass summaries, dedupe pointers) with randomly chosen plain-language phrasings instead of one fixed string each time (`rclm/compress/filters/test.py`, `rclm/hooks/dedupe.py`)
+- `rclm-update` now also refreshes and reports the cached organization hook policy, not just redaction settings (`rclm/update.py`)
+- `bootstrap.policy_snapshot()` now includes schema version, capture client version, and capture provider fields
+
+### Fixed
+- Fixed `Stop` (which fires at the end of every turn, not just session end) wiping the whole session event log each time, so any turn after the first lost `SessionStart` and fell back to `started_at=now()`, corrupting stored duration and start/end timestamps on multi-turn sessions; full cleanup now happens once, in `SessionEnd` (`rclm/hooks/claude_handler.py`)
+- Fixed the same handler double-counting `pre_tool_use`/`post_tool_use`/`tool_failure` counters and mechanism-savings totals across turns, since the event log is now session-cumulative rather than per-turn
+- Fixed `bootstrap.fetch()` treating an explicit `org_hook_policy: null` the same as a missing key, so a user who lost org membership no longer keeps a stale cached policy
+
+### Removed
+- Removed the leftover `rclm-cursor-hooks TEMP event=... payload=...` debug print that logged full hook payloads to stderr on every Cursor hook call (`rclm/hooks/cursor_handler.py`)
+
+### Performance
+- Changed generic repeat-collapse and head/tail compaction to retain bounded line state instead of materializing a second full output-sized line list (`rclm/compress/filters/shell.py`)
+
+### Deps
+- Added `tiktoken>=0.8,<1` as a direct dependency (`pyproject.toml`, `uv.lock`)
+
+---
+
 ## [v0.1.23] — 2026-07-29
 
 ### Added

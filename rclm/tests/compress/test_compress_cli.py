@@ -1,5 +1,6 @@
 """Tests for the rclm-compress CLI entry point, focused on shadow mode."""
 
+import base64
 import json
 
 import pytest
@@ -61,6 +62,69 @@ def test_enforce_mode_prints_compressed_and_records_applied_event(monkeypatch, t
     saving_events = [e for e in events if e.get("event_type") == "MechanismSaving"]
     assert len(saving_events) == 1
     assert saving_events[0]["applied"] is True
+
+
+def test_explicit_session_id_records_non_claude_wrapper_savings(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    commands = []
+
+    def _execute(command):
+        commands.append(command)
+        return "\n".join(f"dir/f{i}.py" for i in range(40)), "", 0
+
+    monkeypatch.setattr("rclm.compress.cli.execute", _execute)
+
+    code = _run(monkeypatch, ["--session-id", "sid-codex", "ls", "-la"])
+
+    assert code == 0
+    assert commands == ["ls -la"]
+    assert "more" in capsys.readouterr().out
+    events = session_store.read_events("sid-codex")
+    assert len(events) == 1
+    assert events[0]["raw_chars"] > events[0]["compressed_chars"]
+    assert events[0]["token_estimator"] == "chars_div_4_v1"
+
+
+def test_session_id_requires_id_and_command(monkeypatch, capsys):
+    code = _run(monkeypatch, ["--session-id", "sid-only"])
+
+    assert code == 1
+    assert "requires an ID and a command" in capsys.readouterr().err
+
+
+def test_session_id_rejects_path_traversal(monkeypatch, capsys):
+    code = _run(monkeypatch, ["--session-id", "../../outside", "ls"])
+
+    assert code == 1
+    assert "invalid --session-id" in capsys.readouterr().err
+
+
+def test_encoded_command_preserves_quotes_pipes_and_chains(monkeypatch, tmp_path):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    command = "printf 'a b' | sed -n '1p' && git status"
+    encoded = base64.urlsafe_b64encode(command.encode()).decode()
+    commands = []
+
+    def _execute(received):
+        commands.append(received)
+        return "ok\n", "", 0
+
+    monkeypatch.setattr("rclm.compress.cli.execute", _execute)
+
+    code = _run(monkeypatch, ["--encoded-command", encoded])
+
+    assert code == 0
+    assert commands == [command]
+
+
+def test_encoded_command_rejects_invalid_payload(monkeypatch, capsys):
+    code = _run(monkeypatch, ["--encoded-command", "not-base64!"])
+
+    assert code == 1
+    assert "invalid --encoded-command" in capsys.readouterr().err
 
 
 def test_no_filter_matched_no_saving_event(monkeypatch, tmp_path, capsys):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -9,6 +10,12 @@ from jsonschema import validate
 
 from rclm._models import HookSessionRecord
 from rclm.hooks import codex_handler, codex_transcript
+
+
+def _wrapped(command: str, session_id: str) -> str:
+    encoded = base64.urlsafe_b64encode(command.encode()).decode()
+    return f"rclm-compress --session-id {session_id} --encoded-command {encoded}"
+
 
 CODEX_POST_TOOL_USE_OUTPUT_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -106,6 +113,92 @@ def _run_handler(event_name: str, payload: dict, monkeypatch) -> None:
     with pytest.raises(SystemExit) as exc_info:
         codex_handler.main()
     assert exc_info.value.code == 0
+
+
+def test_codex_pre_tool_use_rewrites_recognized_shell_input(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"enabled": True}})
+    monkeypatch.setattr("rclm.hooks.compress._compress_available", lambda: True)
+
+    _run_handler(
+        "PreToolUse",
+        {
+            "session_id": "sid-codex-pre",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec_command",
+            "tool_input": {"command": "cat build.log", "yield_time_ms": 1_000},
+            "turn_id": "turn-1",
+        },
+        monkeypatch,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    specific = output["hookSpecificOutput"]
+    assert specific["hookEventName"] == "PreToolUse"
+    assert specific["permissionDecision"] == "allow"
+    assert specific["updatedInput"] == {
+        "command": _wrapped("cat build.log", "sid-codex-pre"),
+        "yield_time_ms": 1_000,
+    }
+
+
+def test_codex_post_tool_use_compacts_recognized_shell_output(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"enabled": True}})
+    monkeypatch.setattr("rclm.hooks.compress._compress_available", lambda: False)
+    _run_handler(
+        "PreToolUse",
+        {
+            "session_id": "sid-codex-post",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec_command",
+            "tool_input": {"command": "cat build.log"},
+            "tool_use_id": "call-1",
+            "turn_id": "turn-1",
+        },
+        monkeypatch,
+    )
+    _run_handler(
+        "PreToolUse",
+        {
+            "session_id": "sid-codex-post",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec_command",
+            "tool_input": {"command": "echo unrelated"},
+            "tool_use_id": "call-2",
+            "turn_id": "turn-1",
+        },
+        monkeypatch,
+    )
+    assert capsys.readouterr().out == ""
+
+    _run_handler(
+        "PostToolUse",
+        {
+            "session_id": "sid-codex-post",
+            "cwd": "/repo",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec_command",
+            "tool_response": "".join(f"line {line}\n" for line in range(100)),
+            "tool_use_id": "call-1",
+            "turn_id": "turn-1",
+        },
+        monkeypatch,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["continue"] is False
+    assert output["decision"] == "block"
+    assert "40 lines omitted" in output["reason"]
+    events = session_store.read_events("sid-codex-post")
+    transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
+    assert transformation["compression_strategy"] == "H3_exec_compaction"
+    assert transformation["applied"] is True
+    assert transformation["raw_chars"] > transformation["compressed_chars"]
 
 
 def test_codex_transcript_parses_messages_tools_and_diffs(tmp_path):
@@ -506,6 +599,7 @@ def test_codex_post_tool_use_dlp_output_matches_codex_schema(monkeypatch, tmp_pa
     parsed = json.loads(output)
     validate(instance=parsed, schema=CODEX_POST_TOOL_USE_OUTPUT_SCHEMA)
 
+    assert parsed["continue"] is False
     assert parsed["decision"] == "block"
     assert parsed["reason"] == "My secret is [REDACTED:PASSWORD]"
     assert "hookSpecificOutput" not in parsed
@@ -568,6 +662,7 @@ def test_codex_post_tool_use_dedupe_blocks_repeated_result(monkeypatch, tmp_path
     output = capsys.readouterr().out.strip()
     parsed = json.loads(output)
     validate(instance=parsed, schema=CODEX_POST_TOOL_USE_OUTPUT_SCHEMA)
+    assert parsed["continue"] is False
     assert parsed["decision"] == "block"
     assert "Identical to the result of `Bash`" in parsed["reason"]
 
@@ -640,6 +735,7 @@ def test_codex_post_tool_use_range_cache_blocks_repeated_read(monkeypatch, tmp_p
 
     output = json.loads(capsys.readouterr().out)
     validate(instance=output, schema=CODEX_POST_TOOL_USE_OUTPUT_SCHEMA)
+    assert output["continue"] is False
     assert output["decision"] == "block"
     assert "[RCLM] Lines 1-80 of source.py unchanged since turn 1." in output["reason"]
     events = session_store.read_events("sid-codex-range")
@@ -778,6 +874,7 @@ def test_codex_bash_pipeline_unaffected_by_mcp_branch(monkeypatch, tmp_path, cap
 
     output = capsys.readouterr().out.strip()
     parsed = json.loads(output)
+    assert parsed["continue"] is False
     assert parsed["decision"] == "block"
     assert "Identical to the result of `Bash`" in parsed["reason"]
 

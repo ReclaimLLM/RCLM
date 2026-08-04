@@ -2390,6 +2390,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "certifi" },
     { name = "mcp" },
+    { name = "tiktoken" },
 ]
 
 [package.optional-dependencies]
@@ -2427,6 +2428,7 @@ requires-dist = [
     { name = "pytest-aiohttp", marker = "extra == 'dev'", specifier = ">=1.1.0,<2.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.3.0,<2.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.9" },
+    { name = "tiktoken", specifier = ">=0.8,<1" },
 ]
 provides-extras = ["dev", "images", "proxy"]
 

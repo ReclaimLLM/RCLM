@@ -6,6 +6,7 @@ Returns an updatedInput dict for Claude Code's hookSpecificOutput, or None.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shlex
@@ -27,6 +28,8 @@ GREP_DEFAULT_OUTPUT_MODE = "count"
 # Commands eligible for rewriting to rclm-compress.
 # Patterns: base command → True (rewrite the full command).
 _BASH_REWRITE_COMMANDS = {
+    "Get-Content",
+    "cat",
     "git",
     "pytest",
     "python",
@@ -38,7 +41,21 @@ _BASH_REWRITE_COMMANDS = {
     "rg",
     "grep",
     "go",
+    "nl",
+    "sed",
 }
+
+
+def is_safe_session_id(value: object) -> bool:
+    """Return whether a session ID is safe as one local filename component."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 200
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and all(ord(char) >= 32 for char in value)
+    )
 
 
 def maybe_compress(
@@ -47,6 +64,7 @@ def maybe_compress(
     *,
     shadow: bool = False,
     read_offset: int | None = None,
+    session_id: str | None = None,
 ) -> dict | None:
     """Return updatedInput dict if compression applies, None otherwise.
 
@@ -61,7 +79,7 @@ def maybe_compress(
     if tool_name == "Grep":
         return None if shadow else _compress_grep(tool_input)
     if tool_name == "Bash":
-        return _compress_bash(tool_input)
+        return _compress_bash(tool_input, session_id=session_id)
     return None
 
 
@@ -104,7 +122,7 @@ def _compress_grep(tool_input: dict) -> dict | None:
     return delta or None
 
 
-def _compress_bash(tool_input: dict) -> dict | None:
+def _compress_bash(tool_input: dict, *, session_id: str | None = None) -> dict | None:
     """Rewrite command to rclm-compress if it matches a known filter."""
     command = tool_input.get("command", "")
     if not command or not command.strip():
@@ -122,28 +140,55 @@ def _compress_bash(tool_input: dict) -> dict | None:
     if not _compress_available():
         return None
 
-    shell = _detect_shell(tool_input)
-    for segment in split_command_segments(command, shell=shell):
+    if is_compressible_command(command, shell=_detect_shell(tool_input)):
+        session_arg = (
+            f" --session-id {shlex.quote(session_id)}" if is_safe_session_id(session_id) else ""
+        )
+        encoded_command = base64.urlsafe_b64encode(command.encode("utf-8")).decode("ascii")
+        return {"command": f"rclm-compress{session_arg} --encoded-command {encoded_command}"}
+
+    return None
+
+
+def is_compressible_command(command: str, *, shell: str = "posix") -> bool:
+    """Return whether a command has a conservative, recognized output shape.
+
+    The same predicate gates PreToolUse command wrapping and PostToolUse
+    fallback compaction. Keeping it here prevents provider handlers from
+    growing subtly different command allowlists.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+
+    posix_shell = _is_posix_shell(shell)
+    if posix_shell:
+        segments = split_command_segments(command, shell=shell)
+    else:
+        # PowerShell is not parsed as POSIX, but simple Get-Content commands
+        # still have a stable text-result shape. Compound PowerShell input is
+        # deliberately left unchanged rather than guessed at.
+        if any(separator in command for separator in (";", "|", "&&", "||")):
+            return False
+        segments = [command]
+
+    for segment in segments:
         base_cmd = extract_base_command(segment)
         if base_cmd not in _BASH_REWRITE_COMMANDS:
             continue
+        if not posix_shell and base_cmd != "Get-Content":
+            continue
 
-        # For python, only rewrite if it's a test command
         if base_cmd == "python" and "-m pytest" not in segment:
             continue
-
-        # For npm/npx, only rewrite test-related commands
         if base_cmd in ("npm", "npx") and not any(
-            kw in segment for kw in ("test", "jest", "vitest")
+            keyword in segment for keyword in ("test", "jest", "vitest")
         ):
             continue
-
         if base_cmd == "go" and not segment.lstrip().startswith("go test"):
             continue
+        return True
 
-        return {"command": f"rclm-compress {command}"}
-
-    return None
+    return False
 
 
 def split_command_segments(command: str, shell: str = "posix") -> list[str]:

@@ -72,7 +72,11 @@ def effective_hook_policy(
     }
     mechanisms: dict[str, dict[str, object]] = {}
     unsupported = {
-        "codex": {"exec_compaction", "test_filter", "image_downscale"},
+        # Current Codex hooks support PreToolUse.updatedInput and model-visible
+        # PostToolUse feedback replacement. Binary image replacement still has
+        # no supported non-text contract.
+        "codex": {"image_downscale"},
+        "cursor": {"image_downscale"},
         "gemini": {"exec_compaction", "test_filter", "image_downscale"},
     }.get(provider or "", set())
     for name, enabled in local_enabled.items():

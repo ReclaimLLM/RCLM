@@ -1,8 +1,8 @@
 """Entry point for rclm-update.
 
-Checks PyPI for the latest rclm version, upgrades via pip if a newer
-version is available, then re-installs hooks for all configured providers so
-any new hook commands take effect immediately.
+Checks PyPI for the latest rclm version, refreshes remote settings, upgrades
+via pip if a newer version is available, then re-installs hooks for all
+configured providers so any new hook commands take effect immediately.
 
 Usage:
     rclm-update          # check and upgrade if needed
@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 
 from rclm import _config
@@ -31,6 +32,25 @@ def _sync_redaction_settings() -> None:
             print("Redaction settings sync skipped or unavailable.")
     except Exception as exc:
         print(f"Redaction settings sync failed: {exc}", file=sys.stderr)
+
+
+def _sync_org_hook_policy() -> None:
+    """Refresh the cached organization hook policy without blocking updates."""
+    try:
+        from rclm.hooks import bootstrap
+
+        result = asyncio.run(bootstrap.fetch("", include_context=False))
+        policy = result.get("org_hook_policy")
+        if isinstance(policy, dict):
+            version = policy.get("policy_version")
+            suffix = f" (v{version})" if isinstance(version, int) else ""
+            print(f"Synced organization hook policy{suffix}.")
+        elif "org_hook_policy" in result:
+            print("No organization hook policy assigned.")
+        else:
+            print("Organization hook policy sync skipped or unavailable.")
+    except Exception as exc:
+        print(f"Organization hook policy sync failed: {exc}", file=sys.stderr)
 
 
 def _parse_flags() -> argparse.Namespace:
@@ -71,6 +91,7 @@ def main() -> None:
     print("Checking for updates...")
     latest = check_for_update(force=True)
     _sync_redaction_settings()
+    _sync_org_hook_policy()
 
     if latest is None:
         print(f"rclm is up to date ({current}).")

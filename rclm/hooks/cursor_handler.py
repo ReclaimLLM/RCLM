@@ -10,6 +10,7 @@ Cursor hook events are registered in _HANDLERS below.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
 import logging
@@ -17,9 +18,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import upload_single
-from rclm.hooks import cursor_transcript, session_store
+from rclm.hooks import bootstrap, cursor_transcript, dedupe, session_store, tool_result_transform
+from rclm.hooks._analytics import aggregate_mechanism_savings
+from rclm.hooks.compress import maybe_compress
 from rclm.hooks.cursor_transcript import _clean_user_text
 
 logger = logging.getLogger(__name__)
@@ -103,6 +107,29 @@ def _handle_before_submit_prompt(session_id: str, payload: dict) -> None:
     )
 
 
+def _handle_session_start(session_id: str, payload: dict) -> None:
+    cwd = payload.get("cwd", "")
+    session_store.append_event(
+        session_id,
+        {
+            "event_type": "SessionStart",
+            "cwd": cwd,
+            "timestamp": payload.get("timestamp", _now()),
+        },
+    )
+    with contextlib.suppress(Exception):
+        asyncio.run(
+            asyncio.wait_for(
+                bootstrap.fetch(cwd, include_context=False),
+                3.0,
+            )
+        )
+    session_store.append_event(
+        session_id,
+        {"event_type": "HookPolicySnapshot", "policy": bootstrap.policy_snapshot("cursor")},
+    )
+
+
 def _handle_before_shell_execution(session_id: str, payload: dict) -> None:
     session_store.append_event(
         session_id,
@@ -113,6 +140,110 @@ def _handle_before_shell_execution(session_id: str, payload: dict) -> None:
             "timestamp": payload.get("timestamp", _now()),
         },
     )
+
+
+def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
+    """Record a generic tool call and rewrite supported input when Cursor allows it."""
+    tool_name = payload.get("tool_name") or ""
+    tool_input = payload.get("tool_input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    session_store.append_event(
+        session_id,
+        {
+            "event_type": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "tool_use_id": payload.get("tool_use_id"),
+            "timestamp": payload.get("timestamp", _now()),
+        },
+    )
+
+    cfg = _config.load()
+    policy = _config.effective_hook_policy(cfg, provider="cursor")
+    if not policy.enabled("exec_compaction"):
+        return
+
+    try:
+        compression_tool = "Bash" if tool_name.lower() in {"shell", "bash"} else tool_name
+        delta = maybe_compress(
+            compression_tool,
+            tool_input,
+            shadow=policy.shadow_for("exec_compaction"),
+            session_id=None if session_id == "unknown" else session_id,
+        )
+        if delta:
+            print(json.dumps({"updated_input": {**tool_input, **delta}}))
+    except Exception:
+        logger.exception("Cursor input compaction failed; passing through tool input")
+
+
+def _handle_post_tool_use(session_id: str, payload: dict) -> None:
+    """Record a result and deduplicate MCP text through Cursor's replacement field."""
+    tool_name = payload.get("tool_name") or ""
+    tool_input = payload.get("tool_input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    tool_output = payload.get("tool_output")
+    prior_events = session_store.read_events(session_id)
+    session_store.append_event(
+        session_id,
+        {
+            "event_type": "PostToolUse",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "tool_response": tool_output,
+            "tool_use_id": payload.get("tool_use_id"),
+            "timestamp": payload.get("timestamp", _now()),
+        },
+    )
+
+    # Cursor documents updated_mcp_tool_output for MCP tools only. Shell and
+    # native-tool compaction therefore happens in PreToolUse, not by assuming
+    # the contradictory Shell example supports post-result replacement.
+    is_mcp = tool_name.startswith("MCP:") or tool_name.startswith("mcp__")
+    if not is_mcp:
+        return
+
+    cfg = _config.load()
+    policy = _config.effective_hook_policy(cfg, provider="cursor")
+    compression = _config.compression_config(cfg)
+    if not policy.enabled("hash_dedupe") or not compression["dedupe"]:
+        return
+
+    envelope = tool_result_transform.extract_text_envelope(tool_output)
+    if envelope is None:
+        return
+    try:
+        state = session_store.read_dedupe_state(session_id)
+        turn = sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
+        replacement, state, match = dedupe.maybe_dedupe(
+            envelope.text,
+            state,
+            tool_name=tool_name,
+            turn=turn,
+            cwd=_resolve_cwd(session_id, payload),
+            min_chars=int(compression["min_dedupe_chars"]),
+        )
+        session_store.write_dedupe_state(session_id, state)
+        if not replacement or match is None:
+            return
+        decision = tool_result_transform.decision_from_replacement(
+            envelope,
+            replacement,
+            mechanism="hash_dedupe",
+        )
+        if decision is None or not isinstance(decision.structured_replacement, dict):
+            return
+        shadow = policy.shadow_for("hash_dedupe")
+        for event in tool_result_transform.analytics_events(
+            decision,
+            tool_use_id=payload.get("tool_use_id"),
+            applied=not shadow,
+        ):
+            session_store.append_event(session_id, event)
+        if not shadow:
+            print(json.dumps({"updated_mcp_tool_output": decision.structured_replacement}))
+    except Exception:
+        logger.exception("Cursor MCP dedupe failed; passing through tool output")
 
 
 def _unified_diff(path: str, before: str | None, after: str | None) -> str:
@@ -267,6 +398,8 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     if transcript_data and transcript_data.cwd:
         cwd = cwd or transcript_data.cwd
     event_file_diffs = _extract_file_diffs_from_events(events)
+    mechanism_savings = aggregate_mechanism_savings(events)
+    hook_policy_snapshot = bootstrap.policy_snapshot_from_events(events, "cursor")
 
     # Reconstruct the session record.
     started_at = events[0].get("timestamp", now) if events else now
@@ -294,6 +427,8 @@ def _handle_stop(session_id: str, payload: dict) -> None:
             file_diffs=_merge_file_diffs(event_file_diffs, transcript_data.file_diffs),
             total_input_tokens=transcript_data.total_input_tokens,
             total_output_tokens=transcript_data.total_output_tokens,
+            mechanism_savings=mechanism_savings,
+            hook_policy_snapshot=hook_policy_snapshot,
         )
     else:
         # Fallback to accumulated events
@@ -308,6 +443,8 @@ def _handle_stop(session_id: str, payload: dict) -> None:
             messages=_build_messages_from_events(events),
             tool_calls=_build_tool_calls_from_events(events),
             file_diffs=event_file_diffs,
+            mechanism_savings=mechanism_savings,
+            hook_policy_snapshot=hook_policy_snapshot,
         )
 
     asyncio.run(upload_single(record))
@@ -315,8 +452,8 @@ def _handle_stop(session_id: str, payload: dict) -> None:
 
 
 _HANDLERS = {
-    "preToolUse": _handle_generic_event("preToolUse"),
-    "postToolUse": _handle_generic_event("postToolUse"),
+    "preToolUse": _handle_pre_tool_use,
+    "postToolUse": _handle_post_tool_use,
     "postToolUseFailure": _handle_generic_event("postToolUseFailure"),
     "subagentStart": _handle_generic_event("subagentStart"),
     "subagentStop": _handle_generic_event("subagentStop"),
@@ -332,7 +469,7 @@ _HANDLERS = {
     "afterAgentResponse": _handle_generic_event("afterAgentResponse"),
     "afterAgentThought": _handle_generic_event("afterAgentThought"),
     "stop": _handle_stop,
-    "sessionStart": _handle_generic_event("sessionStart"),
+    "sessionStart": _handle_session_start,
     "sessionEnd": _handle_stop,
     "preCompact": _handle_generic_event("preCompact"),
 }
@@ -357,11 +494,6 @@ def main() -> None:
             event_name,
         )
         sys.exit(0)
-
-    print(
-        f"rclm-cursor-hooks TEMP event={event_name} payload={json.dumps(payload, default=str)}",
-        file=sys.stderr,
-    )
 
     # Cursor uses conversation_id or generation_id. We'll prefer conversation_id as session_id.
     session_id = (

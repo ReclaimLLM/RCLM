@@ -14,7 +14,7 @@ Usage:
     rclm-hooks-install --openclaw                 # OpenClaw only, global
     rclm-hooks-install --claude --codex           # Claude + Codex, global
     rclm-hooks-install --api-key=<key>            # explicit key (skips browser)
-    rclm-hooks-install --no-compress               # disable compression (Claude only)
+    rclm-hooks-install --no-compress               # disable cross-client text compression
     rclm-hooks-install --no-with-mcp               # skip installing ReclaimLLM MCP server
     rclm-hooks-install --no-statusline             # skip the Claude Code statusline
     rclm-hooks-install --no-handoff-advisor        # skip Claude handoff suggestions
@@ -186,7 +186,7 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --claude --cursor         # Claude Code + Cursor
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
   %(prog)s --include-folder=/repo   # only upload sessions from this folder
-  %(prog)s --no-compress            # disable compression for Claude Code
+  %(prog)s --no-compress            # disable cross-client text compression
   %(prog)s --no-with-mcp            # skip registering the ReclaimLLM MCP server
   %(prog)s --no-statusline          # skip the Claude Code statusline
   %(prog)s --no-handoff-advisor     # skip Claude handoff suggestions
@@ -259,15 +259,18 @@ Subsequent installs without --api-key reuse the saved config.""",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Context compression for Claude Code (rewrites Bash/Read/Grep inputs to reduce "
-            "tokens). On by default; pass --no-compress to disable"
+            "Native-hook context compression for Claude Code, Codex, and Cursor. On by "
+            "default; pass --no-compress to disable"
         ),
     )
     parser.add_argument(
         "--dedupe",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Deduplicate identical large Claude Code tool results. Off by default; pass --dedupe to enable",
+        help=(
+            "Deduplicate supported identical large tool results. Off by default; pass "
+            "--dedupe to enable"
+        ),
     )
     parser.add_argument(
         "--dlp",
@@ -358,11 +361,12 @@ Subsequent installs without --api-key reuse the saved config.""",
     )
     parser.add_argument(
         "--shadow-mode",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Shadow mode (Claude only): compress/read-cache/loop-breaker still detect and "
-            "measure savings, but don't rewrite anything — use to see estimated impact before "
-            "enabling enforcement"
+            "Shadow mode: supported mechanisms still detect and measure savings but do not "
+            "rewrite model-visible input or output. Pass --no-shadow-mode to return to "
+            "enforcement"
         ),
     )
 
@@ -756,7 +760,9 @@ def main() -> None:
         TOOL_CALL_THRESHOLD_KEY,
         DEFAULT_TOOL_CALL_THRESHOLD,
     )
-    shadow_mode_enabled = args.shadow_mode or saved.get("shadow_mode", False)
+    shadow_mode_enabled = (
+        args.shadow_mode if args.shadow_mode is not None else saved.get("shadow_mode", False)
+    )
     image_lifecycle_enabled = args.image_lifecycle or saved.get("image_lifecycle", False)
     image_max_dim = (
         args.image_max_dim

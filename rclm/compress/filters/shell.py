@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections import deque
+from collections.abc import Iterator
+from io import StringIO
 
 # CSI sequences (colors, cursor movement) and OSC sequences (terminal titles).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -45,18 +48,52 @@ def filter_generic(output: str) -> str | None:
     Collapses repeated lines, then caps to head+tail if still large. Returns
     None if the output is already small enough that no shaping is needed.
     """
-    lines = output.splitlines()
-    if len(lines) <= _GENERIC_MAX_LINES:
+    raw_line_count = 0
+    collapsed_count = 0
+    head: list[str] = []
+    tail: deque[str] = deque(maxlen=_GENERIC_TAIL)
+
+    for line, run_length in _iter_runs(output):
+        raw_line_count += run_length
+        collapsed_lines = [line]
+        if run_length >= _MIN_REPEAT_RUN:
+            collapsed_lines.append(f"... (repeated {run_length - 1} more times)")
+        else:
+            collapsed_lines.extend([line] * (run_length - 1))
+
+        for collapsed_line in collapsed_lines:
+            collapsed_count += 1
+            if len(head) < _GENERIC_HEAD:
+                head.append(collapsed_line)
+            else:
+                tail.append(collapsed_line)
+
+    if raw_line_count <= _GENERIC_MAX_LINES:
         return None
+    if collapsed_count <= _GENERIC_MAX_LINES:
+        return "\n".join([*head, *tail])
 
-    collapsed = collapse_repeats(lines)
-    if len(collapsed) <= _GENERIC_MAX_LINES:
-        return "\n".join(collapsed)
+    omitted = collapsed_count - _GENERIC_HEAD - _GENERIC_TAIL
+    return "\n".join([*head, f"... ({omitted} lines omitted) ...", *tail])
 
-    head_lines = collapsed[:_GENERIC_HEAD]
-    tail_lines = collapsed[-_GENERIC_TAIL:]
-    omitted = len(collapsed) - _GENERIC_HEAD - _GENERIC_TAIL
-    return "\n".join([*head_lines, f"... ({omitted} lines omitted) ...", *tail_lines])
+
+def _iter_runs(output: str) -> Iterator[tuple[str, int]]:
+    """Yield consecutive line runs without materializing the full output."""
+    previous: str | None = None
+    run_length = 0
+    for raw_line in StringIO(output, newline=None):
+        line = raw_line.rstrip("\r\n")
+        if previous is None:
+            previous = line
+            run_length = 1
+        elif line == previous:
+            run_length += 1
+        else:
+            yield previous, run_length
+            previous = line
+            run_length = 1
+    if previous is not None:
+        yield previous, run_length
 
 
 def filter_shell(command: str, output: str) -> str | None:

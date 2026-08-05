@@ -1,17 +1,21 @@
-"""Merge rclm hooks into Claude Code, Gemini CLI, Codex CLI, and/or OpenClaw settings.
+"""Merge rclm hooks into Claude Code, Gemini CLI, Codex CLI, Cursor, OpenClaw,
+and/or Antigravity settings.
 
 Installs globally (home directory) by default. Pass --local to install into
 the current project directory instead.
 
-When no provider flag is given, all providers are installed.
+When no provider flag is given, Claude Code, Gemini CLI, Codex CLI, Cursor,
+and Antigravity are installed. OpenClaw is opt-in only — pass --openclaw
+explicitly.
 
 Usage:
-    rclm-hooks-install                            # all providers, global
+    rclm-hooks-install                            # default providers, global
     rclm-hooks-install --local                    # file-based providers, current dir
     rclm-hooks-install --claude                   # Claude Code only, global
     rclm-hooks-install --gemini                   # Gemini CLI only, global
     rclm-hooks-install --codex                    # Codex CLI only, global
-    rclm-hooks-install --openclaw                 # OpenClaw only, global
+    rclm-hooks-install --openclaw                 # OpenClaw only, global (opt-in)
+    rclm-hooks-install --antigravity              # Antigravity only, global
     rclm-hooks-install --claude --codex           # Claude + Codex, global
     rclm-hooks-install --api-key=<key>            # explicit key (skips browser)
     rclm-hooks-install --no-compress               # disable cross-client text compression
@@ -166,6 +170,25 @@ _CURSOR_HOOKS_TO_INJECT: dict[str, list[dict]] = {
     "preCompact": [{"command": "rclm-cursor-hooks preCompact"}],
 }
 
+# Antigravity hooks.json format: {"<hook-name>": {"<EventName>": [entries]}} --
+# keyed by an arbitrary hook name we choose, not by event name (unlike Claude/
+# Codex/Gemini). Stop is the only event registered: Antigravity's PreToolUse/
+# PostToolUse have no channel to mutate tool input or redact output, so none
+# of rclm's active mechanisms apply there, and the full session is already
+# recoverable from transcript.jsonl at Stop. See antigravity_handler.py.
+#
+# Stop/PreInvocation/PostInvocation entries are a *flat* list of handler
+# objects ({"type": ..., "command": ...} directly) -- unlike PreToolUse/
+# PostToolUse, which are matcher-scoped groups ({"matcher": ..., "hooks": [...]}).
+# Confirmed against the installed CLI's own docs
+# (~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/hooks.md).
+_ANTIGRAVITY_HOOK_NAME = "rclm-antigravity-hooks"
+_ANTIGRAVITY_HOOKS_TO_INJECT: dict = {
+    _ANTIGRAVITY_HOOK_NAME: {
+        "Stop": [{"type": "command", "command": "rclm-antigravity-hooks Stop"}],
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -173,16 +196,17 @@ _CURSOR_HOOKS_TO_INJECT: dict[str, list[dict]] = {
 
 def _parse_flags() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Install rclm hooks (all providers by default, global by default)",
+        description="Install rclm hooks (default providers, global by default)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  %(prog)s                          # all providers, global (~/.claude, ~/.gemini, ~/.codex, ~/.openclaw, ~/.cursor)
+  %(prog)s                          # default providers, global (~/.claude, ~/.gemini, ~/.codex, ~/.cursor, ~/.gemini/config)
   %(prog)s --local                  # file-based providers, current project directory
   %(prog)s --claude                 # Claude Code only
   %(prog)s --gemini                   # Gemini CLI only
   %(prog)s --codex                  # Codex CLI only
   %(prog)s --cursor                 # Cursor only
-  %(prog)s --openclaw               # OpenClaw only
+  %(prog)s --openclaw               # OpenClaw only (opt-in, not installed by default)
+  %(prog)s --antigravity            # Antigravity only
   %(prog)s --claude --cursor         # Claude Code + Cursor
   %(prog)s --api-key=<key>          # explicit key (skips browser prompt)
   %(prog)s --include-folder=/repo   # only upload sessions from this folder
@@ -219,6 +243,11 @@ Subsequent installs without --api-key reuse the saved config.""",
         "--openclaw",
         action="store_true",
         help="Install plugin hooks for OpenClaw",
+    )
+    parser.add_argument(
+        "--antigravity",
+        action="store_true",
+        help="Install hooks for Antigravity (capture-only)",
     )
     parser.add_argument(
         "--local",
@@ -417,7 +446,13 @@ def _is_rclm_command(command: str) -> bool:
     if not command:
         return False
     # More robust check that handles spaces in paths by looking for the known binary names.
-    for name in ["rclm-claude-hooks", "rclm-gemini-hooks", "rclm-codex-hooks", "rclm-cursor-hooks"]:
+    for name in [
+        "rclm-claude-hooks",
+        "rclm-gemini-hooks",
+        "rclm-codex-hooks",
+        "rclm-cursor-hooks",
+        "rclm-antigravity-hooks",
+    ]:
         if name in command:
             return True
     return False
@@ -458,6 +493,22 @@ def _merge_settings_hooks(settings: dict, hooks_to_inject: dict) -> dict:
     hooks_section: dict = settings.setdefault("hooks", {})
     for event_name, new_entries in hooks_to_inject.items():
         existing_entries: list[dict] = hooks_section.setdefault(event_name, [])
+
+        # Drop rclm entries at a matcher this event no longer ships (e.g. a
+        # past version registered PreToolUse under "Bash" and a later one
+        # widened it to ""). Without this, changing a matcher across
+        # versions orphans the old entry instead of replacing it — it never
+        # matches the new matcher below, so it survives every reinstall as
+        # a permanent duplicate. Non-rclm entries (the user's own hooks) are
+        # left untouched regardless of matcher.
+        current_matchers = {entry.get("matcher", "") for entry in new_entries}
+        existing_entries[:] = [
+            entry
+            for entry in existing_entries
+            if entry.get("matcher", "") in current_matchers
+            or not any(_is_rclm_command(h.get("command", "")) for h in entry.get("hooks", []))
+        ]
+
         for new_entry in new_entries:
             matcher = new_entry.get("matcher", "")
             # Assume each rclm entry has exactly one hook in the list based on definitions above.
@@ -486,6 +537,18 @@ def _merge_settings_hooks(settings: dict, hooks_to_inject: dict) -> dict:
                 # Add new if none existed
                 existing_entries.append(new_entry)
     return settings
+
+
+def _merge_antigravity_hooks(data: dict, hooks_to_inject: dict) -> dict:
+    """Merge hooks into an Antigravity hooks.json dict.
+
+    The file is keyed by an arbitrary hook name (not by event), so rclm owns
+    exactly the _ANTIGRAVITY_HOOK_NAME key outright -- no matcher/duplicate
+    scanning needed, unlike the Claude/Codex/Gemini merge above. Any other
+    hook names the user has configured are left untouched.
+    """
+    data.update(hooks_to_inject)
+    return data
 
 
 def _merge_cursor_hooks(data: dict, hooks_to_inject: dict) -> dict:
@@ -616,6 +679,34 @@ def _install_cursor(use_global: bool) -> None:
     print(f"rclm hooks installed into {path}")
 
 
+def _install_antigravity(use_global: bool) -> None:
+    # ~/.gemini/config/ is the customization root directory's global location
+    # (see ~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/
+    # json_configs.md); .agents/ is its per-workspace equivalent. hooks.json
+    # follows the same root, same as skills.json/plugins.json.
+    path = (
+        Path.home() / ".gemini" / "config" / "hooks.json"
+        if use_global
+        else Path(".agents") / "hooks.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    binary_name = "rclm-antigravity-hooks"
+    binary = _resolve_binary(binary_name)
+    hooks = copy.deepcopy(_ANTIGRAVITY_HOOKS_TO_INJECT)
+    if binary != binary_name:
+        for entries in hooks[_ANTIGRAVITY_HOOK_NAME].values():
+            for handler in entries:
+                cmd = handler.get("command", "")
+                if cmd == binary_name or cmd.startswith(binary_name + " "):
+                    handler["command"] = binary + cmd[len(binary_name) :]
+
+    data = _load_json(path)
+    _merge_antigravity_hooks(data, hooks)
+    _write_json(path, data)
+    print(f"rclm hooks installed into {path}")
+
+
 def _install_openclaw(use_global: bool) -> None:
     if not use_global:
         print(
@@ -703,20 +794,15 @@ def _redaction_config_with_folder_filters(
 def main() -> None:
     args = _parse_flags()
 
-    # Determine which providers to install. --local defaults to file-based providers.
-    providers = [p for p in ("claude", "gemini", "codex", "cursor", "openclaw") if getattr(args, p)]
+    # Determine which providers to install. openclaw is opt-in only
+    # (--openclaw) for both --local and global default installs.
+    providers = [
+        p
+        for p in ("claude", "gemini", "codex", "cursor", "openclaw", "antigravity")
+        if getattr(args, p)
+    ]
     if not providers:
-        providers = (
-            ["claude", "gemini", "codex", "cursor"]
-            if args.local
-            else [
-                "claude",
-                "gemini",
-                "codex",
-                "cursor",
-                "openclaw",
-            ]
-        )
+        providers = ["claude", "gemini", "codex", "cursor", "antigravity"]
 
     use_global = not args.local
 
@@ -826,6 +912,8 @@ def main() -> None:
             _install_cursor(use_global)
         elif provider == "openclaw":
             _install_openclaw(use_global)
+        elif provider == "antigravity":
+            _install_antigravity(use_global)
 
     if args.with_mcp:
         try:

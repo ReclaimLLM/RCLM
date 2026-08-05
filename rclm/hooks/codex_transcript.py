@@ -225,7 +225,12 @@ def _extract_response_message(
     seen_messages: set[tuple[str, str, str]],
 ) -> None:
     role = payload.get("role")
-    if role not in {"user", "assistant"}:
+    # "developer" carries real content (injected AGENTS.md/memory/multi-agent
+    # instructions, the Responses API's successor to "system"). Capture it
+    # alongside user/assistant rather than silently dropping it -- an
+    # allowlist rather than a blanket exclusion, so an unaudited/internal
+    # role type doesn't get captured by accident.
+    if role not in {"user", "assistant", "developer", "system"}:
         return
 
     parts = payload.get("content") or []

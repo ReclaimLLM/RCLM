@@ -236,6 +236,28 @@ def test_stop_uploads_record(mock_upload, monkeypatch, tmp_path):
     assert len(session_store.read_events(session_id)) == 0
 
 
+@patch("rclm.hooks.cursor_handler.close_session")
+@patch("rclm.hooks.cursor_handler.upload_single")
+def test_stop_closes_uploader_session(mock_upload, mock_close, monkeypatch, tmp_path):
+    """Regression test: Stop must close the module-level aiohttp session in
+    the same event loop it uploaded on, or aiohttp emits "Unclosed client
+    session"/"Unclosed connector" ResourceWarnings to stderr on every Stop
+    (confirmed via a real subprocess repro against a live session
+    transcript -- see close_session's docstring in _uploader.py)."""
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    mock_upload.return_value = MagicMock()
+    mock_close.return_value = MagicMock()
+
+    payload = {
+        "conversation_id": "conv-close",
+        "cwd": "/test/dir",
+        "timestamp": "2024-01-01T00:00:10Z",
+    }
+    _run_handler("stop", payload, monkeypatch)
+
+    assert mock_close.called
+
+
 def test_resolve_transcript_path(tmp_path):
     # Setup mock home and projects dir
     mock_home = tmp_path / "home"

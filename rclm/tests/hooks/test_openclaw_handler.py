@@ -134,6 +134,44 @@ def test_llm_and_tool_events_build_uploaded_record(monkeypatch):
     assert session_store.read_events("oc-sid-2") == []
 
 
+def test_session_end_closes_uploader_session(monkeypatch):
+    """Regression test: session_end must close the module-level aiohttp
+    session in the same event loop it uploaded on, or aiohttp emits
+    "Unclosed client session"/"Unclosed connector" ResourceWarnings to
+    stderr on every invocation (confirmed via a real subprocess repro
+    against a live session transcript -- see close_session's docstring in
+    _uploader.py)."""
+    closed = []
+
+    async def fake_upload(record, *, max_retries=3):
+        pass
+
+    async def fake_close_session():
+        closed.append(True)
+
+    monkeypatch.setattr(openclaw_handler, "upload_single", fake_upload)
+    monkeypatch.setattr(openclaw_handler, "close_session", fake_close_session)
+
+    _run_handler(
+        "session_start",
+        {
+            "received_at": "2026-04-27T00:00:00+00:00",
+            "event": {"sessionKey": "oc-sid-close", "context": {"workspaceDir": "/work"}},
+        },
+        monkeypatch,
+    )
+    _run_handler(
+        "session_end",
+        {
+            "received_at": "2026-04-27T00:01:00+00:00",
+            "event": {"sessionKey": "oc-sid-close"},
+        },
+        monkeypatch,
+    )
+
+    assert closed == [True]
+
+
 def test_unknown_event_exits_zero(monkeypatch):
     _run_handler("unknown_hook", {"event": {"sessionKey": "oc-sid-3"}}, monkeypatch)
 

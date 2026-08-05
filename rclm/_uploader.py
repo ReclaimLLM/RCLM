@@ -12,7 +12,7 @@ from pathlib import Path
 
 import aiohttp
 
-from rclm import _config
+from rclm import _config, auth
 from rclm._endpoints import INGEST_PATH
 from rclm._http import create_tcp_connector
 from rclm._models import (
@@ -60,20 +60,17 @@ async def upload(
         logger.info("rclm upload skipped by local redaction folder filters")
         return
 
-    base = cfg.get("server_url")
-    if not base:
+    creds = _config.resolve_credentials(cfg)
+    if creds is None:
+        print(f"rclm: {auth.AUTH_REQUIRED_MESSAGE}", file=sys.stderr)
         _quarantine(record)
         return
-    url = base.rstrip("/") + INGEST_PATH
+    url = creds.server_url + INGEST_PATH
     # if len(record.messages) == 0:
     #     logger.warning("Record has empty messages; skipping upload")
     #     return
     payload = _to_redacted_json(record, redaction_settings)
-    headers = {"Content-Type": "application/json"}
-    # get from config first, then environment
-    api_key = cfg.get("api_key")
-    if api_key:
-        headers["X-API-Key"] = api_key
+    headers = {"Content-Type": "application/json", "X-API-Key": creds.api_key}
 
     delays = _RETRY_DELAYS[:max_retries]
     for attempt, delay in enumerate(delays, start=1):

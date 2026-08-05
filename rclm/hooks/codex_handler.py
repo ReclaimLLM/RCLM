@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 
 from rclm import _config
 from rclm._models import HookSessionRecord, ToolCall
-from rclm._uploader import upload_single
+from rclm._uploader import close_session, upload_single
 from rclm.hooks import (
     bootstrap,
     codex_transcript,
@@ -561,6 +561,16 @@ def _attach_transformations(
         cursor = match_index + 1
 
 
+async def _upload_and_close(record: HookSessionRecord) -> None:
+    """upload_single, then close the module-level aiohttp session before this
+    asyncio.run() call's event loop is torn down -- see claude_handler's
+    identical helper for why (aiohttp session/loop binding)."""
+    try:
+        await upload_single(record)
+    finally:
+        await close_session()
+
+
 def _handle_stop(session_id: str, payload: dict) -> None:
     now = _now()
     events = session_store.read_events(session_id)
@@ -623,7 +633,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "codex"),
     )
 
-    asyncio.run(upload_single(record))
+    asyncio.run(_upload_and_close(record))
     schedule_session_end_update()
     session_store.cleanup(session_id)
 

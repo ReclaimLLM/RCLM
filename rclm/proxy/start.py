@@ -36,12 +36,12 @@ def cmd_setup() -> None:
     cfg = _config.load()
 
     # Server URL
-    current_url = os.environ.get("RECLAIMLLM_SERVER_URL") or cfg.get("server_url", "")
+    current_url = _config.resolved_server_url(cfg)
     url_hint = f" [{current_url}]" if current_url else ""
     server_url = input(f"ReclaimLLM server URL{url_hint}: ").strip() or current_url
 
     # API key
-    current_key = os.environ.get("RECLAIMLLM_API_KEY") or cfg.get("api_key", "")
+    current_key = _config.resolved_api_key(cfg)
     key_hint = " [********]" if current_key else ""
     api_key = getpass.getpass(f"ReclaimLLM API key{key_hint}: ").strip() or current_key
 

@@ -452,6 +452,33 @@ def test_session_end_schedules_update_after_upload(monkeypatch, tmp_path):
     assert calls == ["upload", "schedule"]
 
 
+def test_session_end_closes_uploader_session(monkeypatch, tmp_path):
+    """Regression test: SessionEnd must close the module-level aiohttp session
+    in the same event loop it uploaded on, or aiohttp emits "Unclosed client
+    session"/"Unclosed connector" ResourceWarnings to stderr on every
+    invocation (confirmed via a real subprocess repro against a live session
+    transcript -- see close_session's docstring in _uploader.py)."""
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    closed = []
+
+    async def fake_upload(_record):
+        pass
+
+    async def fake_close_session():
+        closed.append(True)
+
+    monkeypatch.setattr("rclm.hooks.gemini_handler.upload_single", fake_upload)
+    monkeypatch.setattr("rclm.hooks.gemini_handler.close_session", fake_close_session)
+
+    _run_handler(
+        "SessionEnd",
+        {"session_id": "gsid-close", "timestamp": "2024-01-01T00:01:00Z"},
+        monkeypatch,
+    )
+
+    assert closed == [True]
+
+
 # ---------------------------------------------------------------------------
 # SessionEnd — file diff extraction
 # ---------------------------------------------------------------------------

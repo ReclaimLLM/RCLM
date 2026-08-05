@@ -20,7 +20,7 @@ from pathlib import Path
 
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
-from rclm._uploader import upload_single
+from rclm._uploader import close_session, upload_single
 from rclm.hooks import bootstrap, cursor_transcript, dedupe, session_store, tool_result_transform
 from rclm.hooks._analytics import aggregate_mechanism_savings
 from rclm.hooks.compress import maybe_compress
@@ -383,6 +383,16 @@ def _build_messages_from_events(events: list[dict]) -> list[dict]:
     return messages
 
 
+async def _upload_and_close(record: HookSessionRecord) -> None:
+    """upload_single, then close the module-level aiohttp session before this
+    asyncio.run() call's event loop is torn down -- see claude_handler's
+    identical helper for why (aiohttp session/loop binding)."""
+    try:
+        await upload_single(record)
+    finally:
+        await close_session()
+
+
 def _handle_stop(session_id: str, payload: dict) -> None:
     now = _now()
     events = session_store.read_events(session_id)
@@ -447,7 +457,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
             hook_policy_snapshot=hook_policy_snapshot,
         )
 
-    asyncio.run(upload_single(record))
+    asyncio.run(_upload_and_close(record))
     session_store.cleanup(session_id)
 
 

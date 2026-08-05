@@ -258,6 +258,32 @@ def _stub_transcript(monkeypatch, *, total_input_tokens, total_output_tokens, to
     )
 
 
+def test_stop_closes_uploader_session(monkeypatch, tmp_path):
+    """Regression test: Stop must close the module-level aiohttp session in
+    the same event loop it uploaded on, or aiohttp emits "Unclosed client
+    session"/"Unclosed connector" ResourceWarnings to stderr on every single
+    Stop invocation (confirmed via a real subprocess repro against a live
+    session transcript -- see close_session's docstring in _uploader.py)."""
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
+    closed = []
+
+    async def _fake_close_session():
+        closed.append(True)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.close_session", _fake_close_session)
+    _stub_transcript(monkeypatch, total_input_tokens=10, total_output_tokens=10, tool_call_count=1)
+
+    payload = {"session_id": "sid-close1", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
+    _run_handler("Stop", payload, monkeypatch)
+
+    assert closed == [True]
+
+
 def test_handoff_advisor_off_by_default(monkeypatch, tmp_path, capsys):
     from rclm import _config
     from rclm.hooks import session_store

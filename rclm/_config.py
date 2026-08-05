@@ -7,6 +7,7 @@ Env vars RECLAIMLLM_SERVER_URL / RECLAIMLLM_API_KEY always take precedence.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,6 +117,41 @@ def load() -> dict:
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
+
+
+def resolved_server_url(cfg: dict | None = None) -> str:
+    """Resolve the server URL: RECLAIMLLM_SERVER_URL env var, else config.json."""
+    cfg = cfg if cfg is not None else load()
+    value = (os.environ.get("RECLAIMLLM_SERVER_URL") or cfg.get("server_url") or "").strip()
+    return value.rstrip("/")
+
+
+def resolved_api_key(cfg: dict | None = None) -> str:
+    """Resolve the API key: RECLAIMLLM_API_KEY env var, else config.json."""
+    cfg = cfg if cfg is not None else load()
+    return (os.environ.get("RECLAIMLLM_API_KEY") or cfg.get("api_key") or "").strip()
+
+
+@dataclass(frozen=True)
+class Credentials:
+    server_url: str
+    api_key: str
+
+
+def resolve_credentials(cfg: dict | None = None) -> Credentials | None:
+    """Resolve both credentials at once. None if either is missing.
+
+    Single source of truth for the env-wins-over-config precedence documented
+    above — callers that need per-field error messages (e.g. "server URL not
+    configured" vs. "API key not configured") should call resolved_server_url
+    / resolved_api_key individually instead.
+    """
+    cfg = cfg if cfg is not None else load()
+    server_url = resolved_server_url(cfg)
+    api_key = resolved_api_key(cfg)
+    if not server_url or not api_key:
+        return None
+    return Credentials(server_url=server_url, api_key=api_key)
 
 
 def compression_config(cfg: dict | None = None) -> dict:

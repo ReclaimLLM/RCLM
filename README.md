@@ -77,9 +77,40 @@ rclm-hooks-install --with-mcp
 
 Start a new agent thread and confirm the `reclaimllm` plugin and MCP server are enabled.
 
+### MCP Tools
+
+| Tool | Description |
+|---|---|
+| `search_sessions` | Hybrid semantic + keyword search across captured sessions by topic, error, file, or date range. |
+| `search_by_filename` | File/folder-scoped session history, e.g. "what changed in `auth.tsx`". |
+| `get_session` | Summary metadata and a frontend link for one session ID. |
+| `summarize_session` | Pull a specific session's summary in as working context, on explicit request. |
+| `list_projects` | List available project filters. |
+| `file_brief` | Recent-history brief for a file before making a non-trivial edit to it. |
+| `handoff` | Generate a continuation document to start a fresh session without losing context. |
+| `transfer_session` | Stream a complete captured session (messages, tool calls/results, file diffs) as a versioned JSON artifact. |
+| `signals` | Up to 5 open workflow-efficiency signals (evidence + prescribed fix) for the current project. |
+| `replay_eligibility` | Cheap, metadata-only check of whether replaying compression mechanisms is worth doing. |
+| `replay_session` | Reproduce shipped compression mechanisms over one captured session and report the real tool-result token reduction. |
+| `replay_corpus` | Same as `replay_session`, aggregated across a filtered window of sessions. |
+| `replay_compare` | Replay the same corpus under multiple mechanism configurations in one call. |
+
+All tools are read-only: none re-execute historical commands, call a model, or modify captured data.
+
 When you need the complete captured session instead of a summary, ask the target agent to call `transfer_session` with the ReclaimLLM session ID. The tool streams a versioned JSON artifact containing every captured message, tool call/result, file diff, and metadata field into an owner-only temporary file. The target agent reads that file as historical context; recorded tool calls are never re-executed automatically.
 
 `SESSION_TRANSFER_MAX_BYTES` controls the backend and local download ceiling and defaults to 100 MiB. Transfers are never silently truncated. `SESSION_TRANSFER_TTL_SECONDS` controls when local artifacts become eligible for bounded opportunistic cleanup and defaults to one hour.
+
+### Replay: verifying token savings
+
+`replay_eligibility`, `replay_session`, `replay_corpus`, and `replay_compare` reproduce RCLM's shipped compression mechanisms (`range_cache`, `shell_compaction`, `hash_dedupe`) over already-captured sessions and report the real tool-result token reduction, without calling a model or re-running any historical command:
+
+- "Would compression help on my last 50 sessions?" → `replay_eligibility`
+- "How much did compression save on session `<id>`?" → `replay_session`
+- "What's the aggregate savings across my Codex sessions this month?" → `replay_corpus`
+- "Compare shell compaction alone vs. combined with range cache" → `replay_compare`
+
+Every result states sessions considered vs. eligible vs. excluded; a session or corpus below the turn/tool-call thresholds is refused with the specific failing constraint rather than given an unstable number.
 
 ---
 

@@ -22,6 +22,48 @@ def test_codex_pre_and_post_tool_use_matchers_are_unrestricted():
     assert installer._CODEX_HOOKS_TO_INJECT["PostToolUse"][0]["matcher"] == ""
 
 
+def test_stale_matcher_from_older_install_is_replaced_not_duplicated(tmp_path, monkeypatch):
+    """A hooks.json written by a pre-"" version (matcher: "Bash") must be
+    migrated in place on reinstall, not left as an orphaned duplicate
+    alongside the new matcher: "" entry."""
+    monkeypatch.chdir(tmp_path)
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {"type": "command", "command": "rclm-codex-hooks PreToolUse"}
+                            ],
+                        }
+                    ],
+                    "PostToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {"type": "command", "command": "rclm-codex-hooks PostToolUse"}
+                            ],
+                        }
+                    ],
+                }
+            }
+        )
+    )
+
+    _run_install(monkeypatch, tmp_path)
+
+    hooks = _read_settings(hooks_path)
+    for event in ("PreToolUse", "PostToolUse"):
+        entries = hooks["hooks"][event]
+        assert len(entries) == 1, f"Expected exactly 1 {event} entry, got {len(entries)}: {entries}"
+        assert entries[0]["matcher"] == ""
+        assert f"rclm-codex-hooks {event}" in entries[0]["hooks"][0]["command"]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -378,6 +420,85 @@ def test_openclaw_flag_installs_only_openclaw(tmp_path, monkeypatch):
     assert not (tmp_path / ".codex" / "hooks.json").exists()
 
 
+def test_antigravity_flag_installs_only_antigravity(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    installed: list[bool] = []
+
+    def fake_install_antigravity(use_global: bool) -> None:
+        installed.append(use_global)
+
+    monkeypatch.setattr(installer, "_install_antigravity", fake_install_antigravity)
+    _run_install(monkeypatch, tmp_path, "--antigravity")
+
+    assert installed == [False]
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".gemini" / "settings.json").exists()
+    assert not (tmp_path / ".codex" / "hooks.json").exists()
+
+
+def test_antigravity_local_writes_expected_hook_shape(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
+
+    _run_install(monkeypatch, tmp_path, "--antigravity")
+
+    hooks_path = tmp_path / ".agents" / "hooks.json"
+    data = _read_settings(hooks_path)
+    assert data == installer._ANTIGRAVITY_HOOKS_TO_INJECT
+    assert not (tmp_path / ".gemini").exists()
+
+
+def test_antigravity_global_writes_to_gemini_config_dir(tmp_path, monkeypatch):
+    """~/.gemini/config/ is the customization root directory's global
+    location (skills.json/plugins.json/hooks.json all live there); .agents/
+    is its per-workspace equivalent, used only with --local."""
+    monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "rclm-hooks-install",
+            "--antigravity",
+            "--api-key=test-key",
+            "--server-url=http://test.example.com",
+        ],
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+
+    installer.main()
+
+    hooks_path = tmp_path / ".gemini" / "config" / "hooks.json"
+    data = _read_settings(hooks_path)
+    assert data == installer._ANTIGRAVITY_HOOKS_TO_INJECT
+    assert not (tmp_path / ".agents").exists()
+
+
+def test_antigravity_merge_preserves_other_hook_names(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
+    hooks_path = tmp_path / ".agents" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(
+        json.dumps({"my-linter-hook": {"PostToolUse": [{"hooks": [{"command": "./lint.sh"}]}]}})
+    )
+
+    _run_install(monkeypatch, tmp_path, "--antigravity")
+
+    data = _read_settings(hooks_path)
+    assert data["my-linter-hook"] == {"PostToolUse": [{"hooks": [{"command": "./lint.sh"}]}]}
+    assert "rclm-antigravity-hooks" in data
+
+
+def test_antigravity_idempotent_running_twice(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
+
+    _run_install(monkeypatch, tmp_path, "--antigravity")
+    _run_install(monkeypatch, tmp_path, "--antigravity")
+
+    data = _read_settings(tmp_path / ".agents" / "hooks.json")
+    assert data == installer._ANTIGRAVITY_HOOKS_TO_INJECT
+
+
 def test_cursor_all_expected_events_present(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
@@ -396,6 +517,51 @@ def test_local_default_does_not_install_openclaw(tmp_path, monkeypatch):
 
     _run_install(monkeypatch, tmp_path)
 
+    assert (tmp_path / ".claude" / "settings.json").exists()
+
+
+def test_global_default_does_not_install_openclaw(tmp_path, monkeypatch):
+    """openclaw is opt-in (--openclaw) even for a plain global install."""
+    monkeypatch.setattr(installer, "_install_openclaw", lambda use_global: pytest.fail())
+    monkeypatch.setattr(
+        "sys.argv",
+        ["rclm-hooks-install", "--api-key=test-key", "--server-url=http://test.example.com"],
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+
+    installer.main()
+
+    assert (tmp_path / ".claude" / "settings.json").exists()
+
+
+def test_local_default_installs_antigravity(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    installed: list[bool] = []
+    monkeypatch.setattr(
+        installer, "_install_antigravity", lambda use_global: installed.append(use_global)
+    )
+
+    _run_install(monkeypatch, tmp_path)
+
+    assert installed == [False]
+    assert (tmp_path / ".claude" / "settings.json").exists()
+
+
+def test_global_default_installs_antigravity(tmp_path, monkeypatch):
+    """antigravity is part of the default provider set for a plain global install."""
+    installed: list[bool] = []
+    monkeypatch.setattr(
+        installer, "_install_antigravity", lambda use_global: installed.append(use_global)
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["rclm-hooks-install", "--api-key=test-key", "--server-url=http://test.example.com"],
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+
+    installer.main()
+
+    assert installed == [True]
     assert (tmp_path / ".claude" / "settings.json").exists()
 
 

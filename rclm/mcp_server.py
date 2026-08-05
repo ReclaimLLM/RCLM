@@ -7,7 +7,6 @@ import json
 import os
 import sys
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import quote
@@ -15,6 +14,7 @@ from urllib.parse import quote
 import aiohttp
 
 from rclm import _config, auth
+from rclm._config import Credentials
 from rclm._http import create_tcp_connector
 from rclm._session_transfer import (
     SessionTransferTooLarge,
@@ -112,21 +112,12 @@ class ReclaimLLMError(RuntimeError):
     """Raised when the ReclaimLLM backend request fails."""
 
 
-@dataclass(frozen=True)
-class Credentials:
-    server_url: str
-    api_key: str
-
-
 def _load_credentials() -> Credentials:
-    """Load MCP credentials, matching hook uploader precedence: config first."""
-    cfg = _config.load()
-    server_url = (cfg.get("server_url") or os.environ.get("RECLAIMLLM_SERVER_URL") or "").strip()
-    api_key = (cfg.get("api_key") or os.environ.get("RECLAIMLLM_API_KEY") or "").strip()
-
-    if not server_url or not api_key:
+    """Load MCP credentials, matching hook uploader precedence: env var wins over config."""
+    creds = _config.resolve_credentials()
+    if creds is None:
         raise ReclaimLLMError(auth.AUTH_REQUIRED_MESSAGE)
-    return Credentials(server_url=server_url.rstrip("/"), api_key=api_key)
+    return creds
 
 
 def _truncate(value: Any, max_chars: int) -> Any:

@@ -14,7 +14,7 @@ import sys
 from typing import Any
 
 from rclm._models import HookSessionRecord
-from rclm._uploader import upload_single
+from rclm._uploader import close_session, upload_single
 from rclm.hooks import session_store
 from rclm.hooks.openclaw_transcript import (
     as_dict,
@@ -84,6 +84,16 @@ def _handle_append_event(session_id: str, payload: dict, hook_name: str) -> None
     session_store.append_event(session_id, stored)
 
 
+async def _upload_and_close(record: HookSessionRecord, *, max_retries: int) -> None:
+    """upload_single, then close the module-level aiohttp session before this
+    asyncio.run() call's event loop is torn down -- see claude_handler's
+    identical helper for why (aiohttp session/loop binding)."""
+    try:
+        await upload_single(record, max_retries=max_retries)
+    finally:
+        await close_session()
+
+
 def _handle_session_end(session_id: str, payload: dict) -> None:
     now = timestamp_from_payload(payload)
     events = session_store.read_events(session_id)
@@ -105,7 +115,7 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
         total_output_tokens=None,
     )
 
-    asyncio.run(upload_single(record, max_retries=1))
+    asyncio.run(_upload_and_close(record, max_retries=1))
     session_store.cleanup(session_id)
 
 

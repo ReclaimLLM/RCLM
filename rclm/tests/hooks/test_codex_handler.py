@@ -302,6 +302,60 @@ def test_codex_transcript_parses_messages_tools_and_diffs(tmp_path):
     assert data.file_diffs[0].timestamp == "2026-03-30T12:00:05Z"
 
 
+def test_codex_transcript_captures_developer_role_messages(tmp_path):
+    """'developer' is the Responses API's successor to 'system' and carries
+    real injected instructions (AGENTS.md, memory-tool guidance, multi-agent
+    mode directives) -- it must not be silently dropped alongside user/
+    assistant."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-29T09:36:34Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [
+                                {"type": "input_text", "text": "## Memory\n\nUse it wisely."}
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-07-29T09:36:35Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert data.messages == [
+        {
+            "role": "developer",
+            "content": "## Memory\n\nUse it wisely.",
+            "timestamp": "2026-07-29T09:36:34Z",
+        },
+        {
+            "role": "user",
+            "content": "hi",
+            "timestamp": "2026-07-29T09:36:35Z",
+        },
+    ]
+
+
 def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
@@ -506,6 +560,39 @@ def test_codex_stop_schedules_update_after_upload(monkeypatch, tmp_path):
     )
 
     assert calls == ["upload", "schedule"]
+
+
+def test_codex_stop_closes_uploader_session(monkeypatch, tmp_path):
+    """Regression test: Stop must close the module-level aiohttp session in
+    the same event loop it uploaded on, or aiohttp emits "Unclosed client
+    session"/"Unclosed connector" ResourceWarnings to stderr on every Stop
+    (confirmed via a real subprocess repro against a live session
+    transcript -- see close_session's docstring in _uploader.py)."""
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    closed = []
+
+    async def fake_upload_single(_record):
+        pass
+
+    async def fake_close_session():
+        closed.append(True)
+
+    monkeypatch.setattr("rclm.hooks.codex_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr("rclm.hooks.codex_handler.close_session", fake_close_session)
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.codex_transcript.parse_transcript",
+        lambda _path: codex_transcript.CodexTranscriptData(),
+    )
+
+    _run_handler(
+        "Stop",
+        {"session_id": "sid-codex-close", "timestamp": "2026-03-30T12:06:00+00:00"},
+        monkeypatch,
+    )
+
+    assert closed == [True]
 
 
 def test_codex_stop_falls_back_when_transcript_empty(monkeypatch, tmp_path):

@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
-from rclm._uploader import upload_single
+from rclm._uploader import close_session, upload_single
 from rclm.hooks import (
     bootstrap,
     brevity,
@@ -670,6 +670,18 @@ def _handoff_advisory(transcript_data, cfg: dict) -> str | None:
     )
 
 
+async def _upload_and_close(record: HookSessionRecord) -> None:
+    """upload_single, then close the module-level aiohttp session before this
+    asyncio.run() call's event loop is torn down. aiohttp's ClientSession is
+    bound to the loop that created it, so a *later*, separate asyncio.run()
+    can't close it safely -- without this, aiohttp emits "Unclosed client
+    session"/"Unclosed connector" ResourceWarnings to stderr on every Stop."""
+    try:
+        await upload_single(record)
+    finally:
+        await close_session()
+
+
 def _handle_stop(
     session_id: str,
     payload: dict,
@@ -806,7 +818,7 @@ def _handle_stop(
         hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "claude"),
     )
 
-    asyncio.run(upload_single(record))
+    asyncio.run(_upload_and_close(record))
     if mechanism_savings:
         try:
             session_store.write_mechanism_savings_state(session_id, mechanism_savings)

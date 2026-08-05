@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from rclm import _config
+from rclm import _config, _uploader
 from rclm._models import HookSessionRecord
 from rclm._uploader import upload
 
@@ -135,7 +135,7 @@ async def test_upload_include_folder_supersedes_exclude_folder(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_upload_prefers_config_server_url_over_env(tmp_path, monkeypatch):
+async def test_upload_prefers_env_server_url_over_config(tmp_path, monkeypatch):
     monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
     monkeypatch.setenv("RECLAIMLLM_SERVER_URL", "https://env.example.test")
     monkeypatch.setenv("BACKEND_SERVER", "https://legacy-env.example.test")
@@ -154,4 +154,23 @@ async def test_upload_prefers_config_server_url_over_env(tmp_path, monkeypatch):
 
     await upload(_record(), session)
 
-    assert session.posts[0]["url"] == "https://config.example.test/api/ingest"
+    assert session.posts[0]["url"] == "https://env.example.test/api/ingest"
+
+
+@pytest.mark.asyncio
+async def test_upload_missing_credentials_quarantines_with_message(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.delenv("RECLAIMLLM_SERVER_URL", raising=False)
+    monkeypatch.delenv("RECLAIMLLM_API_KEY", raising=False)
+    monkeypatch.setattr(_uploader, "_FAILED_UPLOADS_DIR", tmp_path / "failed_uploads")
+    session = _Session()
+    record = _record()
+
+    await upload(record, session)
+
+    assert session.posts == []
+    quarantined = tmp_path / "failed_uploads" / f"{record.session_id}.json"
+    assert quarantined.exists()
+    err = capsys.readouterr().err
+    assert "not authenticated" in err
+    assert "rclm-login" in err

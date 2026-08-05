@@ -6,7 +6,7 @@ import pytest
 from rclm import _config, mcp_server
 
 
-def test_load_credentials_prefers_config_over_env(tmp_path, monkeypatch):
+def test_load_credentials_prefers_env_over_config(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps({"server_url": "https://config.test", "api_key": "config-key"})
@@ -14,6 +14,21 @@ def test_load_credentials_prefers_config_over_env(tmp_path, monkeypatch):
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
     monkeypatch.setenv("RECLAIMLLM_SERVER_URL", "https://env.test")
     monkeypatch.setenv("RECLAIMLLM_API_KEY", "env-key")
+
+    creds = mcp_server._load_credentials()
+
+    assert creds.server_url == "https://env.test"
+    assert creds.api_key == "env-key"
+
+
+def test_load_credentials_reads_config_when_env_unset(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"server_url": "https://config.test", "api_key": "config-key"})
+    )
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    monkeypatch.delenv("RECLAIMLLM_SERVER_URL", raising=False)
+    monkeypatch.delenv("RECLAIMLLM_API_KEY", raising=False)
 
     creds = mcp_server._load_credentials()
 

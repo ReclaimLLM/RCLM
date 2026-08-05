@@ -3,6 +3,27 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.25] — 2026-08-05
+
+### Added
+- Added Antigravity CLI hook integration: capture-only `Stop` hook via a new `rclm-antigravity-hooks` command, installing into `.agents/hooks.json` (`--local`) or `~/.gemini/config/hooks.json` (global) (`rclm/hooks/antigravity_handler.py`, `rclm/hooks/antigravity_transcript.py`, `rclm/hooks/installer.py`, `pyproject.toml`)
+- Added `_config.resolved_server_url()`, `resolved_api_key()`, and `resolve_credentials()` as a single shared credential-resolution helper (`rclm/_config.py`)
+- Added an MCP Tools reference table and a "Replay: verifying token savings" section to the README
+
+### Changed
+- Antigravity is now part of the default `rclm-hooks-install` provider set alongside Claude, Gemini, Codex, and Cursor; OpenClaw remains opt-in (`rclm/hooks/installer.py`)
+- `codex_transcript.py` now captures `developer` and `system` role messages instead of silently dropping them alongside user/assistant — `developer` carries real injected instructions (AGENTS.md, memory-tool guidance, multi-agent-mode directives), not boilerplate
+
+### Fixed
+- Fixed rclm hook entries at a matcher an older version used (e.g. Codex `PreToolUse`/`PostToolUse` `"Bash"` → `""`) surviving reinstall as orphaned duplicates instead of being migrated in place (`rclm/hooks/installer.py`)
+- Fixed every provider's Stop/SessionEnd handler leaving the module-level aiohttp session open across the event loop's teardown, which printed an "Unclosed client session"/"Unclosed connector" `ResourceWarning` to stderr on every single Stop invocation — confirmed via a real subprocess repro against a live session transcript (`rclm/hooks/claude_handler.py`, `codex_handler.py`, `gemini_handler.py`, `cursor_handler.py`, `openclaw_handler.py`, `antigravity_handler.py`)
+
+### Security
+- Unified `server_url`/`api_key` resolution (env var takes precedence over `config.json`) across `mcp_server.py`, `convert.py`, `proxy/start.py`, and `_uploader.py` — previously inconsistent, with some call sites resolving precedence the opposite way
+- A missing `api_key` no longer results in silently sending an unauthenticated upload request; `_uploader.py` now prints a clear "not authenticated" message and quarantines the record locally instead
+
+---
+
 ## [v0.1.24] — 2026-08-03
 
 ### Added

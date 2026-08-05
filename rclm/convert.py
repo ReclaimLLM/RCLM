@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -77,8 +76,8 @@ def convert_session(
 ) -> None:
     """Fetch a context export document from the server and write it to stdout or a file."""
     cfg = _config.load()
-    server_url = os.environ.get("RECLAIMLLM_SERVER_URL") or cfg.get("server_url")
-    api_key = os.environ.get("RECLAIMLLM_API_KEY") or cfg.get("api_key")
+    server_url = _config.resolved_server_url(cfg)
+    api_key = _config.resolved_api_key(cfg)
 
     if not server_url:
         print(

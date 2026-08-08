@@ -22,6 +22,48 @@ def test_codex_pre_and_post_tool_use_matchers_are_unrestricted():
     assert installer._CODEX_HOOKS_TO_INJECT["PostToolUse"][0]["matcher"] == ""
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [("--dlp", True), ("--no-dlp", False)],
+)
+def test_dlp_flag_can_be_enabled_and_disabled(monkeypatch, flag, expected):
+    monkeypatch.setattr("sys.argv", ["rclm-hooks-install", flag])
+    assert installer._parse_flags().dlp is expected
+
+
+def test_dlp_flag_is_unspecified_by_default(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["rclm-hooks-install"])
+    assert installer._parse_flags().dlp is None
+
+
+def test_no_dlp_overrides_saved_enabled_setting(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--dlp")
+    assert _config.load()["dlp"] is True
+
+    _run_install(monkeypatch, tmp_path, "--no-dlp")
+
+    assert _config.load()["dlp"] is False
+
+
+def test_dlp_is_enabled_on_fresh_install(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    _run_install(monkeypatch, tmp_path)
+
+    assert _config.load()["dlp"] is True
+
+
+def test_saved_no_dlp_choice_survives_reinstall(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-dlp")
+    assert _config.load()["dlp"] is False
+
+    _run_install(monkeypatch, tmp_path)
+
+    assert _config.load()["dlp"] is False
+
+
 def test_stale_matcher_from_older_install_is_replaced_not_duplicated(tmp_path, monkeypatch):
     """A hooks.json written by a pre-"" version (matcher: "Bash") must be
     migrated in place on reinstall, not left as an orphaned duplicate
@@ -575,24 +617,28 @@ def test_with_mcp_installs_local_mcp_configs(tmp_path, monkeypatch):
     assert claude["mcpServers"]["reclaimllm"] == {
         "command": "/bin/rclm-mcp",
         "args": [],
+        "timeout": 600_000,
     }
 
     cursor = _read_settings(tmp_path / ".cursor" / "mcp.json")
     assert cursor["mcpServers"]["reclaimllm"] == {
         "command": "/bin/rclm-mcp",
         "args": [],
+        "timeout": 600_000,
     }
 
     gemini = _read_settings(tmp_path / ".gemini" / "settings.json")
     assert gemini["mcpServers"]["reclaimllm"] == {
         "command": "/bin/rclm-mcp",
         "args": [],
+        "timeout": 600_000,
     }
 
     codex = (tmp_path / ".codex" / "config.toml").read_text()
     assert "[mcp_servers.reclaimllm]" in codex
     assert 'command = "/bin/rclm-mcp"' in codex
     assert "args = []" in codex
+    assert "tool_timeout_sec = 600" in codex
 
 
 # ---------------------------------------------------------------------------

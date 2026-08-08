@@ -129,10 +129,11 @@ Every result states sessions considered vs. eligible vs. excluded; a session or 
 ## Advanced Usage
 
 ### Context Compression & DLP
-Enable advanced features during installation:
+Env-file DLP is enabled on fresh installs and preserves an explicit saved opt-out:
 ```bash
 rclm-hooks-install --compress                          # Reduces tool-result tokens in Claude Code, Codex, and Cursor
-rclm-hooks-install --dlp                                # Enables Data Loss Prevention for .env files
+rclm-hooks-install --dlp                                # Explicitly enable or re-enable DLP
+rclm-hooks-install --no-dlp                             # Explicitly disable DLP
 rclm-hooks-install --image-lifecycle                    # Downscales oversized screenshots/images before they reach the model
 rclm-hooks-install --image-lifecycle --image-max-dim=1280  # Set the max image dimension in pixels (default 1280)
 ```

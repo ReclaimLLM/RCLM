@@ -13,9 +13,10 @@ import logging
 import sys
 from typing import Any
 
+from rclm import _config
 from rclm._models import HookSessionRecord
 from rclm._uploader import close_session, upload_single
-from rclm.hooks import session_store
+from rclm.hooks import dlp, session_store
 from rclm.hooks.openclaw_transcript import (
     as_dict,
     bounded,
@@ -81,6 +82,36 @@ def _handle_append_event(session_id: str, payload: dict, hook_name: str) -> None
             stored["tool_result"] = tool_result_from_event(event)
 
     stored["raw"] = bounded(event)
+    cfg = _config.load()
+    if _config.dlp_enabled(cfg):
+        cwd = cwd_from_payload(payload) or first_cwd_from_events(
+            session_store.read_events(session_id), ""
+        )
+        if cwd:
+            try:
+                redacted = dlp.maybe_redact_value(
+                    stored,
+                    cwd,
+                    redact_all=(
+                        hook_name == "after_tool_call"
+                        and dlp.input_may_read_env(
+                            str(stored.get("tool_name", "")),
+                            stored.get("tool_input", {}),
+                        )
+                    ),
+                )
+                if isinstance(redacted, dict):
+                    stored = redacted
+                    stored["dlp_redacted"] = True
+            except dlp.DLPRedactionError as exc:
+                if hook_name == "after_tool_call" and dlp.input_may_read_env(
+                    str(stored.get("tool_name", "")),
+                    stored.get("tool_input", {}),
+                ):
+                    stored.pop("tool_result", None)
+                    stored.pop("raw", None)
+                    stored["dlp_redacted"] = True
+                    stored["dlp_error"] = f"output withheld: {exc}"
     session_store.append_event(session_id, stored)
 
 

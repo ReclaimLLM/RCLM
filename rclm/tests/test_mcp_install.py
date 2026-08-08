@@ -30,6 +30,7 @@ def test_codex_install_replaces_existing_reclaimllm_sections(tmp_path):
     assert text.count("[mcp_servers.reclaimllm]") == 1
     assert "[mcp_servers.reclaimllm.env]" not in text
     assert 'command = "/bin/rclm-mcp"' in text
+    assert "tool_timeout_sec = 600" in text
     assert "[mcp_servers.supabase]" in text
 
 
@@ -51,6 +52,7 @@ def test_install_mcp_adds_gemini_settings(tmp_path, monkeypatch):
     assert data["mcpServers"]["reclaimllm"] == {
         "command": "/bin/rclm-mcp",
         "args": [],
+        "timeout": 600_000,
     }
 
 

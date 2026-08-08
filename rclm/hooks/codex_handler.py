@@ -75,6 +75,20 @@ logger = logging.getLogger(__name__)
 
 THRESHOLD_ZERO_DURATION = 5.0  # seconds
 
+_DLP_STOP_REASON = (
+    "ReclaimLLM DLP withheld the original tool result because it contained an env-file "
+    "secret; a redacted result was returned instead."
+)
+_DLP_SCAN_STOP_REASON = (
+    "ReclaimLLM DLP withheld the tool result because the env-file secret scan could not "
+    "complete safely."
+)
+_RANGE_CACHE_STOP_REASON = "ReclaimLLM replaced this repeated file read with a range-cache notice."
+_COMPACTION_STOP_REASON = (
+    "ReclaimLLM compacted this tool result before it entered the model context."
+)
+_DEDUPE_STOP_REASON = "ReclaimLLM replaced this repeated tool result with a deduplication notice."
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -146,35 +160,70 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
 
     cfg = _config.load()
     policy = _config.effective_hook_policy(cfg, provider="codex")
-    if not policy.enabled("exec_compaction") or not isinstance(tool_input, dict):
+    if not isinstance(tool_input, dict):
         return
 
-    try:
-        compression_tool = (
-            "Bash" if tool_name in {"Bash", "exec", "exec_command", "shell"} else tool_name
-        )
-        delta = maybe_compress(
-            compression_tool,
-            tool_input,
-            shadow=policy.shadow_for("exec_compaction"),
-            session_id=session_id,
-        )
-        if not delta:
+    effective_input = dict(tool_input)
+    changed = False
+    dlp_tool = "Bash" if tool_name in {"Bash", "exec", "exec_command", "shell"} else tool_name
+
+    if _config.dlp_enabled(cfg):
+        try:
+
+            def _track(path: str) -> None:
+                session_store.append_event(session_id, {"event_type": "DLPTempFile", "path": path})
+
+            delta = dlp.maybe_redact_input(
+                dlp_tool,
+                effective_input,
+                _resolve_cwd(session_id, payload),
+                track_temp=_track,
+            )
+            if delta:
+                effective_input.update(delta)
+                changed = True
+        except dlp.DLPRedactionError as exc:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": (
+                                f"ReclaimLLM DLP blocked this env-file read: {exc}"
+                            ),
+                        }
+                    }
+                )
+            )
             return
-        updated_input = {**tool_input, **delta}
+
+    if policy.enabled("exec_compaction"):
+        try:
+            delta = maybe_compress(
+                dlp_tool,
+                effective_input,
+                shadow=policy.shadow_for("exec_compaction"),
+                session_id=session_id,
+            )
+            if delta:
+                effective_input.update(delta)
+                changed = True
+        except Exception:
+            logger.exception("Codex input compaction failed; passing through tool input")
+
+    if changed:
         print(
             json.dumps(
                 {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
-                        "updatedInput": updated_input,
+                        "updatedInput": effective_input,
                     }
                 }
             )
         )
-    except Exception:
-        logger.exception("Codex input compaction failed; passing through tool input")
 
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
@@ -182,19 +231,54 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     tool_response = payload.get("tool_response")
     prior_events = session_store.read_events(session_id)
 
+    cfg = _config.load()
+    policy = _config.effective_hook_policy(cfg, provider="codex")
+    cwd = _resolve_cwd(session_id, payload)
+    dlp_replacement: str | None = None
+    replacement_stop_reason: str | None = None
+    captured_response = tool_response
+    is_image_result = (
+        tool_name.startswith("mcp__")
+        and policy.enabled("image_downscale")
+        and image_lifecycle.find_image(tool_response) is not None
+    )
+    if _config.dlp_enabled(cfg) and not is_image_result:
+        try:
+            tool_input = payload.get("tool_input", {})
+            redact_all = dlp.input_may_read_env(tool_name, tool_input)
+            if isinstance(tool_response, str):
+                dlp_replacement = dlp.maybe_redact_output(
+                    tool_name, tool_response, cwd, redact_all=redact_all
+                )
+                if dlp_replacement is not None:
+                    captured_response = dlp_replacement
+                    replacement_stop_reason = _DLP_STOP_REASON
+            else:
+                redacted_value = dlp.maybe_redact_value(tool_response, cwd, redact_all=redact_all)
+                if redacted_value is not None:
+                    captured_response = redacted_value
+                    dlp_replacement = str(redacted_value)
+                    replacement_stop_reason = _DLP_STOP_REASON
+        except dlp.DLPRedactionError as exc:
+            if dlp.input_may_read_env(tool_name, payload.get("tool_input", {})):
+                dlp_replacement = f"[rclm DLP] Output withheld: {exc}"
+                captured_response = dlp_replacement
+                replacement_stop_reason = _DLP_SCAN_STOP_REASON
+            else:
+                logger.warning("DLP could not inspect %s output: %s", tool_name, exc)
+
     session_store.append_event(
         session_id,
         {
             "event_type": "PostToolUse",
             "tool_name": tool_name,
-            "tool_response": tool_response,
+            "tool_response": captured_response,
+            "dlp_redacted": dlp_replacement is not None,
             "turn_id": payload.get("turn_id"),
             "timestamp": _now(),
         },
     )
 
-    cfg = _config.load()
-    policy = _config.effective_hook_policy(cfg, provider="codex")
     shadow = policy.legacy_shadow
     turn_id = payload.get("turn_id")
     tool_use_id = payload.get("tool_use_id")
@@ -284,19 +368,15 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 logger.exception("codex image lifecycle measurement failed; no-op")
         return
 
-    cwd = _resolve_cwd(session_id, payload)
     # DLP runs first so dedupe only ever hashes secret-free content.
-    effective_text = tool_response if isinstance(tool_response, str) else str(tool_response or "")
+    effective_text = (
+        captured_response if isinstance(captured_response, str) else str(captured_response or "")
+    )
     replaced = False
 
-    if cfg.get("dlp", False):
-        try:
-            scrubbed = dlp.maybe_redact_output("Bash", tool_response, cwd)
-            if scrubbed is not None:
-                effective_text = scrubbed
-                replaced = True
-        except Exception:
-            pass  # Never let DLP disrupt Codex CLI
+    if dlp_replacement is not None:
+        effective_text = dlp_replacement
+        replaced = True
 
     range_claimed = False
     if policy.enabled("range_cache"):
@@ -329,6 +409,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 if application.replacement is not None:
                     effective_text = application.replacement
                     replaced = True
+                    replacement_stop_reason = replacement_stop_reason or _RANGE_CACHE_STOP_REASON
         except Exception:
             logger.exception("range cache failed; passing through tool result")
 
@@ -352,6 +433,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 if not shadow:
                     effective_text = decision.model_text
                     replaced = True
+                    replacement_stop_reason = replacement_stop_reason or _COMPACTION_STOP_REASON
         except Exception:
             logger.exception("tool-result compaction failed; passing through tool result")
 
@@ -402,6 +484,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 if not shadow:
                     effective_text = replacement
                     replaced = True
+                    replacement_stop_reason = replacement_stop_reason or _DEDUPE_STOP_REASON
         except Exception:
             logger.exception("hash dedupe failed; passing through tool result")
 
@@ -409,7 +492,16 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         # Codex documents this pair as model-visible feedback replacement.
         # continue:false prevents normal processing of the original result and,
         # unlike block-only output, does not reject a nested code-mode promise.
-        print(json.dumps({"continue": False, "decision": "block", "reason": effective_text}))
+        print(
+            json.dumps(
+                {
+                    "continue": False,
+                    "decision": "block",
+                    "reason": effective_text,
+                    "stopReason": replacement_stop_reason,
+                }
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +702,8 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     messages = transcript_data.messages or fallback_messages
     tool_calls = transcript_data.tool_calls or fallback_tool_calls
     _attach_transformations(tool_calls, fallback_tool_calls, events)
+    if _config.dlp_enabled():
+        dlp.reconcile_captured_tool_results(tool_calls, events)
     file_diffs = transcript_data.file_diffs
     model = transcript_data.model or model
     usage = transcript_data.usage
@@ -635,6 +729,10 @@ def _handle_stop(session_id: str, payload: dict) -> None:
 
     asyncio.run(_upload_and_close(record))
     schedule_session_end_update()
+    for event in events:
+        if event.get("event_type") == "DLPTempFile":
+            with contextlib.suppress(OSError):
+                os.unlink(event["path"])
     session_store.cleanup(session_id)
 
 

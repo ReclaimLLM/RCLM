@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from rclm.hooks.dlp import (
+    DLPRedactionError,
     _build_scrub_set,
+    _find_env_files,
     _is_env_file,
     _parse_env_file,
+    input_may_read_env,
     maybe_redact_input,
     maybe_redact_output,
+    maybe_redact_value,
+    reconcile_captured_tool_results,
+    redact_json_payload,
 )
 
 # ---------------------------------------------------------------------------
@@ -109,9 +119,33 @@ class TestParseEnvFile:
         assert result["PORT"] == "8080"
         assert result["DEBUG"] == "false"
 
-    def test_missing_file_returns_empty(self, tmp_path):
-        result = _parse_env_file(tmp_path / "nonexistent.env")
-        assert result == {}
+    def test_missing_file_fails_closed(self, tmp_path):
+        with pytest.raises(DLPRedactionError):
+            _parse_env_file(tmp_path / "nonexistent.env")
+
+    def test_multiline_quoted_value(self, tmp_path):
+        p = _write_env(tmp_path, ".env", 'PRIVATE_KEY="line-one\nline-two"\n')
+        assert _parse_env_file(p)["PRIVATE_KEY"] == "line-one\nline-two"
+
+
+class TestFindEnvFiles:
+    def test_discovers_nested_env_files_recursively(self, tmp_path):
+        nested = tmp_path / "services" / "api"
+        nested.mkdir(parents=True)
+        root_env = _write_env(tmp_path, ".env.local", "ROOT_SECRET=root-secret-value\n")
+        nested_env = _write_env(nested, "dev.env", "NESTED_SECRET=nested-secret-value\n")
+
+        assert _find_env_files(str(tmp_path)) == [root_env, nested_env]
+
+    def test_does_not_follow_symlinked_env_files(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = _write_env(outside, ".env", "SECRET=outside-secret-value\n")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / ".env").symlink_to(target)
+
+        assert _find_env_files(str(workspace)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +186,54 @@ class TestBuildScrubSet:
         assert val == "sk-ant-longkey123456"
         assert placeholder == "[REDACTED:API_KEY]"
 
+    def test_ordinary_configuration_values_excluded(self):
+        secrets = {
+            "QDRANT_COLLECTION": "sessions",
+            "ENTERPRISE_PROXY_DEFAULT_SLUG": "default",
+            "AZURE_OPENAI_LIST_MODE": "config",
+            "AWS_REGION": "us-east-1",
+            "OPENAI_MODEL": "gpt-5-mini",
+            "POSTHOG_HOST": "https://analytics.example.test",
+        }
+
+        assert _build_scrub_set(secrets) == []
+
+    def test_sensitive_key_and_opaque_value_are_included(self):
+        secrets = {
+            "DB_PASSWORD": "ordinary-looking-password",
+            "CUSTOM_VALUE": "AbCdEfGhIjKlMnOpQrStUv123456",
+        }
+
+        placeholders = {placeholder for _, placeholder in _build_scrub_set(secrets)}
+
+        assert placeholders == {
+            "[REDACTED:DB_PASSWORD]",
+            "[REDACTED:CUSTOM_VALUE]",
+        }
+
+    def test_explicitly_public_keys_are_excluded(self):
+        secrets = {
+            "NEXT_PUBLIC_API_KEY": "AbCdEfGhIjKlMnOpQrStUv123456",
+            "SUPABASE_ANON_KEY": "AbCdEfGhIjKlMnOpQrStUv123456",
+        }
+
+        assert _build_scrub_set(secrets) == []
+
+    def test_direct_access_includes_every_assignment(self):
+        secrets = {"PORT": "8080", "DEBUG": "false", "REGION": "us-east-1"}
+
+        placeholders = {
+            placeholder for _, placeholder in _build_scrub_set(secrets, include_all_values=True)
+        }
+
+        assert placeholders == {
+            "[REDACTED:PORT]",
+            "[REDACTED:DEBUG]",
+            "[REDACTED:REGION]",
+        }
+
     def test_sorted_longest_first(self):
-        secrets = {"SHORT": "abcde", "LONG": "abcdefghijklmn"}
+        secrets = {"SHORT_TOKEN": "abcde", "LONG_TOKEN": "abcdefghijklmn"}
         scrub = _build_scrub_set(secrets)
         assert scrub[0][0] == "abcdefghijklmn"
 
@@ -176,8 +256,8 @@ class TestMaybeRedactInputRead:
         content = Path(temp_path).read_text()
         assert "[REDACTED:API_KEY]" in content
         assert "sk-supersecretvalue" not in content
-        # PORT=8080 value "8080" is a pure integer — not redacted
-        assert "8080" in content
+        assert "[REDACTED:PORT]" in content
+        assert "8080" not in content
         # Clean up
         os.unlink(temp_path)
 
@@ -200,12 +280,24 @@ class TestMaybeRedactInputRead:
         assert "[REDACTED:API_KEY]" in content
         os.unlink(result["file_path"])
 
-    def test_empty_env_file_returns_none(self, tmp_path):
-        # A file with no parseable secrets (e.g. only comments) → no redirect needed
+    def test_comment_only_env_file_returns_none(self, tmp_path):
         env_file = tmp_path / "dev.env"
-        env_file.write_text("# just a comment\nDEBUG=false\nPORT=8080\n")
+        env_file.write_text("# just a comment\n")
         result = maybe_redact_input("Read", {"file_path": str(env_file)}, str(tmp_path))
-        assert result is None  # all values filtered by scrub-set rules
+        assert result is None
+
+    def test_config_only_env_file_is_fully_sanitized(self, tmp_path):
+        env_file = tmp_path / ".env.example"
+        env_file.write_text("DEBUG=false\nPORT=8080\nREGION=us-east-1\n")
+
+        result = maybe_redact_input("Read", {"file_path": str(env_file)}, str(tmp_path))
+
+        assert result is not None
+        content = Path(result["file_path"]).read_text()
+        assert "false" not in content
+        assert "8080" not in content
+        assert "us-east-1" not in content
+        os.unlink(result["file_path"])
 
     def test_track_temp_callback_invoked(self, tmp_path):
         _write_env(tmp_path, ".env", "SECRET=verylongsecretvalue\n")
@@ -226,6 +318,13 @@ class TestMaybeRedactInputRead:
     def test_unknown_tool_returns_none(self, tmp_path):
         result = maybe_redact_input("Write", {"file_path": "/foo"}, str(tmp_path))
         assert result is None
+
+    def test_oversized_env_file_fails_closed(self, tmp_path, monkeypatch):
+        env_file = _write_env(tmp_path, ".env", "TOKEN=oversized-secret-value\n")
+        monkeypatch.setattr("rclm.hooks.dlp.MAX_ENV_FILE_BYTES", 1)
+
+        with pytest.raises(DLPRedactionError):
+            maybe_redact_input("Read", {"file_path": str(env_file)}, str(tmp_path))
 
     def test_env_file_updated_between_calls_is_fresh(self, tmp_path):
         env_path = tmp_path / "dev.env"
@@ -272,6 +371,20 @@ class TestMaybeRedactInputBash:
         result = maybe_redact_input("Bash", {"command": "git status"}, str(tmp_path))
         assert result is None
 
+    def test_supported_sed_read_of_nested_env_file_is_blocked(self, tmp_path):
+        nested = tmp_path / "service"
+        nested.mkdir()
+        _write_env(nested, ".env", "TOKEN=sed-secret-value\n")
+
+        result = maybe_redact_input(
+            "Bash",
+            {"command": "sed -n '1p' service/.env"},
+            str(tmp_path),
+        )
+
+        assert result is not None
+        assert "DLP" in result["command"]
+
 
 # ---------------------------------------------------------------------------
 # maybe_redact_output
@@ -314,3 +427,112 @@ class TestMaybeRedactOutput:
         assert result is not None
         assert "firstsecretvalue1" not in result
         assert "secondsecretvalue2" not in result
+
+    def test_nested_env_secret_is_scrubbed(self, tmp_path):
+        nested = tmp_path / "apps" / "api"
+        nested.mkdir(parents=True)
+        _write_env(nested, ".env.production", "TOKEN=nested-production-secret\n")
+
+        result = maybe_redact_output("Bash", "nested-production-secret", str(tmp_path))
+
+        assert result == "[REDACTED:TOKEN]"
+
+    def test_common_config_values_do_not_redact_unrelated_output(self, tmp_path):
+        _write_env(
+            tmp_path,
+            "local.env",
+            "QDRANT_COLLECTION=sessions\n"
+            "ENTERPRISE_PROXY_DEFAULT_SLUG=default\n"
+            "AZURE_OPENAI_LIST_MODE=config\n",
+        )
+
+        result = maybe_redact_output(
+            "Bash",
+            "sessions use the default config",
+            str(tmp_path),
+        )
+
+        assert result is None
+
+    def test_direct_env_access_redacts_common_config_values(self, tmp_path):
+        _write_env(tmp_path, "local.env", "QDRANT_COLLECTION=sessions\n")
+
+        result = maybe_redact_output(
+            "Bash",
+            "QDRANT_COLLECTION=sessions",
+            str(tmp_path),
+            redact_all=True,
+        )
+
+        assert result == "QDRANT_COLLECTION=[REDACTED:QDRANT_COLLECTION]"
+
+    def test_example_and_test_env_files_are_not_ambient_secret_sources(self, tmp_path):
+        _write_env(tmp_path, ".env.example", "API_KEY=example-secret-value\n")
+        _write_env(tmp_path, "pytest.env", "PASSWORD=test-secret-value\n")
+
+        result = maybe_redact_output(
+            "Bash",
+            "example-secret-value test-secret-value",
+            str(tmp_path),
+        )
+
+        assert result is None
+
+    def test_shape_preserving_redaction(self, tmp_path):
+        _write_env(tmp_path, ".env", "TOKEN=structured-secret-value\n")
+        response = {"content": [{"type": "text", "text": "structured-secret-value"}]}
+
+        result = maybe_redact_value(response, str(tmp_path))
+
+        assert result == {"content": [{"type": "text", "text": "[REDACTED:TOKEN]"}]}
+
+
+def test_reconcile_replaces_only_explicitly_redacted_transcript_results():
+    redacted = SimpleNamespace(tool_use_id="call-1", tool_result="raw-secret")
+    untouched = SimpleNamespace(tool_use_id="call-2", tool_result="keep-structured-result")
+    events = [
+        {
+            "event_type": "PostToolUse",
+            "tool_use_id": "call-1",
+            "tool_response": "[REDACTED:TOKEN]",
+            "dlp_redacted": True,
+        },
+        {
+            "event_type": "PostToolUse",
+            "tool_use_id": "call-2",
+            "tool_response": "different-capture-shape",
+            "dlp_redacted": False,
+        },
+    ]
+
+    reconcile_captured_tool_results([redacted, untouched], events)
+
+    assert redacted.tool_result == "[REDACTED:TOKEN]"
+    assert untouched.tool_result == "keep-structured-result"
+
+
+def test_serialized_multiline_env_value_is_redacted(tmp_path):
+    _write_env(tmp_path, ".env", 'PRIVATE_KEY="line-one\nline-two"\n')
+    payload = json.dumps({"content": "line-one\nline-two"})
+
+    result = redact_json_payload(payload, str(tmp_path))
+
+    assert "line-one" not in result
+    assert json.loads(result)["content"] == "[REDACTED:PRIVATE_KEY]"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        ("Read", {"file_path": "services/api/.env.local"}),
+        ("run_shell_command", {"command": "cat config/dev.env"}),
+        ("Bash", {"command": "printenv"}),
+        ("exec", {"input": 'tools.exec_command({cmd:"sed -n 1,20p services/api/.env"})'}),
+    ],
+)
+def test_recognizes_env_access_for_targeted_fail_closed_behavior(tool_name, tool_input):
+    assert input_may_read_env(tool_name, tool_input)
+
+
+def test_unrelated_shell_command_remains_fail_open():
+    assert not input_may_read_env("Bash", {"command": "ls"})

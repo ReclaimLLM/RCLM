@@ -194,6 +194,9 @@ def test_codex_post_tool_use_compacts_recognized_shell_output(monkeypatch, tmp_p
     assert output["continue"] is False
     assert output["decision"] == "block"
     assert "40 lines omitted" in output["reason"]
+    assert output["stopReason"] == (
+        "ReclaimLLM compacted this tool result before it entered the model context."
+    )
     events = session_store.read_events("sid-codex-post")
     transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
     assert transformation["compression_strategy"] == "H3_exec_compaction"
@@ -656,10 +659,11 @@ def test_codex_post_tool_use_dlp_output_matches_codex_schema(monkeypatch, tmp_pa
 
     monkeypatch.setattr("rclm._config.load", lambda: {"dlp": True})
 
-    def mock_redact(tool_name, tool_response, cwd):
+    def mock_redact(tool_name, tool_response, cwd, *, redact_all=False):
         assert tool_name == "Bash"
         assert tool_response == "My secret is password123"
         assert cwd == "/repo"
+        assert redact_all is True
         return "My secret is [REDACTED:PASSWORD]"
 
     monkeypatch.setattr(dlp, "maybe_redact_output", mock_redact)
@@ -689,7 +693,14 @@ def test_codex_post_tool_use_dlp_output_matches_codex_schema(monkeypatch, tmp_pa
     assert parsed["continue"] is False
     assert parsed["decision"] == "block"
     assert parsed["reason"] == "My secret is [REDACTED:PASSWORD]"
+    assert parsed["stopReason"] == (
+        "ReclaimLLM DLP withheld the original tool result because it contained an env-file "
+        "secret; a redacted result was returned instead."
+    )
     assert "hookSpecificOutput" not in parsed
+    event = session_store.read_events("sid-codex")[-1]
+    assert event["tool_response"] == "My secret is [REDACTED:PASSWORD]"
+    assert "password123" not in json.dumps(event)
 
 
 def test_codex_post_tool_use_no_stdout_when_dlp_finds_nothing(monkeypatch, tmp_path, capsys):
@@ -697,7 +708,11 @@ def test_codex_post_tool_use_no_stdout_when_dlp_finds_nothing(monkeypatch, tmp_p
 
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     monkeypatch.setattr("rclm._config.load", lambda: {"dlp": True})
-    monkeypatch.setattr(dlp, "maybe_redact_output", lambda tool_name, response, cwd: None)
+    monkeypatch.setattr(
+        dlp,
+        "maybe_redact_output",
+        lambda tool_name, response, cwd, **kwargs: None,
+    )
 
     payload = {
         "session_id": "sid-codex-clean",
@@ -752,6 +767,9 @@ def test_codex_post_tool_use_dedupe_blocks_repeated_result(monkeypatch, tmp_path
     assert parsed["continue"] is False
     assert parsed["decision"] == "block"
     assert "Identical to the result of `Bash`" in parsed["reason"]
+    assert parsed["stopReason"] == (
+        "ReclaimLLM replaced this repeated tool result with a deduplication notice."
+    )
 
 
 def test_codex_post_tool_use_dedupe_off_by_default(monkeypatch, tmp_path, capsys):
@@ -825,6 +843,9 @@ def test_codex_post_tool_use_range_cache_blocks_repeated_read(monkeypatch, tmp_p
     assert output["continue"] is False
     assert output["decision"] == "block"
     assert "[RCLM] Lines 1-80 of source.py unchanged since turn 1." in output["reason"]
+    assert output["stopReason"] == (
+        "ReclaimLLM replaced this repeated file read with a range-cache notice."
+    )
     events = session_store.read_events("sid-codex-range")
     transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
     assert transformation["compression_strategy"] == "range_cache"
@@ -964,6 +985,9 @@ def test_codex_bash_pipeline_unaffected_by_mcp_branch(monkeypatch, tmp_path, cap
     assert parsed["continue"] is False
     assert parsed["decision"] == "block"
     assert "Identical to the result of `Bash`" in parsed["reason"]
+    assert parsed["stopReason"] == (
+        "ReclaimLLM replaced this repeated tool result with a deduplication notice."
+    )
 
 
 def test_codex_build_tool_calls_preserves_real_tool_name(monkeypatch, tmp_path):

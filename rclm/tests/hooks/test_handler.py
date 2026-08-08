@@ -986,7 +986,7 @@ def test_read_cache_and_dlp_compose_without_exposing_secret(monkeypatch, tmp_pat
     monkeypatch.setattr(
         dlp,
         "maybe_redact_output",
-        lambda tool_name, tool_response, cwd: tool_response.replace(
+        lambda tool_name, tool_response, cwd, **kwargs: tool_response.replace(
             "secret-token", "[REDACTED:TOKEN]"
         ),
     )
@@ -1100,7 +1100,7 @@ def test_post_tool_use_dlp_output_matches_claude_schema(monkeypatch, tmp_path, c
     monkeypatch.setattr(
         dlp,
         "maybe_redact_output",
-        lambda tool_name, tool_response, cwd: "token=[REDACTED:TOKEN]",
+        lambda tool_name, tool_response, cwd, **kwargs: "token=[REDACTED:TOKEN]",
     )
 
     payload = {
@@ -1124,6 +1124,9 @@ def test_post_tool_use_dlp_output_matches_claude_schema(monkeypatch, tmp_path, c
         "updatedToolOutput": "token=[REDACTED:TOKEN]",
         "additionalContext": "[rclm DLP] Secrets were redacted from the tool response.",
     }
+    event = session_store.read_events("sid-dlp")[-1]
+    assert event["tool_response"] == "token=[REDACTED:TOKEN]"
+    assert "secret-token" not in json.dumps(event)
 
 
 # ---------------------------------------------------------------------------

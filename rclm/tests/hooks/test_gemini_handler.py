@@ -215,7 +215,7 @@ def test_after_tool_dlp_output_matches_gemini_schema(monkeypatch, tmp_path, caps
     monkeypatch.setattr(
         dlp,
         "maybe_redact_output",
-        lambda tool_name, tool_response, cwd: "TOKEN=[REDACTED:TOKEN]",
+        lambda tool_name, tool_response, cwd, **kwargs: "TOKEN=[REDACTED:TOKEN]",
     )
 
     payload = {
@@ -238,6 +238,9 @@ def test_after_tool_dlp_output_matches_gemini_schema(monkeypatch, tmp_path, caps
     parsed = json.loads(output)
     validate(instance=parsed, schema=GEMINI_COMMON_OUTPUT_SCHEMA)
     assert parsed == {"decision": "deny", "reason": "TOKEN=[REDACTED:TOKEN]"}
+    event = session_store.read_events("gsid-dlp")[-1]
+    assert event["tool_response"] == "TOKEN=[REDACTED:TOKEN]"
+    assert "secret-token" not in json.dumps(event)
 
 
 def test_after_tool_dedupe_denies_repeated_result(monkeypatch, tmp_path, capsys):

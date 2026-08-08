@@ -14,6 +14,7 @@ import contextlib
 import difflib
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,14 @@ from pathlib import Path
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import close_session, upload_single
-from rclm.hooks import bootstrap, cursor_transcript, dedupe, session_store, tool_result_transform
+from rclm.hooks import (
+    bootstrap,
+    cursor_transcript,
+    dedupe,
+    dlp,
+    session_store,
+    tool_result_transform,
+)
 from rclm.hooks._analytics import aggregate_mechanism_savings
 from rclm.hooks.compress import maybe_compress
 from rclm.hooks.cursor_transcript import _clean_user_text
@@ -147,34 +155,57 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     tool_name = payload.get("tool_name") or ""
     tool_input = payload.get("tool_input")
     tool_input = tool_input if isinstance(tool_input, dict) else {}
+    cfg = _config.load()
+    effective_input = dict(tool_input)
+    changed = False
+    dlp_tool = "Bash" if tool_name.lower() in {"shell", "bash"} else tool_name
+
+    if _config.dlp_enabled(cfg):
+        try:
+
+            def _track(path: str) -> None:
+                session_store.append_event(session_id, {"event_type": "DLPTempFile", "path": path})
+
+            delta = dlp.maybe_redact_input(
+                dlp_tool,
+                effective_input,
+                _resolve_cwd(session_id, payload),
+                track_temp=_track,
+            )
+            if delta:
+                effective_input.update(delta)
+                changed = True
+        except dlp.DLPRedactionError as exc:
+            logger.warning("Cursor cannot safely rewrite this env-file read: %s", exc)
+
     session_store.append_event(
         session_id,
         {
             "event_type": "PreToolUse",
             "tool_name": tool_name,
-            "tool_input": tool_input,
+            "tool_input": effective_input,
             "tool_use_id": payload.get("tool_use_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
 
-    cfg = _config.load()
     policy = _config.effective_hook_policy(cfg, provider="cursor")
-    if not policy.enabled("exec_compaction"):
-        return
+    if policy.enabled("exec_compaction"):
+        try:
+            delta = maybe_compress(
+                dlp_tool,
+                effective_input,
+                shadow=policy.shadow_for("exec_compaction"),
+                session_id=None if session_id == "unknown" else session_id,
+            )
+            if delta:
+                effective_input.update(delta)
+                changed = True
+        except Exception:
+            logger.exception("Cursor input compaction failed; passing through tool input")
 
-    try:
-        compression_tool = "Bash" if tool_name.lower() in {"shell", "bash"} else tool_name
-        delta = maybe_compress(
-            compression_tool,
-            tool_input,
-            shadow=policy.shadow_for("exec_compaction"),
-            session_id=None if session_id == "unknown" else session_id,
-        )
-        if delta:
-            print(json.dumps({"updated_input": {**tool_input, **delta}}))
-    except Exception:
-        logger.exception("Cursor input compaction failed; passing through tool input")
+    if changed:
+        print(json.dumps({"updated_input": effective_input}))
 
 
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
@@ -184,13 +215,32 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     tool_input = tool_input if isinstance(tool_input, dict) else {}
     tool_output = payload.get("tool_output")
     prior_events = session_store.read_events(session_id)
+    cfg = _config.load()
+    cwd = _resolve_cwd(session_id, payload)
+    captured_output = tool_output
+    redacted_output = None
+    if _config.dlp_enabled(cfg):
+        try:
+            redacted_output = dlp.maybe_redact_value(
+                tool_output,
+                cwd,
+                redact_all=dlp.input_may_read_env(tool_name, tool_input),
+            )
+            if redacted_output is not None:
+                captured_output = redacted_output
+        except dlp.DLPRedactionError as exc:
+            if dlp.input_may_read_env(tool_name, tool_input):
+                captured_output = f"[rclm DLP] Output withheld: {exc}"
+            else:
+                logger.warning("DLP could not inspect %s output: %s", tool_name, exc)
     session_store.append_event(
         session_id,
         {
             "event_type": "PostToolUse",
             "tool_name": tool_name,
             "tool_input": tool_input,
-            "tool_response": tool_output,
+            "tool_response": captured_output,
+            "dlp_redacted": redacted_output is not None or captured_output is not tool_output,
             "tool_use_id": payload.get("tool_use_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
@@ -203,13 +253,16 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     if not is_mcp:
         return
 
-    cfg = _config.load()
+    if isinstance(redacted_output, dict):
+        print(json.dumps({"updated_mcp_tool_output": redacted_output}))
+        return
+
     policy = _config.effective_hook_policy(cfg, provider="cursor")
     compression = _config.compression_config(cfg)
     if not policy.enabled("hash_dedupe") or not compression["dedupe"]:
         return
 
-    envelope = tool_result_transform.extract_text_envelope(tool_output)
+    envelope = tool_result_transform.extract_text_envelope(captured_output)
     if envelope is None:
         return
     try:
@@ -407,6 +460,8 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         transcript_data = cursor_transcript.parse_transcript(transcript_path)
     if transcript_data and transcript_data.cwd:
         cwd = cwd or transcript_data.cwd
+    if transcript_data and _config.dlp_enabled():
+        dlp.reconcile_captured_tool_results(transcript_data.tool_calls, events)
     event_file_diffs = _extract_file_diffs_from_events(events)
     mechanism_savings = aggregate_mechanism_savings(events)
     hook_policy_snapshot = bootstrap.policy_snapshot_from_events(events, "cursor")
@@ -458,6 +513,10 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         )
 
     asyncio.run(_upload_and_close(record))
+    for event in events:
+        if event.get("event_type") == "DLPTempFile":
+            with contextlib.suppress(OSError):
+                os.unlink(event["path"])
     session_store.cleanup(session_id)
 
 

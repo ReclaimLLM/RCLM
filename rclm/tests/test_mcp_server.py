@@ -112,7 +112,9 @@ async def test_get_session_rejects_non_session_record(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_search_by_filename_path_does_not_send_text_query(tmp_path, monkeypatch):
+async def test_filter_sessions_uses_postgres_without_text_or_record_type_params(
+    tmp_path, monkeypatch
+):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "key"}))
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
@@ -120,7 +122,7 @@ async def test_search_by_filename_path_does_not_send_text_query(tmp_path, monkey
 
     async def fake_request(self, method, path, *, params=None):
         assert method == "GET"
-        assert path == "/api/sessions/search"
+        assert path == "/api/sessions/filter"
         seen_params.update(params or {})
         return {
             "sessions": [
@@ -134,17 +136,17 @@ async def test_search_by_filename_path_does_not_send_text_query(tmp_path, monkey
 
     monkeypatch.setattr(mcp_server.ReclaimLLMClient, "_request", fake_request)
 
-    result = await mcp_server.ReclaimLLMClient().search_sessions(
-        None,
+    result = await mcp_server.ReclaimLLMClient().filter_sessions(
         project_name=None,
         file_path="auth.tsx",
         limit=8,
+        include_changed_files=True,
     )
 
     assert "text_query" not in seen_params
     assert seen_params["file_path"] == "auth.tsx"
     assert seen_params["include_changed_files"] == "true"
-    assert seen_params["record_type"] == "session"
+    assert "record_type" not in seen_params
     assert result["sessions"][0]["title"] == "Touched auth.tsx"
 
 
@@ -156,6 +158,7 @@ async def test_search_sessions_passes_scope_param(tmp_path, monkeypatch):
     seen_params = {}
 
     async def fake_request(self, method, path, *, params=None):
+        assert path == "/api/sessions/search"
         seen_params.update(params or {})
         return {"sessions": [], "scope": "team"}
 
@@ -209,8 +212,7 @@ async def test_search_sessions_passes_ingestion_date_range(tmp_path, monkeypatch
 
     monkeypatch.setattr(mcp_server.ReclaimLLMClient, "_request", fake_request)
 
-    await mcp_server.ReclaimLLMClient().search_sessions(
-        None,
+    await mcp_server.ReclaimLLMClient().filter_sessions(
         project_name=None,
         file_path="src/auth.tsx",
         limit=5,
@@ -220,6 +222,21 @@ async def test_search_sessions_passes_ingestion_date_range(tmp_path, monkeypatch
 
     assert seen_params["date_from"] == "2026-07-08"
     assert seen_params["date_to"] == "2026-07-30"
+
+
+@pytest.mark.asyncio
+async def test_search_sessions_rejects_empty_text_query(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "key"}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    with pytest.raises(mcp_server.ReclaimLLMError, match="query is required"):
+        await mcp_server.ReclaimLLMClient().search_sessions(
+            "   ",
+            project_name=None,
+            file_path=None,
+            limit=5,
+        )
 
 
 @pytest.mark.parametrize(
@@ -306,6 +323,9 @@ async def test_file_brief_reshapes_search_result(tmp_path, monkeypatch):
     seen_params = {}
 
     async def fake_request(self, method, path, *, params=None):
+        if path == "/api/signals/file-brief":
+            return {"signal": None}
+        assert path == "/api/sessions/filter"
         seen_params.update(params or {})
         return {
             "sessions": [
@@ -326,6 +346,38 @@ async def test_file_brief_reshapes_search_result(tmp_path, monkeypatch):
     assert result["touch_count"] == 2
     assert result["scope"] == "team"
     assert len(result["sessions"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_most_recent_complete_session_uses_filter_endpoint(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "key"}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    seen_paths = []
+
+    async def fake_request(self, method, path, *, params=None):
+        seen_paths.append(path)
+        if path == "/api/sessions/filter":
+            return {
+                "sessions": [
+                    {
+                        "session_id": "session-1",
+                        "record_type": "session",
+                    }
+                ]
+            }
+        return {
+            "session_id": "session-1",
+            "record_type": "session",
+            "ended_at": "2026-08-01T12:00:00Z",
+        }
+
+    monkeypatch.setattr(mcp_server.ReclaimLLMClient, "_request", fake_request)
+
+    session_id = await mcp_server.ReclaimLLMClient().most_recent_complete_session_id()
+
+    assert session_id == "session-1"
+    assert seen_paths[0] == "/api/sessions/filter"
 
 
 @pytest.mark.asyncio
@@ -559,11 +611,13 @@ async def test_transfer_session_streams_verified_artifact(tmp_path, monkeypatch)
     config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "key"}))
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
     content = b'{"schema_version":"reclaimllm.session-transfer.v1","payload":{}}'
-    monkeypatch.setattr(
-        mcp_server.aiohttp,
-        "ClientSession",
-        lambda **_kwargs: _FakeTransferSession(content),
-    )
+    session_kwargs = {}
+
+    def fake_client_session(**kwargs):
+        session_kwargs.update(kwargs)
+        return _FakeTransferSession(content)
+
+    monkeypatch.setattr(mcp_server.aiohttp, "ClientSession", fake_client_session)
     real_write_transfer_stream = mcp_server.write_transfer_stream
 
     async def write_to_test_root(chunks, *, max_bytes):
@@ -586,6 +640,7 @@ async def test_transfer_session_streams_verified_artifact(tmp_path, monkeypatch)
     assert result["schema_version"] == "reclaimllm.session-transfer.v1"
     assert result["token_estimate"] == 42
     assert result["sha256"] == hashlib.sha256(content).hexdigest()
+    assert session_kwargs["timeout"].total == 600
     with open(result["artifact_path"], "rb") as artifact_file:
         assert artifact_file.read() == content
 
@@ -603,6 +658,16 @@ async def test_search_tools_do_not_expose_record_type_override():
 
     for name in ("search_sessions", "search_by_filename"):
         assert "record_type" not in tools[name].inputSchema.get("properties", {})
+
+
+@pytest.mark.asyncio
+async def test_replay_tools_default_minimums_to_five():
+    tools = {tool.name: tool for tool in await mcp_server.build_mcp_server().list_tools()}
+
+    for name in ("replay_eligibility", "replay_session", "replay_corpus", "replay_compare"):
+        properties = tools[name].inputSchema["properties"]
+        assert properties["min_turns"]["default"] == 5
+        assert properties["min_tool_calls"]["default"] == 5
 
 
 def test_missing_credentials_raises(tmp_path, monkeypatch):
@@ -649,12 +714,17 @@ async def test_request_raises_clear_message_on_401(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "revoked-key"}))
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
-    monkeypatch.setattr(
-        mcp_server.aiohttp, "ClientSession", lambda **kwargs: _FakeAuthFailureSession(401)
-    )
+    session_kwargs = {}
+
+    def fake_client_session(**kwargs):
+        session_kwargs.update(kwargs)
+        return _FakeAuthFailureSession(401)
+
+    monkeypatch.setattr(mcp_server.aiohttp, "ClientSession", fake_client_session)
 
     client = mcp_server.ReclaimLLMClient()
     with pytest.raises(mcp_server.ReclaimLLMError) as exc_info:
         await client._request("GET", "/api/sessions")
 
     assert "rclm-login" in str(exc_info.value)
+    assert session_kwargs["timeout"].total == 600

@@ -173,7 +173,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     hook_output: dict = {"hookEventName": "PreToolUse"}
     cwd = _resolve_cwd(session_id, payload)
 
-    if cfg.get("dlp", False):
+    if _config.dlp_enabled(cfg):
         try:
 
             def _track(path: str) -> None:
@@ -183,8 +183,17 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
             if dlp_delta:
                 effective_input.update(dlp_delta)
                 changed = True
+        except dlp.DLPRedactionError as exc:
+            hook_output.update(
+                {
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"ReclaimLLM DLP blocked this env-file read: {exc}",
+                }
+            )
+            print(json.dumps({"hookSpecificOutput": hook_output}))
+            return
         except Exception:
-            pass  # Never let DLP disrupt Claude Code
+            logger.exception("DLP input inspection failed; passing through unrelated tool input")
 
     read_offset: int | None = None
     if policy.enabled("range_cache"):
@@ -313,20 +322,48 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     # prior reads only.
     prior_events = session_store.read_events(session_id)
 
+    cfg = _config.load()
+    policy = _config.effective_hook_policy(cfg, provider="claude")
+    cwd = _resolve_cwd(session_id, payload)
+    dlp_replacement: str | None = None
+    captured_response = tool_response
+    is_image_result = (
+        policy.enabled("image_downscale") and image_lifecycle.find_image(tool_response) is not None
+    )
+    if _config.dlp_enabled(cfg) and not is_image_result:
+        try:
+            redact_all = dlp.input_may_read_env(tool_name, tool_input)
+            if isinstance(tool_response, str):
+                dlp_replacement = dlp.maybe_redact_output(
+                    tool_name, tool_response, cwd, redact_all=redact_all
+                )
+                if dlp_replacement is not None:
+                    captured_response = dlp_replacement
+            else:
+                redacted_value = dlp.maybe_redact_value(tool_response, cwd, redact_all=redact_all)
+                if redacted_value is not None:
+                    captured_response = redacted_value
+                    dlp_replacement = _response_text(redacted_value)
+        except dlp.DLPRedactionError as exc:
+            if dlp.input_may_read_env(tool_name, tool_input):
+                dlp_replacement = f"[rclm DLP] Output withheld: {exc}"
+                captured_response = dlp_replacement
+            else:
+                logger.warning("DLP could not inspect %s output: %s", tool_name, exc)
+
     session_store.append_event(
         session_id,
         {
             "event_type": "PostToolUse",
             "tool_name": tool_name,
             "tool_input": tool_input,
-            "tool_response": tool_response,
+            "tool_response": captured_response,
+            "dlp_redacted": dlp_replacement is not None,
             "tool_use_id": payload.get("tool_use_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
 
-    cfg = _config.load()
-    policy = _config.effective_hook_policy(cfg, provider="claude")
     shadow = policy.legacy_shadow
     hook_output: dict = {"hookEventName": "PostToolUse"}
     context_notes: list[str] = []
@@ -335,7 +372,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     # have no meaningful text form — DLP/read-cache/dedupe below all operate on
     # `_response_text()`, which would otherwise stringify the raw base64
     # payload for no benefit. Handle them separately and return early.
-    if policy.enabled("image_downscale") and image_lifecycle.find_image(tool_response) is not None:
+    if is_image_result:
         shadow = policy.shadow_for("image_downscale")
         try:
             image_result = image_lifecycle.maybe_downscale_image_result(
@@ -412,19 +449,11 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
 
     # DLP runs first so every downstream mechanism (read-cache included) only
     # ever sees secret-free content — never the raw response.
-    effective_text = _response_text(tool_response)
-    cwd = _resolve_cwd(session_id, payload)
+    effective_text = _response_text(captured_response)
 
-    if cfg.get("dlp", False):
-        try:
-            cwd = _resolve_cwd(session_id, payload)
-            scrubbed = dlp.maybe_redact_output(tool_name, effective_text, cwd)
-            if scrubbed is not None:
-                effective_text = scrubbed
-                hook_output["updatedToolOutput"] = scrubbed
-                context_notes.append("[rclm DLP] Secrets were redacted from the tool response.")
-        except Exception:
-            pass  # Never let DLP disrupt Claude Code
+    if dlp_replacement is not None:
+        hook_output["updatedToolOutput"] = dlp_replacement
+        context_notes.append("[rclm DLP] Secrets were redacted from the tool response.")
 
     tool_use_id = payload.get("tool_use_id")
     range_claimed = any(
@@ -544,13 +573,27 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
 
 def _handle_post_tool_use_failure(session_id: str, payload: dict) -> None:
     """Record a failed tool call so the loop-breaker can see consecutive failures."""
+    tool_name = payload.get("tool_name", "")
+    tool_output = payload.get("tool_output")
+    if _config.dlp_enabled():
+        try:
+            redacted = dlp.maybe_redact_value(
+                tool_output,
+                _resolve_cwd(session_id, payload),
+                redact_all=dlp.input_may_read_env(tool_name, payload.get("tool_input", {})),
+            )
+            if redacted is not None:
+                tool_output = redacted
+        except dlp.DLPRedactionError as exc:
+            if dlp.input_may_read_env(tool_name, payload.get("tool_input", {})):
+                tool_output = f"[rclm DLP] Output withheld: {exc}"
     session_store.append_event(
         session_id,
         {
             "event_type": "ToolFailure",
-            "tool_name": payload.get("tool_name", ""),
+            "tool_name": tool_name,
             "tool_input": payload.get("tool_input", {}),
-            "tool_output": payload.get("tool_output"),
+            "tool_output": tool_output,
             "timestamp": payload.get("timestamp", _now()),
         },
     )
@@ -775,6 +818,8 @@ def _handle_stop(
                 call.extra_fields["measurement_kind"] = transformation["measurement_kind"]
             if transformation.get("file_path"):
                 call.extra_fields["compression_file_path"] = transformation["file_path"]
+    if _config.dlp_enabled(cfg):
+        dlp.reconcile_captured_tool_results(transcript_data.tool_calls, events)
     file_diffs = _extract_file_diffs_from_tool_calls(transcript_data.tool_calls)
 
     # Compute analytics from tool calls and file diffs.

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".reclaimllm" / "config.json"
+DEFAULT_DLP_ENABLED = True
 
 DEFAULT_COMPRESSION_CONFIG = {
     "enabled": True,
@@ -130,6 +131,12 @@ def resolved_api_key(cfg: dict | None = None) -> str:
     """Resolve the API key: RECLAIMLLM_API_KEY env var, else config.json."""
     cfg = cfg if cfg is not None else load()
     return (os.environ.get("RECLAIMLLM_API_KEY") or cfg.get("api_key") or "").strip()
+
+
+def dlp_enabled(cfg: dict | None = None) -> bool:
+    """Return the persisted DLP choice, defaulting fresh/legacy configs on."""
+    cfg = cfg if cfg is not None else load()
+    return bool(cfg.get("dlp", DEFAULT_DLP_ENABLED))
 
 
 @dataclass(frozen=True)

@@ -29,19 +29,21 @@ from rclm.replay.provenance import build_provenance
 
 _DEFAULT_LIMIT = 5
 _MAX_LIMIT = 25
+_MAX_FILTER_LIMIT = 100
 _MAX_HIGHLIGHT_CHARS = 500
 _VALID_SCOPES = {"mine", "team", "org"}
+_MCP_CALL_TIMEOUT_SECONDS = 600
 
 _DEFAULT_REPLAY_CORPUS_LIMIT = 50
 # Tool-layer defaults, deliberately lower than eligibility.MIN_TURNS/
 # MIN_TOOL_CALLS (10/10, the PRD §6 floors). Exposed as explicit, visible
 # min_turns/min_tool_calls arguments so a looser evidence bar is a caller
 # choice, not silent drift.
-_DEFAULT_REPLAY_MIN_TURNS = 1
-_DEFAULT_REPLAY_MIN_TOOL_CALLS = 1
+_DEFAULT_REPLAY_MIN_TURNS = 5
+_DEFAULT_REPLAY_MIN_TOOL_CALLS = 5
 _MAX_REPLAY_CORPUS_LIMIT = 100
 _REPLAY_CANDIDATE_SCAN_MULTIPLIER = 4
-_MAX_REPLAY_CANDIDATE_SCAN = 200  # backend cap on GET /api/sessions/search
+_MAX_REPLAY_CANDIDATE_SCAN = 100  # backend cap on GET /api/sessions/filter
 _REPLAY_INGEST_LAG_MARGIN_DAYS = 7
 _MCP_INSTRUCTIONS = (
     "ReclaimLLM tools recall prior captured AI sessions. Use them sparingly and only when prior "
@@ -143,6 +145,49 @@ def _validated_date_range(
     return date_from, date_to
 
 
+def _session_filter_params(
+    *,
+    project_name: str | None,
+    file_path: str | None,
+    limit: int,
+    max_limit: int,
+    date_from: str | None,
+    date_to: str | None,
+    scope: str | None,
+    model: str | None = None,
+    model_family: str | None = None,
+    provider: str | None = None,
+    language: str | None = None,
+    session_category: str | None = None,
+    has_code_changes: bool | None = None,
+    include_changed_files: bool = False,
+) -> dict[str, Any]:
+    date_from, date_to = _validated_date_range(date_from, date_to)
+    params: dict[str, Any] = {
+        "limit": max(1, min(limit, max_limit)),
+        "include_changed_files": str(include_changed_files).lower(),
+    }
+    optional_params = {
+        "project_name": project_name,
+        "file_path": file_path,
+        "date_from": date_from,
+        "date_to": date_to,
+        "model": model,
+        "model_family": model_family,
+        "provider": provider,
+        "language": language,
+        "session_category": session_category,
+    }
+    params.update({key: value for key, value in optional_params.items() if value})
+    if has_code_changes is not None:
+        params["has_code_changes"] = str(has_code_changes).lower()
+    if scope:
+        if scope not in _VALID_SCOPES:
+            raise ReclaimLLMError(f"scope must be one of: {', '.join(sorted(_VALID_SCOPES))}")
+        params["scope"] = scope
+    return params
+
+
 def _extract_section(markdown: str | None, heading: str) -> str:
     if not markdown:
         return ""
@@ -214,6 +259,15 @@ def _session_search_result(session: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _public_search_response(data: dict[str, Any]) -> dict[str, Any]:
+    sessions = [_session_search_result(session) for session in data.get("sessions", [])]
+    return {
+        "sessions": sessions,
+        "total_returned": len(sessions),
+        "scope": data.get("scope"),
+    }
+
+
 def _require_session_record(session: dict[str, Any], session_id: str) -> None:
     record_type = session.get("record_type")
     if record_type != "session":
@@ -242,7 +296,9 @@ class ReclaimLLMClient:
         url = f"{self.server_url}{path}"
         async with (
             aiohttp.ClientSession(
-                headers=self.headers, connector=create_tcp_connector()
+                headers=self.headers,
+                connector=create_tcp_connector(),
+                timeout=aiohttp.ClientTimeout(total=_MCP_CALL_TIMEOUT_SECONDS),
             ) as session,
             session.request(method, url, params=params) as resp,
         ):
@@ -263,7 +319,7 @@ class ReclaimLLMClient:
 
     async def search_sessions(
         self,
-        query: str | None,
+        query: str,
         *,
         project_name: str | None,
         file_path: str | None,
@@ -272,34 +328,57 @@ class ReclaimLLMClient:
         date_to: str | None = None,
         scope: str | None = None,
     ) -> dict[str, Any]:
-        date_from, date_to = _validated_date_range(date_from, date_to)
-        params: dict[str, Any] = {
-            "limit": max(1, min(limit, _MAX_LIMIT)),
-            "include_changed_files": "true",
-            "record_type": "session",
-        }
-        if query:
-            params["text_query"] = query
-        if project_name:
-            params["project_name"] = project_name
-        if file_path:
-            params["file_path"] = file_path
-        if date_from:
-            params["date_from"] = date_from
-        if date_to:
-            params["date_to"] = date_to
-        if scope:
-            if scope not in _VALID_SCOPES:
-                raise ReclaimLLMError(f"scope must be one of: {', '.join(sorted(_VALID_SCOPES))}")
-            params["scope"] = scope
-
+        if not query.strip():
+            raise ReclaimLLMError("query is required for semantic search; use filter_sessions")
+        params = _session_filter_params(
+            project_name=project_name,
+            file_path=file_path,
+            limit=limit,
+            max_limit=_MAX_LIMIT,
+            date_from=date_from,
+            date_to=date_to,
+            scope=scope,
+            include_changed_files=True,
+        )
+        params["record_type"] = "session"
+        params["text_query"] = query
         data = await self._request("GET", "/api/sessions/search", params=params)
-        sessions = [_session_search_result(session) for session in data.get("sessions", [])]
-        return {
-            "sessions": sessions,
-            "total_returned": len(sessions),
-            "scope": data.get("scope"),
-        }
+        return _public_search_response(data)
+
+    async def filter_sessions(
+        self,
+        *,
+        project_name: str | None,
+        file_path: str | None,
+        limit: int,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        scope: str | None = None,
+        model: str | None = None,
+        model_family: str | None = None,
+        provider: str | None = None,
+        language: str | None = None,
+        session_category: str | None = None,
+        has_code_changes: bool | None = None,
+        include_changed_files: bool = False,
+    ) -> dict[str, Any]:
+        params = _session_filter_params(
+            project_name=project_name,
+            file_path=file_path,
+            limit=limit,
+            max_limit=_MAX_FILTER_LIMIT,
+            date_from=date_from,
+            date_to=date_to,
+            scope=scope,
+            model=model,
+            model_family=model_family,
+            provider=provider,
+            language=language,
+            session_category=session_category,
+            has_code_changes=has_code_changes,
+            include_changed_files=include_changed_files,
+        )
+        return await self._request("GET", "/api/sessions/filter", params=params)
 
     async def hook_bootstrap(self, *, cwd: str | None, include_context: bool) -> dict[str, Any]:
         params: dict[str, Any] = {"include_context": str(include_context).lower()}
@@ -358,13 +437,14 @@ class ReclaimLLMClient:
         §6.5.1) so the agent sees "read in 31 sessions across 4 contributors"
         exactly when it's about to re-read the file itself. Best-effort: a
         failed lookup never breaks the underlying brief."""
-        data = await self.search_sessions(
-            None,
+        data = await self.filter_sessions(
             project_name=None,
             file_path=path,
-            limit=limit,
+            limit=min(limit, _MAX_LIMIT),
             scope=scope,
+            include_changed_files=True,
         )
+        data = _public_search_response(data)
         signal = None
         with suppress(ReclaimLLMError):
             signal_data = await self._request(
@@ -422,7 +502,9 @@ class ReclaimLLMClient:
 
         async with (
             aiohttp.ClientSession(
-                headers=self.headers, connector=create_tcp_connector()
+                headers=self.headers,
+                connector=create_tcp_connector(),
+                timeout=aiohttp.ClientTimeout(total=_MCP_CALL_TIMEOUT_SECONDS),
             ) as session,
             session.get(url) as resp,
         ):
@@ -525,7 +607,11 @@ class ReclaimLLMClient:
         return session.get("blob")
 
     async def most_recent_complete_session_id(self) -> str | None:
-        data = await self.search_sessions(None, project_name=None, file_path=None, limit=_MAX_LIMIT)
+        data = await self.filter_sessions(
+            project_name=None,
+            file_path=None,
+            limit=_MAX_LIMIT,
+        )
         for session in data.get("sessions", []):
             session_id = session.get("session_id")
             if not session_id:
@@ -549,9 +635,9 @@ class ReclaimLLMClient:
 
         Windowed on `started_at` per Report 2's method
         (docs/whitepaper/report-2-token-savings-data-collection.md,
-        scripts/report2_collection_status.py): page the indexed `ingested_at`
+        scripts/report2_collection_status.py): query the indexed `ingested_at`
         boundary with an ingest-lag margin, then filter each candidate
-        locally by its exact `started_at`. `/api/sessions/search` itself
+        locally by its exact `started_at`. `/api/sessions/filter` itself
         filters `date_from`/`date_to` on `ingested_at`, not `started_at` —
         the local filter below is what makes the `days` window mean session
         activity time.
@@ -565,21 +651,15 @@ class ReclaimLLMClient:
             _MAX_REPLAY_CANDIDATE_SCAN,
         )
 
-        params: dict[str, Any] = {
-            "date_from": ingested_from.date().isoformat(),
-            "limit": scan_limit,
-            "record_type": "session",
-        }
-        if model_family:
-            params["model_family"] = model_family
-        if project_name:
-            params["project_name"] = project_name
-        if session_category:
-            params["session_category"] = session_category
-        if source and source != "all":
-            params["provider"] = source
-
-        data = await self._request("GET", "/api/sessions/search", params=params)
+        data = await self.filter_sessions(
+            project_name=project_name,
+            file_path=None,
+            limit=scan_limit,
+            date_from=ingested_from.date().isoformat(),
+            model_family=model_family,
+            provider=source if source and source != "all" else None,
+            session_category=session_category,
+        )
         return [
             session
             for session in data.get("sessions", [])
@@ -816,15 +896,16 @@ def build_mcp_server():
         changed_files result for an implementation-history question.
         """
         client = ReclaimLLMClient()
-        return await client.search_sessions(
-            None,
+        data = await client.filter_sessions(
             project_name=project_name,
             file_path=file_path,
-            limit=limit,
+            limit=min(limit, _MAX_LIMIT),
             date_from=date_from,
             date_to=date_to,
             scope=scope,
+            include_changed_files=True,
         )
+        return _public_search_response(data)
 
     @mcp.tool()
     async def get_session(session_id: str) -> dict[str, Any]:
@@ -963,7 +1044,7 @@ def build_mcp_server():
         loosening filters to force a number.
 
         min_turns/min_tool_calls override the turn-count and tool-call-count
-        floors (default 1/1; PRD §6's documented floors are 10/10). Lowering
+        floors (default 5/5; PRD §6's documented floors are 10/10). Lowering
         them trades evidence quality for sample size — state the values used
         alongside any result, don't drop them silently.
         """
@@ -1049,7 +1130,7 @@ def build_mcp_server():
         given an unstable number.
 
         min_turns/min_tool_calls override the turn-count and tool-call-count
-        floors (default 1/1; PRD §6's documented floors are 10/10) —
+        floors (default 5/5; PRD §6's documented floors are 10/10) —
         reported in the output's provenance.
         """
         client = ReclaimLLMClient()
@@ -1090,7 +1171,7 @@ def build_mcp_server():
         rest were excluded.
 
         min_turns/min_tool_calls override the turn-count and tool-call-count
-        floors (default 1/1; PRD §6's documented floors are 10/10) —
+        floors (default 5/5; PRD §6's documented floors are 10/10) —
         reported in the output's provenance.
         """
         client = ReclaimLLMClient()
@@ -1144,7 +1225,7 @@ def build_mcp_server():
         select the corpus, same as replay_corpus.
 
         min_turns/min_tool_calls override the turn-count and tool-call-count
-        floors (default 1/1; PRD §6's documented floors are 10/10) —
+        floors (default 5/5; PRD §6's documented floors are 10/10) —
         reported in each config row's provenance.
         """
         client = ReclaimLLMClient()

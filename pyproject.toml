@@ -58,6 +58,7 @@ rclm-update = "rclm.update:main"
 rclm-compress = "rclm.compress.cli:main"
 rclm-read-cache = "rclm.compress.read_cache_cli:main"
 rclm-mcp = "rclm.mcp_server:main"
+rclm-bench-adapter = "rclm.bench_adapter:main"
 rclm-login = "rclm.login:main"
 
 [tool.ruff]

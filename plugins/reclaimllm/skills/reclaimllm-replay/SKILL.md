@@ -69,8 +69,8 @@ this way when relaying results:
   attributable. Only use when the user is comparing configurations, not for
   a single verification.
 
-All four tools accept `min_turns` (default **1**) and `min_tool_calls`
-(default **1**). PRD §6's documented floors are 10/10; the tool layer
+All four tools accept `min_turns` (default **5**) and `min_tool_calls`
+(default **5**). PRD §6's documented floors are 10/10; the tool layer
 defaults lower so short-session users still get a number. This is a
 visible, stated deviation — every result's `provenance` carries
 `min_turns_applied`/`min_tool_calls_applied` (or the equivalent

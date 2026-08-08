@@ -19,14 +19,15 @@ Usage:
     rclm-hooks-install --claude --codex           # Claude + Codex, global
     rclm-hooks-install --api-key=<key>            # explicit key (skips browser)
     rclm-hooks-install --no-compress               # disable cross-client text compression
+    rclm-hooks-install --no-dlp                    # explicitly disable env-file DLP
     rclm-hooks-install --no-with-mcp               # skip installing ReclaimLLM MCP server
     rclm-hooks-install --no-statusline             # skip the Claude Code statusline
     rclm-hooks-install --no-handoff-advisor        # skip Claude handoff suggestions
     rclm-hooks-install --brevity                   # inject brevity instruction at session start (Claude only)
 
---with-mcp, --read-cache, --loop-breaker, --compress, --statusline, and --handoff-advisor are on by default;
-pass the --no-<flag> form to opt out. --dlp, --context-pack, --shadow-mode, --brevity, and
---image-lifecycle are off by default; pass the flag to opt in. Credentials and preferences are
+--with-mcp, --read-cache, --loop-breaker, --compress, --statusline, --handoff-advisor, and
+--dlp are on by default; pass the --no-<flag> form to opt out. --context-pack, --shadow-mode,
+--brevity, and --image-lifecycle are off by default; pass the flag to opt in. Credentials and preferences are
 stored in ~/.reclaimllm/config.json and reused on subsequent runs.
 """
 
@@ -215,7 +216,7 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --no-statusline          # skip the Claude Code statusline
   %(prog)s --no-handoff-advisor     # skip Claude handoff suggestions
 
---with-mcp, --read-cache, --loop-breaker, --compress, --statusline, and --handoff-advisor are on by default.
+--with-mcp, --read-cache, --loop-breaker, --compress, --statusline, --handoff-advisor, and --dlp are on by default.
 Subsequent installs without --api-key reuse the saved config.""",
     )
 
@@ -303,8 +304,9 @@ Subsequent installs without --api-key reuse the saved config.""",
     )
     parser.add_argument(
         "--dlp",
-        action="store_true",
-        help="Enable Data Loss Prevention: redact secrets from .env files before they reach the model",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=("Data Loss Prevention for env-file secrets. On by default; pass --no-dlp to disable"),
     )
     parser.add_argument(
         "--brevity",
@@ -821,7 +823,7 @@ def main() -> None:
 
     saved_compression = _config.compression_config(saved)
     compress_enabled = args.compress if args.compress is not None else saved_compression["enabled"]
-    dlp_enabled = args.dlp or saved.get("dlp", False)
+    dlp_enabled = args.dlp if args.dlp is not None else _config.dlp_enabled(saved)
     brevity_enabled = args.brevity or saved.get("brevity", False)
     loop_breaker_enabled = (
         args.loop_breaker if args.loop_breaker is not None else saved.get("loop_breaker", True)

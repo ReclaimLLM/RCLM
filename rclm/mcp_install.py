@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 
 _SERVER_NAME = "reclaimllm"
+_MCP_TOOL_TIMEOUT_SECONDS = 600
+_MCP_TOOL_TIMEOUT_MILLISECONDS = _MCP_TOOL_TIMEOUT_SECONDS * 1000
 
 
 def _resolve_binary() -> str:
@@ -47,7 +49,11 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def _mcp_json_entry(command: str) -> dict:
-    return {"command": command, "args": []}
+    return {
+        "command": command,
+        "args": [],
+        "timeout": _MCP_TOOL_TIMEOUT_MILLISECONDS,
+    }
 
 
 def _install_json_mcp(path: Path, command: str) -> None:
@@ -63,7 +69,12 @@ def _toml_string(value: str) -> str:
 
 
 def _codex_block(command: str) -> str:
-    return f"[mcp_servers.{_SERVER_NAME}]\ncommand = {_toml_string(command)}\nargs = []\n"
+    return (
+        f"[mcp_servers.{_SERVER_NAME}]\n"
+        f"command = {_toml_string(command)}\n"
+        "args = []\n"
+        f"tool_timeout_sec = {_MCP_TOOL_TIMEOUT_SECONDS}\n"
+    )
 
 
 def _install_codex_mcp(path: Path, command: str) -> None:

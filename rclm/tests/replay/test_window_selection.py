@@ -79,8 +79,10 @@ async def test_corpus_enumeration_scans_four_times_target_and_returns_candidates
         limit=50,
     )
 
-    assert captured["params"]["record_type"] == "session"
-    assert captured["params"]["limit"] == 200
+    assert captured["path"] == "/api/sessions/filter"
+    assert "record_type" not in captured["params"]
+    assert captured["params"]["include_changed_files"] == "false"
+    assert captured["params"]["limit"] == 100
     assert [session["session_id"] for session in sessions] == [
         f"session-{index}" for index in range(75)
     ]

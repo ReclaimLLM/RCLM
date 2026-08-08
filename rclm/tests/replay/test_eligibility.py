@@ -118,7 +118,7 @@ class TestSessionMetadataEligibility:
 
     def test_default_min_tool_calls_is_unchanged(self):
         """The library default stays PRD §6's 10; only the MCP tool layer
-        exposes a lower default (1) via an explicit min_tool_calls argument."""
+        exposes a lower default (5) via an explicit min_tool_calls argument."""
         result = session_metadata_eligibility(_session(tool_call_count=9))
         assert not result.eligible
         assert result.failing_constraint == "tool_call_count"

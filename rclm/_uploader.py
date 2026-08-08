@@ -20,7 +20,7 @@ from rclm._models import (
     ProxyRecord,
     SessionRecord,
 )
-from rclm.hooks import redaction
+from rclm.hooks import dlp, redaction
 
 _FAILED_UPLOADS_DIR = Path.home() / ".reclaimllm" / "failed_uploads"
 
@@ -39,8 +39,13 @@ def _to_json(record: AnyRecord) -> str:
 def _to_redacted_json(
     record: AnyRecord,
     settings: redaction.RedactionSettings | None = None,
+    *,
+    dlp_enabled: bool = False,
 ) -> str:
-    return redaction.redact_json_payload(_to_json(record), settings)
+    payload = _to_json(record)
+    if dlp_enabled and isinstance(record, HookSessionRecord) and record.cwd:
+        payload = dlp.redact_json_payload(payload, record.cwd)
+    return redaction.redact_json_payload(payload, settings)
 
 
 async def upload(
@@ -60,16 +65,29 @@ async def upload(
         logger.info("rclm upload skipped by local redaction folder filters")
         return
 
+    try:
+        payload = _to_redacted_json(
+            record,
+            redaction_settings,
+            dlp_enabled=_config.dlp_enabled(cfg),
+        )
+    except dlp.DLPRedactionError as exc:
+        logger.error("rclm DLP withheld an unredacted record: %s", exc)
+        print(
+            f"rclm: DLP withheld session {record.session_id}; no data was uploaded or quarantined",
+            file=sys.stderr,
+        )
+        return
+
     creds = _config.resolve_credentials(cfg)
     if creds is None:
         print(f"rclm: {auth.AUTH_REQUIRED_MESSAGE}", file=sys.stderr)
-        _quarantine(record)
+        _quarantine(record, payload=payload)
         return
     url = creds.server_url + INGEST_PATH
     # if len(record.messages) == 0:
     #     logger.warning("Record has empty messages; skipping upload")
     #     return
-    payload = _to_redacted_json(record, redaction_settings)
     headers = {"Content-Type": "application/json", "X-API-Key": creds.api_key}
 
     delays = _RETRY_DELAYS[:max_retries]
@@ -102,10 +120,10 @@ async def upload(
         await asyncio.sleep(delay)
 
     logger.error("rclm upload failed after all retries; quarantining record locally")
-    _quarantine(record)
+    _quarantine(record, payload=payload)
 
 
-def _quarantine(record: AnyRecord) -> None:
+def _quarantine(record: AnyRecord, *, payload: str | None = None) -> None:
     """Write the failed record to ~/.reclaimllm/failed_uploads/ with owner-only permissions.
 
     Emits a one-line stderr notice pointing to the file. The directory and file
@@ -115,7 +133,14 @@ def _quarantine(record: AnyRecord) -> None:
         _FAILED_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(_FAILED_UPLOADS_DIR, 0o700)
         path = _FAILED_UPLOADS_DIR / f"{record.session_id}.json"
-        path.write_text(_to_redacted_json(record), encoding="utf-8")
+        if payload is None:
+            cfg = _config.load()
+            payload = _to_redacted_json(
+                record,
+                redaction.load_settings(cfg),
+                dlp_enabled=_config.dlp_enabled(cfg),
+            )
+        path.write_text(payload, encoding="utf-8")
         os.chmod(path, 0o600)
         print(
             f"rclm: upload failed; record saved to {path}",

@@ -3,6 +3,36 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.26] — 2026-08-07
+
+### Added
+- Added recursive env-file DLP scanning with size limits, symlink skipping, and fail-closed `DLPRedactionError` when a recognized secret source cannot be inspected (`rclm/hooks/dlp.py`)
+- Added secret-shape heuristics (key markers, known token prefixes, entropy, credential URLs, PEM private keys) and public-key exclusions for ambient output scrubbing (`rclm/hooks/dlp.py`)
+- Added shape-preserving `maybe_redact_value`, upload-time `redact_json_payload`, and `reconcile_captured_tool_results` so redacted hook output is what gets captured and uploaded (`rclm/hooks/dlp.py`, `rclm/_uploader.py`, provider handlers)
+- Added shared `/api/sessions/filter` client path (`filter_sessions`) for non-semantic listing used by `search_by_filename`, `file_brief`, handoff, and replay candidate scans (`rclm/mcp_server.py`)
+- Added 600s MCP tool timeouts on install for JSON MCP configs and Codex `tool_timeout_sec` (`rclm/mcp_install.py`)
+- Added `rclm-bench-adapter` console script entry (`pyproject.toml`)
+- Added `--no-dlp` / BooleanOptionalAction for DLP so fresh installs default on while preserving an explicit saved opt-out (`rclm/hooks/installer.py`, `rclm/_config.py`)
+
+### Changed
+- Env-file DLP is now on by default (`DEFAULT_DLP_ENABLED`); README documents `--dlp` / `--no-dlp` behavior
+- Direct env-file reads redact every assignment (`include_all_values`); ambient scans stay conservative and skip fixture/template env filenames
+- Bash DLP now uses `read_cache.parse_shell_read` plus `shlex` tokenization, and blocks `env`/`printenv`/`set` dumps that reference env paths (`rclm/hooks/dlp.py`)
+- Provider PostToolUse DLP now fails closed on env-file access (withhold/redact) instead of silently passing through (`claude_handler.py`, `codex_handler.py`, `cursor_handler.py`, `gemini_handler.py`, `openclaw_handler.py`)
+- `search_sessions` requires a non-empty semantic `query`; empty-query callers move to `filter_sessions` (`rclm/mcp_server.py`)
+- Replay MCP defaults raised from `min_turns`/`min_tool_calls` 1/1 to 5/5; candidate scan cap lowered to 100 via the filter endpoint (`rclm/mcp_server.py`, replay skill)
+- Failed-upload quarantine now writes the already-redacted payload instead of re-serializing without DLP (`rclm/_uploader.py`)
+- MCP HTTP client calls use a 600s total timeout (`rclm/mcp_server.py`)
+
+### Fixed
+- Fixed multiline quoted env values and escaped characters inside inline comments being misparsed during DLP env loading (`rclm/hooks/dlp.py`)
+- Fixed relative env-file Read paths resolving incorrectly when cwd was present (`rclm/hooks/dlp.py`)
+
+### Security
+- Unreadable or oversized env trees no longer fail open: recognized env-file tool access is blocked or withheld, and upload raises `DLPRedactionError` without uploading or quarantining unredacted data (`rclm/hooks/dlp.py`, `rclm/_uploader.py`, provider handlers)
+
+---
+
 ## [v0.1.25] — 2026-08-05
 
 ### Added

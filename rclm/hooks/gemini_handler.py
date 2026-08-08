@@ -125,36 +125,49 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
     tool_response = _normalise_tool_response(payload.get("tool_response"))
     prior_events = session_store.read_events(session_id)
 
+    cfg = _config.load()
+    cwd = _resolve_cwd(session_id, payload)
+    captured_response = tool_response
+    dlp_replacement: str | None = None
+    if _config.dlp_enabled(cfg):
+        try:
+            scrubbed = dlp.maybe_redact_output(
+                tool_name,
+                tool_response,
+                cwd,
+                redact_all=dlp.input_may_read_env(tool_name, payload.get("tool_input", {})),
+            )
+            if scrubbed is not None:
+                captured_response = scrubbed
+                if tool_name in _DLP_SCRUB_TOOLS:
+                    dlp_replacement = scrubbed
+        except dlp.DLPRedactionError as exc:
+            if dlp.input_may_read_env(tool_name, payload.get("tool_input", {})):
+                dlp_replacement = f"[rclm DLP] Output withheld: {exc}"
+                captured_response = dlp_replacement
+            else:
+                logger.warning("DLP could not inspect %s output: %s", tool_name, exc)
+
     session_store.append_event(
         session_id,
         {
             "event_type": "AfterTool",
             "tool_name": tool_name,
             "tool_input": payload.get("tool_input", {}),
-            "tool_response": tool_response,
+            "tool_response": captured_response,
+            "dlp_redacted": dlp_replacement is not None,
             "tool_use_id": payload.get("tool_use_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
 
-    cfg = _config.load()
     policy = _config.effective_hook_policy(cfg, provider="gemini")
     shadow = policy.legacy_shadow
-    cwd = _resolve_cwd(session_id, payload)
     # DLP runs first so dedupe only ever hashes secret-free content.
-    effective_text = tool_response
-    replaced = False
+    effective_text = captured_response
+    replaced = dlp_replacement is not None
     tool_input = payload.get("tool_input", {})
     tool_use_id = payload.get("tool_use_id") or f"gemini-tool-{len(prior_events)}"
-
-    if cfg.get("dlp", False) and tool_name in _DLP_SCRUB_TOOLS:
-        try:
-            scrubbed = dlp.maybe_redact_output(tool_name, tool_response, cwd)
-            if scrubbed is not None:
-                effective_text = scrubbed
-                replaced = True
-        except Exception:
-            pass  # Never let DLP disrupt Gemini CLI
 
     if policy.enabled("range_cache") and tool_name in {"write_file", "replace"}:
         try:

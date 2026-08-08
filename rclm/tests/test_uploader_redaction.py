@@ -7,6 +7,7 @@ import pytest
 from rclm import _config, _uploader
 from rclm._models import HookSessionRecord
 from rclm._uploader import upload
+from rclm.hooks import dlp
 
 
 def _record(cwd: str = "/tmp/project") -> HookSessionRecord:
@@ -47,6 +48,7 @@ async def test_upload_redacts_payload_before_post(tmp_path, monkeypatch):
     _config.patch(
         server_url="https://api.example.test",
         api_key="key",
+        dlp=False,
         redaction={
             "enabled": True,
             "remote_substitutions": {"secret": "[REDACTED]"},
@@ -64,6 +66,53 @@ async def test_upload_redacts_payload_before_post(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_upload_redacts_nested_env_values_before_post(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    nested = project / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env.production").write_text("TOKEN=nested-upload-secret\n")
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _config.patch(
+        server_url="https://api.example.test",
+        api_key="key",
+        dlp=True,
+        redaction={"enabled": False},
+    )
+    record = _record(str(project))
+    record.messages[0]["content"] = "nested-upload-secret"
+    session = _Session()
+
+    await upload(record, session)
+
+    payload = session.posts[0]["data"]
+    assert "nested-upload-secret" not in payload
+    assert "[REDACTED:TOKEN]" in payload
+
+
+@pytest.mark.asyncio
+async def test_upload_dlp_scan_failure_sends_and_quarantines_nothing(tmp_path, monkeypatch, capsys):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text("TOKEN=too-large-for-test\n")
+    monkeypatch.setattr(dlp, "MAX_ENV_FILE_BYTES", 1)
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(_uploader, "_FAILED_UPLOADS_DIR", tmp_path / "failed_uploads")
+    _config.patch(
+        server_url="https://api.example.test",
+        api_key="key",
+        dlp=True,
+        redaction={"enabled": False},
+    )
+    session = _Session()
+
+    await upload(_record(str(project)), session)
+
+    assert session.posts == []
+    assert not (tmp_path / "failed_uploads").exists()
+    assert "no data was uploaded or quarantined" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
 async def test_upload_skips_excluded_folder(tmp_path, monkeypatch):
     project = tmp_path / "private"
     project.mkdir()
@@ -71,6 +120,7 @@ async def test_upload_skips_excluded_folder(tmp_path, monkeypatch):
     _config.patch(
         server_url="https://api.example.test",
         api_key="key",
+        dlp=False,
         redaction={
             "enabled": True,
             "remote_substitutions": {"secret": "[REDACTED]"},
@@ -94,6 +144,7 @@ async def test_upload_skips_outside_include_folder(tmp_path, monkeypatch):
     _config.patch(
         server_url="https://api.example.test",
         api_key="key",
+        dlp=False,
         redaction={
             "enabled": True,
             "remote_substitutions": {},
@@ -118,6 +169,7 @@ async def test_upload_include_folder_supersedes_exclude_folder(tmp_path, monkeyp
     _config.patch(
         server_url="https://api.example.test",
         api_key="key",
+        dlp=False,
         redaction={
             "enabled": True,
             "remote_substitutions": {},
@@ -142,6 +194,7 @@ async def test_upload_prefers_env_server_url_over_config(tmp_path, monkeypatch):
     _config.patch(
         server_url="https://config.example.test",
         api_key="key",
+        dlp=False,
         redaction={
             "enabled": True,
             "remote_substitutions": {},
@@ -163,6 +216,7 @@ async def test_upload_missing_credentials_quarantines_with_message(tmp_path, mon
     monkeypatch.delenv("RECLAIMLLM_SERVER_URL", raising=False)
     monkeypatch.delenv("RECLAIMLLM_API_KEY", raising=False)
     monkeypatch.setattr(_uploader, "_FAILED_UPLOADS_DIR", tmp_path / "failed_uploads")
+    _config.patch(dlp=False)
     session = _Session()
     record = _record()
 

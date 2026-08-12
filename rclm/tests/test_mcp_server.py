@@ -687,6 +687,8 @@ async def test_filter_sessions_is_registered_as_no_query_postgres_tool():
 @pytest.mark.asyncio
 async def test_filter_sessions_tool_calls_postgres_client_with_metadata_filters(monkeypatch):
     captured = {}
+    monkeypatch.setenv("RECLAIMLLM_SERVER_URL", "https://api.test")
+    monkeypatch.setenv("RECLAIMLLM_API_KEY", "test-key")
 
     async def fake_filter_sessions(self, **kwargs):
         captured.update(kwargs)

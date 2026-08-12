@@ -33,6 +33,7 @@ _BASH_REWRITE_COMMANDS = {
     "git",
     "pytest",
     "python",
+    "python3",
     "npm",
     "npx",
     "cargo",
@@ -178,7 +179,7 @@ def is_compressible_command(command: str, *, shell: str = "posix") -> bool:
         if not posix_shell and base_cmd != "Get-Content":
             continue
 
-        if base_cmd == "python" and "-m pytest" not in segment:
+        if base_cmd in {"python", "python3"} and "-m pytest" not in segment:
             continue
         if base_cmd in ("npm", "npx") and not any(
             keyword in segment for keyword in ("test", "jest", "vitest")

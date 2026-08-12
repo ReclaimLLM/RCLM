@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
@@ -147,6 +148,7 @@ def _extract(entries: list[dict]) -> CursorTranscriptData:
                 data.total_input_tokens = (data.total_input_tokens or 0) + in_tokens
                 data.total_output_tokens = (data.total_output_tokens or 0) + out_tokens
 
+    data.file_diffs = coalesce_file_diffs(data.file_diffs)
     return data
 
 
@@ -158,6 +160,75 @@ def _clean_user_text(text: str) -> str:
 
 def _is_redacted_only_assistant(role: str, text: str) -> bool:
     return role == "assistant" and text.strip() == "[REDACTED]"
+
+
+def build_unified_diff(path: str, before: str | None, after: str | None) -> str:
+    """Build a displayable unified diff from available file or snippet content."""
+    return "".join(
+        difflib.unified_diff(
+            (before or "").splitlines(keepends=True),
+            (after or "").splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+
+
+def coalesce_file_diffs(diffs: list[FileDiff]) -> list[FileDiff]:
+    """Keep one ordered diff per path while retaining every replacement hunk."""
+    by_path: dict[str, FileDiff] = {}
+    for diff in diffs:
+        previous = by_path.get(diff.path)
+        if previous is None or diff.before is None:
+            # A full Write supersedes earlier partial edits for the same path.
+            by_path[diff.path] = diff
+            continue
+
+        if (
+            previous.before is None
+            and previous.after is not None
+            and diff.before
+            and diff.after is not None
+            and diff.before in previous.after
+        ):
+            # Apply a later replacement to content captured by an earlier Write.
+            final_content = previous.after.replace(diff.before, diff.after, 1)
+            by_path[diff.path] = FileDiff(
+                path=diff.path,
+                before=None,
+                after=final_content,
+                unified_diff=build_unified_diff(diff.path, None, final_content),
+                timestamp=diff.timestamp or previous.timestamp,
+            )
+            continue
+
+        by_path[diff.path] = FileDiff(
+            path=diff.path,
+            before=_join_fragments(previous.before, diff.before),
+            after=_join_fragments(previous.after, diff.after),
+            unified_diff=_join_diff_chunks(previous.unified_diff, diff.unified_diff),
+            timestamp=diff.timestamp or previous.timestamp,
+        )
+
+    return list(by_path.values())
+
+
+def _join_fragments(left: str | None, right: str | None) -> str | None:
+    if left is None and right is None:
+        return None
+    return "\n".join(part for part in (left, right) if part)
+
+
+def _join_diff_chunks(left: str, right: str) -> str:
+    return "\n".join(chunk.rstrip("\n") for chunk in (left, right) if chunk)
+
+
+def _string_input(tool_input: dict, *keys: str) -> str | None:
+    for key in keys:
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            return value
+    return None
 
 
 def _process_tool_use(block: dict, data: CursorTranscriptData, timestamp: str | None) -> None:
@@ -185,19 +256,31 @@ def _process_tool_use(block: dict, data: CursorTranscriptData, timestamp: str | 
         )
     )
 
-    # Handle 'Write' tool for file_diffs
+    path = _string_input(tool_input, "path", "file_path", "filepath")
+
+    # Cursor uses `contents` in current transcripts; retain older aliases too.
     if tool_name == "Write":
-        path = tool_input.get("path") or tool_input.get("filepath")
-        content = tool_input.get("content") or tool_input.get("text")
-        if path:
+        content = _string_input(tool_input, "contents", "content", "text")
+        if path and content is not None:
             data.file_diffs.append(
                 FileDiff(
                     path=path,
                     before=None,  # We don't have the original content in the transcript
                     after=content,
-                    unified_diff=f"--- {path}\n+++ {path}\n@@ -0,0 +1 @@\n+{content}"
-                    if content
-                    else "",
+                    unified_diff=build_unified_diff(path, None, content),
+                    timestamp=timestamp or "",
+                )
+            )
+    elif tool_name in {"StrReplace", "Edit"}:
+        before = _string_input(tool_input, "old_string", "old_text")
+        after = _string_input(tool_input, "new_string", "new_text")
+        if path and before is not None and after is not None:
+            data.file_diffs.append(
+                FileDiff(
+                    path=path,
+                    before=before,
+                    after=after,
+                    unified_diff=build_unified_diff(path, before, after),
                     timestamp=timestamp or "",
                 )
             )

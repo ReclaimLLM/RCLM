@@ -19,7 +19,9 @@ from rclm.hooks.dlp import (
     maybe_redact_input,
     maybe_redact_output,
     maybe_redact_value,
+    reconcile_captured_tool_inputs,
     reconcile_captured_tool_results,
+    redact_high_confidence_value,
     redact_json_payload,
 )
 
@@ -519,6 +521,33 @@ def test_serialized_multiline_env_value_is_redacted(tmp_path):
 
     assert "line-one" not in result
     assert json.loads(result)["content"] == "[REDACTED:PRIVATE_KEY]"
+
+
+def test_inline_jwt_is_redacted_without_matching_env_file(tmp_path):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.signature_value_12345"
+
+    assert maybe_redact_output("Bash", f"token={jwt}", str(tmp_path)) == "token=[REDACTED:JWT]"
+    assert redact_high_confidence_value({"command": f"curl -H 'Bearer {jwt}'"}) == {
+        "command": "curl -H 'Bearer [REDACTED:JWT]'"
+    }
+    payload = redact_json_payload(json.dumps({"tool_input": {"token": jwt}}), str(tmp_path))
+    assert jwt not in payload
+    assert json.loads(payload)["tool_input"]["token"] == "[REDACTED:JWT]"
+
+
+def test_reconcile_replaces_transcript_tool_input_with_sanitized_capture():
+    call = SimpleNamespace(tool_use_id="call-1", tool_input={"command": "raw-secret"})
+    events = [
+        {
+            "event_type": "PreToolUse",
+            "tool_use_id": "call-1",
+            "tool_input": {"command": "[REDACTED:JWT]"},
+        }
+    ]
+
+    reconcile_captured_tool_inputs([call], events)
+
+    assert call.tool_input == {"command": "[REDACTED:JWT]"}
 
 
 @pytest.mark.parametrize(

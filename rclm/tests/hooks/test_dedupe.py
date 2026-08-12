@@ -32,6 +32,15 @@ def test_identical_result_returns_pointer_and_lru_is_bounded():
     assert len(state) == 1
 
 
+def test_identical_result_pointer_is_deterministic_for_replay():
+    text = "result line\n" * 100
+    _, state, _ = maybe_dedupe(text, {}, tool_name="Read", turn=1)
+
+    replacements = {maybe_dedupe(text, state, tool_name="Read", turn=2)[0] for _ in range(10)}
+
+    assert len(replacements) == 1
+
+
 def test_error_dict_is_never_deduplicated():
     replacement, state, match = maybe_dedupe(
         {"is_error": True, "content": "x" * 600}, {}, tool_name="Bash", turn=1

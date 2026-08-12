@@ -29,7 +29,7 @@ ReclaimLLM is an app that adds persistent memory to AI applications. It captures
 
 Every ReclaimLLM memory workflow follows the same pattern: retrieve, reason, and optionally expand.
 
-1. Retrieve relevant memories with `search_sessions`, `search_by_filename`, or `list_projects`.
+1. Retrieve relevant memories with `search_sessions`, `filter_sessions`, `search_by_filename`, or `list_projects`.
 2. Reason over the result titles, timestamps, projects, models, highlights, and changed files together with the current repo or user prompt.
 3. When identifying which session implemented something, use `search_by_filename` on a relevant `changed_files` path to inspect the latest sessions that changed it.
 4. Expand a chosen memory with `get_session`, `summarize_session`, or `transfer_session` only when the user asks to inspect or reuse a specific session.
@@ -37,6 +37,7 @@ Every ReclaimLLM memory workflow follows the same pattern: retrieve, reason, and
 ## Tool Routing
 
 - Use `search_sessions` for arbitrary memory search by topic, intent, feature, bug, architecture decision, performance issue, prior implementation, or user preference. If the prompt also includes a file or folder path, pass that path as `file_path`. Results include up to three changed source files. Use `date_from` and exclusive `date_to` for ingestion-time windows.
+- Use `filter_sessions` when there is no semantic text query and the user wants sessions matching metadata or an ingestion-date window. It calls the authoritative Postgres filter route rather than Qdrant. Use `provider="codex"` for Codex/GPT-family sessions. Do not invent a text query to use `search_sessions`.
 - Use `search_by_filename` for file/folder-only memory requests such as "what changed in auth.tsx" or "show history under /api/auth". Also use it after an intent search identifies a likely file in `changed_files` and the user wants the implementation history. It accepts the same ingestion-date window.
 - Use `list_projects` when the user asks which project memories exist, wants to choose a project filter, or the same query may span unrelated projects.
 - Use `get_session` only when the user asks to inspect a specific ReclaimLLM session ID. This returns metadata, a short summary, and a frontend link.
@@ -69,6 +70,7 @@ The MCP server reads credentials from `~/.reclaimllm/config.json`, falling back 
 | Tool | Use |
 |------|-----|
 | `search_sessions` | Arbitrary semantic memory search across captured sessions. |
+| `filter_sessions` | Postgres session listing for metadata/date filters without text. |
 | `search_by_filename` | File or folder history search. |
 | `list_projects` | Discover available project filters. |
 | `get_session` | Retrieve metadata and a link for a known session ID. |

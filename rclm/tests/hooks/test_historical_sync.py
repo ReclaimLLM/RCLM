@@ -549,6 +549,23 @@ def _cursor_jsonl_entries():
             "timestamp": "2024-01-01T00:00:01Z",
             "usage": {"input": 10, "output": 5},
         },
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "StrReplace",
+                        "input": {
+                            "path": "/repo/app.py",
+                            "old_string": "old",
+                            "new_string": "new",
+                        },
+                    }
+                ]
+            },
+            "timestamp": "2024-01-01T00:00:02Z",
+        },
     ]
 
 
@@ -563,6 +580,9 @@ def test_parse_cursor_session_basic(tmp_path):
     assert len(record.messages) == 2
     assert record.total_input_tokens == 10
     assert record.total_output_tokens == 5
+    assert len(record.file_diffs) == 1
+    assert record.file_diffs[0].path == "/repo/app.py"
+    assert record.unique_files_modified == 1
     assert record.is_sync is True
 
 

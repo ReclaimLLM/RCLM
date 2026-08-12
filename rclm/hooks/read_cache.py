@@ -19,6 +19,7 @@ from typing import Any
 MAX_TRACKED_FILES = 200
 MAX_TRACKED_SPANS = 2_000
 STATE_VERSION = 1
+READ_REQUEST_METADATA_VERSION = 1
 
 _SED_RANGE = re.compile(r"^(?P<start>[1-9]\d*)(?:,(?P<end>[1-9]\d*))?p$")
 _AWK_RANGE = re.compile(r"^\s*NR\s*>=\s*(?P<start>[1-9]\d*)\s*&&\s*NR\s*<=\s*(?P<end>[1-9]\d*)\s*$")
@@ -49,6 +50,61 @@ class ReadRequest:
     @property
     def display_path(self) -> str:
         return self.metadata.display_path
+
+
+def serialize_read_request(request: ReadRequest) -> dict:
+    """Return a JSON-safe capture of the exact request used by H1."""
+    return {
+        "schema_version": READ_REQUEST_METADATA_VERSION,
+        "absolute_path": request.metadata.absolute_path,
+        "display_path": request.metadata.display_path,
+        "content_hash": request.metadata.content_hash,
+        "line_count": request.metadata.line_count,
+        "size": request.metadata.size,
+        "start_line": request.start_line,
+        "end_line": request.end_line,
+        "output_style": request.output_style,
+    }
+
+
+def deserialize_read_request(value: object) -> ReadRequest | None:
+    """Validate captured H1 metadata and rebuild its provider-neutral value."""
+    try:
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            return None
+        absolute_path = value.get("absolute_path")
+        display_path = value.get("display_path")
+        content_hash = value.get("content_hash")
+        output_style = value.get("output_style")
+        integers = [
+            value.get("line_count"),
+            value.get("size"),
+            value.get("start_line"),
+            value.get("end_line"),
+        ]
+        if not all(isinstance(item, int) and not isinstance(item, bool) for item in integers):
+            return None
+        line_count, size, start_line, end_line = integers
+        if (
+            not isinstance(absolute_path, str)
+            or not absolute_path
+            or not isinstance(display_path, str)
+            or not display_path
+            or not isinstance(content_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", content_hash) is None
+            or not isinstance(output_style, str)
+            or output_style not in {"plain", "native", "tail", "cat", "nl"}
+            or line_count < 1
+            or size < 0
+            or start_line < 1
+            or end_line < start_line
+            or end_line > line_count
+        ):
+            return None
+        metadata = FileMetadata(absolute_path, display_path, content_hash, line_count, size)
+        return ReadRequest(metadata, start_line, end_line, output_style)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)

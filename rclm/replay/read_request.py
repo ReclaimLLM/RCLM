@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-from rclm.hooks.read_cache import FileMetadata, ReadRequest
+from rclm.hooks.read_cache import FileMetadata, ReadRequest, deserialize_read_request
 
 _NUMBERED_LINE = re.compile(r"^\s*(\d+)→(.*)$")
 _SED_RANGE = re.compile(r"^(?P<start>[1-9]\d*)(?:,(?P<end>[1-9]\d*))?p$")
@@ -195,6 +195,7 @@ def build_read_request(
     tool_name: str,
     tool_input: object,
     content: str,
+    captured_metadata: object = None,
 ) -> tuple[ReadRequest, str] | None:
     """Dispatch to the native or shell read-request builder, or None.
 
@@ -203,6 +204,14 @@ def build_read_request(
     name = tool_name.lower()
     if not isinstance(tool_input, dict):
         return None
+    captured = deserialize_read_request(captured_metadata)
+    if captured is not None and name in _NATIVE_READ_TOOL_NAMES | _SHELL_READ_TOOL_NAMES:
+        trailing = ""
+        if name in _NATIVE_READ_TOOL_NAMES:
+            split = split_native_read_block(content)
+            if split is not None:
+                _block, trailing = split
+        return captured, trailing
     if name in _NATIVE_READ_TOOL_NAMES:
         return build_native_read_request(tool_input, content)
     if name in _SHELL_READ_TOOL_NAMES:

@@ -3,6 +3,35 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.27] — 2026-08-12
+
+### Added
+- Added a public `filter_sessions` MCP tool for authoritative Postgres metadata and ingestion-date filtering without semantic search (`rclm/mcp_server.py`, bundled memory skill)
+- Added reversible search-result and path-list folding, including chained-shell fallback and independently attributed multi-stage savings (`rclm/compress/filters/lossless.py`, `rclm/hooks/tool_result_transform.py`)
+- Added capture and validation of range-read request metadata so replay can reproduce cache behavior without access to the historical filesystem (`rclm/hooks/read_cache.py`, `rclm/replay/read_request.py`)
+- Added native compaction support for Playwright accessibility snapshots and read-only Supabase SQL result envelopes (`rclm/hooks/tool_result_transform.py`)
+- Added Anthropic Messages API image-block detection and downscaling while preserving the original source envelope (`rclm/hooks/image_lifecycle.py`)
+
+### Changed
+- Replay corpus selection now uses the caller's own sessions and an exact rolling `ingested_at` window, applies minimum turn/tool-call filters server-side, and restricts Codex source matches to `gpt-*` and `codex-*` models (`rclm/mcp_server.py`)
+- Range-cache misses and unresolvable reads now fall through to execution compaction and hash deduplication; unresolvable text remains in the replay denominator (`rclm/hooks/claude_handler.py`, `rclm/replay/engine.py`)
+- Compression and deduplication wording is now deterministic so repeated replay runs produce stable results (`rclm/compress/filters/test.py`, `rclm/hooks/dedupe.py`)
+- Shell compaction recognizes `python3 -m pytest`, preserves single-text-block list envelopes, and records every applied compression strategy (`rclm/hooks/compress.py`, `rclm/hooks/tool_result_transform.py`)
+
+### Fixed
+- Fixed Codex file-diff capture for authoritative `patch_apply_end` add, update, delete, and move events (`rclm/hooks/codex_transcript.py`)
+- Fixed Cursor project resolution from `workspace_roots` and file-diff capture for current `Write.contents`, `StrReplace`, and `Edit` transcript shapes, including historical sync (`rclm/hooks/cursor_handler.py`, `rclm/hooks/cursor_transcript.py`, `rclm/hooks/historical_sync.py`)
+- Fixed Claude compacted list responses violating the PostToolUse output contract by serializing model-visible replacements while preserving captured structure (`rclm/hooks/claude_handler.py`)
+- Fixed first-seen range reads suppressing downstream compaction despite leaving the original tool result unchanged (`rclm/hooks/claude_handler.py`)
+
+### Security
+- Redacted inline JWTs and high-confidence secrets from captured tool inputs, transcript reconciliation, and serialized uploads even without a matching env file (`rclm/hooks/dlp.py`, `rclm/hooks/claude_handler.py`, `rclm/_uploader.py`)
+
+### Performance
+- Compacted repeated search prefixes, directory prefixes, large browser snapshots, and sampled read-only SQL rows with bounded, fail-open transforms (`rclm/compress/filters/lossless.py`, `rclm/hooks/tool_result_transform.py`)
+
+---
+
 ## [v0.1.26] — 2026-08-07
 
 ### Added

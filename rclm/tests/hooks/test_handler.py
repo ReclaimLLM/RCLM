@@ -865,6 +865,32 @@ def test_read_cache_first_read_no_output(monkeypatch, tmp_path, capsys):
     assert entry["spans"] == [{"start": 1, "end": 80, "turn": 1}]
 
 
+def test_read_cache_miss_falls_through_to_shell_compaction(monkeypatch, tmp_path, capsys):
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True, "compress": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    target = tmp_path / "a.py"
+    content = "".join(f"unique line {line}\n" for line in range(1, 101))
+    target.write_text(content)
+    payload = {
+        "session_id": "sid-range-fallthrough",
+        "tool_name": "Bash",
+        "tool_input": {"command": f"sed -n '1,100p' {target}"},
+        "tool_response": content,
+        "cwd": str(tmp_path),
+        "tool_use_id": "tool-range-fallthrough",
+    }
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    assert "40 lines omitted" in output["hookSpecificOutput"]["updatedToolOutput"]
+
+
 def test_read_cache_unchanged_reread_records_unenforced_potential(monkeypatch, tmp_path, capsys):
     from rclm import _config
     from rclm.hooks import session_store
@@ -1090,6 +1116,31 @@ def test_post_tool_use_compacts_recognized_shell_output(monkeypatch, tmp_path, c
     transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
     assert transformation["compression_strategy"] == "H3_exec_compaction"
     assert transformation["applied"] is True
+
+
+def test_post_tool_use_serializes_compacted_native_text_array(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"compression": {"enabled": True}})
+    snapshot = "\n".join(f"- generic [ref=e{line}]: item {line}" for line in range(100))
+    payload = {
+        "session_id": "sid-native-compact",
+        "cwd": "/repo",
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__playwright__browser_snapshot",
+        "tool_input": {},
+        "tool_response": [{"type": "text", "text": snapshot}],
+        "tool_use_id": "call-native-compact",
+    }
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    replacement = output["hookSpecificOutput"]["updatedToolOutput"]
+    assert isinstance(replacement, str)
+    assert "40 lines omitted" in json.loads(replacement)[0]["text"]
 
 
 def test_post_tool_use_dlp_output_matches_claude_schema(monkeypatch, tmp_path, capsys):
@@ -1339,6 +1390,11 @@ def test_repeated_read_stop_emits_session_and_per_call_range_savings(monkeypatch
     assert tool_call.compression_strategy == "range_cache"
     assert tool_call.raw_token_estimate > tool_call.compressed_token_estimate
     assert tool_call.extra_fields["compression_file_path"] == "source.py"
+    replay_request = tool_call.extra_fields["replay_read_request"]
+    assert replay_request["schema_version"] == 1
+    assert replay_request["display_path"] == "source.py"
+    assert replay_request["start_line"] == 1
+    assert replay_request["end_line"] == 80
 
 
 def test_stop_records_missing_tool_hook_health_without_retaining_content(

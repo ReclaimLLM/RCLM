@@ -82,6 +82,7 @@ Start a new agent thread and confirm the `reclaimllm` plugin and MCP server are 
 | Tool | Description |
 |---|---|
 | `search_sessions` | Hybrid semantic + keyword search across captured sessions by topic, error, file, or date range. |
+| `filter_sessions` | Authoritative Postgres session listing for metadata/date filters when there is no semantic text query. |
 | `search_by_filename` | File/folder-scoped session history, e.g. "what changed in `auth.tsx`". |
 | `get_session` | Summary metadata and a frontend link for one session ID. |
 | `summarize_session` | Pull a specific session's summary in as working context, on explicit request. |

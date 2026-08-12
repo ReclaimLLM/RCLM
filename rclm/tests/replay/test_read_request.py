@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from rclm.hooks.read_cache import process_read
+from rclm.hooks.read_cache import FileMetadata, ReadRequest, process_read, serialize_read_request
 from rclm.replay.read_request import (
     build_native_read_request,
     build_read_request,
@@ -84,6 +84,26 @@ class TestDispatchAndInterop:
 
     def test_unknown_tool_returns_none(self):
         assert build_read_request("Edit", {"file_path": "/a.py"}, "x") is None
+
+    def test_prefers_valid_capture_metadata_for_plain_native_output(self):
+        request = ReadRequest(
+            FileMetadata("/past/a.py", "a.py", "a" * 64, 2, 12),
+            1,
+            2,
+            "native",
+        )
+
+        built = build_read_request(
+            "Read",
+            {"file_path": "/past/a.py"},
+            "plain first line\nplain second line\n",
+            serialize_read_request(request),
+        )
+
+        assert built is not None
+        captured, trailing = built
+        assert captured == request
+        assert trailing == ""
 
     def test_built_request_feeds_process_read_cleanly(self):
         content = _numbered(1, 20)

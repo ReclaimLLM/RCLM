@@ -125,6 +125,12 @@ class TestCompressBash:
         assert "rclm-compress" in result["command"]
 
     @patch("rclm.hooks.compress._compress_available", return_value=True)
+    def test_python3_pytest_rewritten(self, mock_avail):
+        result = maybe_compress("Bash", {"command": "python3 -m pytest tests/ -v"})
+        assert result is not None
+        assert "rclm-compress" in result["command"]
+
+    @patch("rclm.hooks.compress._compress_available", return_value=True)
     def test_npm_test_rewritten(self, mock_avail):
         result = maybe_compress("Bash", {"command": "npm test"})
         assert result is not None

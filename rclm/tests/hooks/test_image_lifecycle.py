@@ -49,6 +49,13 @@ def _mcp_image_block(b64: str, media_type: str = "image/png") -> dict:
     return {"type": "image", "data": b64, "mimeType": media_type}
 
 
+def _anthropic_image_block(b64: str, media_type: str = "image/png") -> dict:
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": b64},
+    }
+
+
 def _mcp_call_tool_result(b64: str, *, with_structured_mirror: bool = True) -> dict:
     result = {
         "content": [_mcp_image_block(b64)],
@@ -74,6 +81,12 @@ class TestFindImage:
     def test_bare_mcp_image_block(self):
         b64 = _b64_image(10, 10)
         ref = find_image(_mcp_image_block(b64))
+        assert ref is not None
+        assert ref.base64_data == b64
+
+    def test_anthropic_image_block_in_top_level_content_list(self):
+        b64 = _b64_image(10, 10)
+        ref = find_image([_anthropic_image_block(b64)])
         assert ref is not None
         assert ref.base64_data == b64
 
@@ -190,6 +203,18 @@ class TestMaybeDownscaleImageResult:
         assert new_tr["content"][0]["data"] != b64
         assert new_tr["structuredContent"]["data"] != b64
         assert new_tr["content"][0]["data"] == new_tr["structuredContent"]["data"]
+
+    def test_anthropic_content_block_preserves_source_envelope(self):
+        b64 = _b64_image(2000, 2000)
+        result = maybe_downscale_image_result(
+            [_anthropic_image_block(b64)], min_size_bytes=1, max_dim=100
+        )
+        assert result is not None
+        new_block = result.new_tool_response[0]
+        assert new_block["type"] == "image"
+        assert new_block["source"]["type"] == "base64"
+        assert new_block["source"]["media_type"] == "image/jpeg"
+        assert new_block["source"]["data"] != b64
 
     def test_corrupt_image_payload_returns_none_never_raises(self):
         result = maybe_downscale_image_result(

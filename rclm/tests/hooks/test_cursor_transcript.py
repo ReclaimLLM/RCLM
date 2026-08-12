@@ -165,6 +165,57 @@ def test_parses_nested_content_and_write_tool(tmp_path):
     assert data.file_diffs[0].timestamp == "2024-01-01T00:00:10Z"
 
 
+def test_parses_current_write_and_coalesces_str_replace_tools(tmp_path):
+    entries = [
+        {
+            "role": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "StrReplace",
+                        "input": {
+                            "path": "/repo/existing.py",
+                            "old_string": "old_one",
+                            "new_string": "new_one",
+                        },
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "StrReplace",
+                        "input": {
+                            "path": "/repo/existing.py",
+                            "old_string": "old_two",
+                            "new_string": "new_two",
+                        },
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Write",
+                        "input": {
+                            "path": "/repo/new.py",
+                            "contents": "first\nsecond\n",
+                        },
+                    },
+                ]
+            },
+            "timestamp": "2026-08-07T12:00:00Z",
+        }
+    ]
+    path = _write_transcript(tmp_path / "cursor.jsonl", entries)
+
+    data = parse_transcript(path)
+
+    assert [diff.path for diff in data.file_diffs] == ["/repo/existing.py", "/repo/new.py"]
+    assert data.file_diffs[0].before == "old_one\nold_two"
+    assert data.file_diffs[0].after == "new_one\nnew_two"
+    assert "-old_one" in data.file_diffs[0].unified_diff
+    assert "+new_two" in data.file_diffs[0].unified_diff
+    assert data.file_diffs[1].before is None
+    assert data.file_diffs[1].after == "first\nsecond\n"
+    assert "+first" in data.file_diffs[1].unified_diff
+
+
 def test_drops_assistant_message_that_is_only_redacted_text(tmp_path):
     entries = [
         {

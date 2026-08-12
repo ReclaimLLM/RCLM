@@ -107,6 +107,9 @@ _ENV_PATH_REFERENCE = re.compile(
 _CREDENTIAL_URL = re.compile(r"^[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s/]+@", re.IGNORECASE)
 _OPAQUE_TOKEN = re.compile(r"^[A-Za-z0-9_+./=-]+$")
 _HEX_TOKEN = re.compile(r"^[A-Fa-f0-9]{32,}$")
+_JWT_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +403,7 @@ def _scrub(text: str, scrub_set: list[tuple[str, str]]) -> str:
     """Apply all (value → placeholder) substitutions to text."""
     for val, placeholder in scrub_set:
         text = text.replace(val, placeholder)
-    return text
+    return _JWT_TOKEN.sub("[REDACTED:JWT]", text)
 
 
 def _scrub_value(value: object, scrub_set: list[tuple[str, str]]) -> tuple[object, bool]:
@@ -486,11 +489,7 @@ def maybe_redact_output(
     """PostToolUse: return scrubbed response string if secrets were found, else None."""
     _ = tool_name  # reserved for future per-tool filtering
     secrets = _load_secrets(cwd, include_non_secret_files=redact_all)
-    if not secrets:
-        return None
     scrub_set = _build_scrub_set(secrets, include_all_values=redact_all)
-    if not scrub_set:
-        return None
     response_str = tool_response if isinstance(tool_response, str) else str(tool_response or "")
     scrubbed = _scrub(response_str, scrub_set)
     return scrubbed if scrubbed != response_str else None
@@ -500,9 +499,13 @@ def maybe_redact_value(value: object, cwd: str, *, redact_all: bool = False) -> 
     """Return a shape-preserving redacted copy, or None when no value changed."""
     secrets = _load_secrets(cwd, include_non_secret_files=redact_all)
     scrub_set = _build_scrub_set(secrets, include_all_values=redact_all)
-    if not scrub_set:
-        return None
     scrubbed, changed = _scrub_value(value, scrub_set)
+    return scrubbed if changed else None
+
+
+def redact_high_confidence_value(value: object) -> object | None:
+    """Redact self-identifying secret shapes without reading workspace files."""
+    scrubbed, changed = _scrub_value(value, [])
     return scrubbed if changed else None
 
 
@@ -515,7 +518,7 @@ def redact_json_payload(payload: str, cwd: str) -> str:
         encoded_value = json.dumps(value)[1:-1]
         encoded_placeholder = json.dumps(placeholder)[1:-1]
         payload = payload.replace(encoded_value, encoded_placeholder)
-    return payload
+    return _scrub(payload, [])
 
 
 def reconcile_captured_tool_results(tool_calls: list[object], events: list[dict]) -> None:
@@ -529,6 +532,19 @@ def reconcile_captured_tool_results(tool_calls: list[object], events: list[dict]
         tool_use_id = getattr(call, "tool_use_id", None)
         if tool_use_id in redacted_by_id:
             call.tool_result = redacted_by_id[tool_use_id]
+
+
+def reconcile_captured_tool_inputs(tool_calls: list[object], events: list[dict]) -> None:
+    """Replace transcript inputs with the already-sanitized hook capture."""
+    redacted_by_id = {
+        event.get("tool_use_id"): event.get("tool_input")
+        for event in events
+        if event.get("event_type") == "PreToolUse" and event.get("tool_use_id")
+    }
+    for call in tool_calls:
+        tool_use_id = getattr(call, "tool_use_id", None)
+        if tool_use_id in redacted_by_id:
+            call.tool_input = redacted_by_id[tool_use_id]
 
 
 # ---------------------------------------------------------------------------

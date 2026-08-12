@@ -399,6 +399,83 @@ def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
     assert data.file_diffs[0].timestamp == "2026-04-07T12:52:34.670Z"
 
 
+def test_codex_transcript_parses_patch_apply_end_diffs(tmp_path):
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-10T15:32:29.622Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "patch_apply_end",
+                            "success": True,
+                            "status": "completed",
+                            "changes": {
+                                "/repo/existing.py": {
+                                    "type": "update",
+                                    "unified_diff": "@@ -1,2 +1,2 @@\n keep\n-old\n+new\n",
+                                    "move_path": None,
+                                },
+                                "/repo/new.py": {
+                                    "type": "add",
+                                    "unified_diff": "@@ -0,0 +1,2 @@\n+first\n+second\n",
+                                    "move_path": None,
+                                },
+                                "/repo/old.py": {
+                                    "type": "delete",
+                                    "unified_diff": "@@ -1 +0,0 @@\n-old\n",
+                                    "move_path": None,
+                                },
+                                "/repo/source.py": {
+                                    "type": "update",
+                                    "unified_diff": "",
+                                    "move_path": "/repo/destination.py",
+                                },
+                            },
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-10T15:32:30.000Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "patch_apply_end",
+                            "success": False,
+                            "changes": {
+                                "/repo/failed.py": {
+                                    "type": "add",
+                                    "unified_diff": "+not-applied\n",
+                                }
+                            },
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert [diff.path for diff in data.file_diffs] == [
+        "/repo/existing.py",
+        "/repo/new.py",
+        "/repo/old.py",
+        "/repo/destination.py",
+    ]
+    assert data.file_diffs[0].before == "keep\nold"
+    assert data.file_diffs[0].after == "keep\nnew"
+    assert data.file_diffs[0].unified_diff.startswith("@@ -1,2 +1,2 @@")
+    assert data.file_diffs[0].timestamp == "2026-08-10T15:32:29.622Z"
+    assert data.file_diffs[1].before is None
+    assert data.file_diffs[1].after == "first\nsecond"
+    assert data.file_diffs[2].before == "old"
+    assert data.file_diffs[2].after is None
+
+
 def test_codex_transcript_parses_model_and_cumulative_usage_with_reset(tmp_path):
     transcript_path = tmp_path / "usage.jsonl"
     entries = [

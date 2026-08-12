@@ -140,12 +140,16 @@ async def test_filter_sessions_uses_postgres_without_text_or_record_type_params(
         project_name=None,
         file_path="auth.tsx",
         limit=8,
+        min_turns=5,
+        min_tool_calls=5,
         include_changed_files=True,
     )
 
     assert "text_query" not in seen_params
     assert seen_params["file_path"] == "auth.tsx"
     assert seen_params["include_changed_files"] == "true"
+    assert seen_params["min_turns"] == 5
+    assert seen_params["min_tool_calls"] == 5
     assert "record_type" not in seen_params
     assert result["sessions"][0]["title"] == "Touched auth.tsx"
 
@@ -656,8 +660,65 @@ async def test_transfer_session_is_registered_as_mcp_tool():
 async def test_search_tools_do_not_expose_record_type_override():
     tools = {tool.name: tool for tool in await mcp_server.build_mcp_server().list_tools()}
 
-    for name in ("search_sessions", "search_by_filename"):
+    for name in ("search_sessions", "filter_sessions", "search_by_filename"):
         assert "record_type" not in tools[name].inputSchema.get("properties", {})
+
+
+@pytest.mark.asyncio
+async def test_filter_sessions_is_registered_as_no_query_postgres_tool():
+    tools = {tool.name: tool for tool in await mcp_server.build_mcp_server().list_tools()}
+
+    schema = tools["filter_sessions"].inputSchema
+    properties = schema["properties"]
+    assert "query" not in properties
+    assert "text_query" not in properties
+    assert properties["limit"]["default"] == 50
+    assert {
+        "provider",
+        "model",
+        "model_family",
+        "date_from",
+        "date_to",
+        "min_turns",
+        "min_tool_calls",
+    } <= properties.keys()
+
+
+@pytest.mark.asyncio
+async def test_filter_sessions_tool_calls_postgres_client_with_metadata_filters(monkeypatch):
+    captured = {}
+
+    async def fake_filter_sessions(self, **kwargs):
+        captured.update(kwargs)
+        return {"sessions": [], "scope": "mine"}
+
+    monkeypatch.setattr(
+        mcp_server.ReclaimLLMClient,
+        "filter_sessions",
+        fake_filter_sessions,
+    )
+
+    await mcp_server.build_mcp_server().call_tool(
+        "filter_sessions",
+        {
+            "provider": "codex",
+            "date_from": "2026-07-24",
+            "date_to": "2026-08-09",
+            "scope": "mine",
+            "limit": 100,
+            "min_turns": 5,
+            "min_tool_calls": 5,
+        },
+    )
+
+    assert captured["provider"] == "codex"
+    assert captured["date_from"] == "2026-07-24"
+    assert captured["date_to"] == "2026-08-09"
+    assert captured["scope"] == "mine"
+    assert captured["limit"] == 100
+    assert captured["min_turns"] == 5
+    assert captured["min_tool_calls"] == 5
+    assert captured["include_changed_files"] is False
 
 
 @pytest.mark.asyncio

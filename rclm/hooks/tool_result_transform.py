@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import TypeAlias
 
+from rclm.compress.filters.lossless import MECHANISM as LOSSLESS_SEARCH_PATH_MECHANISM
+from rclm.compress.filters.lossless import compact_search_and_paths
+from rclm.compress.filters.shell import filter_generic
 from rclm.compress.runner import apply_filter
 from rclm.hooks import image_lifecycle
 from rclm.hooks._analytics import estimate_tokens, mechanism_saving_event
@@ -21,6 +25,23 @@ _PathPart: TypeAlias = str | int
 _MAX_JSON_PARSE_CHARS = 2_000_000
 _MAX_CONTENT_BLOCKS = 64
 _SHELL_TOOL_NAMES = frozenset({"bash", "exec", "exec_command", "shell"})
+_SQL_READ_PREFIX = re.compile(r"^\s*(?:select|explain|show)\b", re.IGNORECASE)
+_SQL_UNTRUSTED_BLOCK = re.compile(
+    r"<(?P<tag>untrusted-data-[A-Za-z0-9-]+)>\n(?P<data>.*?)\n</(?P=tag)>",
+    re.DOTALL,
+)
+_SQL_HEAD_ROWS = 12
+_SQL_TAIL_ROWS = 6
+_SQL_MIN_ROWS = 30
+
+
+@dataclass(frozen=True)
+class SavingsStep:
+    """One independently attributable stage of a model-visible transform."""
+
+    mechanism: str
+    original_text: str
+    compressed_text: str
 
 
 @dataclass(frozen=True)
@@ -33,6 +54,7 @@ class TransformDecision:
     wire_replacement: object
     structured_replacement: object
     model_text: str
+    savings_steps: tuple[SavingsStep, ...]
 
     @property
     def raw_chars(self) -> int:
@@ -69,6 +91,7 @@ def decision_from_replacement(
     replacement: str,
     *,
     mechanism: str,
+    savings_steps: tuple[SavingsStep, ...] | None = None,
 ) -> TransformDecision | None:
     """Build a standard decision for stateful mechanisms such as dedupe."""
     if not replacement or replacement == envelope.text or len(replacement) >= len(envelope.text):
@@ -81,6 +104,7 @@ def decision_from_replacement(
         wire_replacement=wire,
         structured_replacement=structured,
         model_text=model_text,
+        savings_steps=savings_steps or (SavingsStep(mechanism, envelope.text, replacement),),
     )
 
 
@@ -95,8 +119,7 @@ def compact_tool_result(
     already-small results pass through unchanged.
     """
     if (
-        tool_name.lower() not in _SHELL_TOOL_NAMES
-        or not isinstance(tool_input, dict)
+        not isinstance(tool_input, dict)
         or _is_error_result(tool_response)
         or _has_oversized_content_list(tool_response)
     ):
@@ -104,15 +127,6 @@ def compact_tool_result(
     if image_lifecycle.find_image(tool_response) is not None:
         return None
     if isinstance(tool_response, str) and _looks_like_encoded_image(tool_response):
-        return None
-
-    command = tool_input.get("command") or tool_input.get("cmd")
-    if not isinstance(command, str):
-        return None
-    shell = tool_input.get("shell")
-    if not isinstance(shell, str) or not shell.strip():
-        shell = "posix" if os.name == "posix" else os.name
-    if not is_compressible_command(command, shell=shell):
         return None
 
     envelope = extract_text_envelope(tool_response)
@@ -124,18 +138,61 @@ def compact_tool_result(
     exit_code = _exit_code(tool_response)
     if exit_code not in (None, 0):
         return None
-    result = apply_filter(command, envelope.text, "", exit_code=exit_code or 0)
-    if (
-        result.mechanism is None
-        or result.text == envelope.text
-        or len(result.text) >= len(envelope.text)
-    ):
-        return None
 
+    native_replacement = _compact_known_native_tool(tool_name, tool_input, envelope.text)
+    if native_replacement is not None:
+        return decision_from_replacement(
+            envelope,
+            native_replacement,
+            mechanism="H3_exec_compaction",
+        )
+
+    if tool_name.lower() not in _SHELL_TOOL_NAMES:
+        return None
+    command = tool_input.get("command") or tool_input.get("cmd")
+    if isinstance(command, str):
+        shell = tool_input.get("shell")
+        if not isinstance(shell, str) or not shell.strip():
+            shell = "posix" if os.name == "posix" else os.name
+        if is_compressible_command(command, shell=shell):
+            result = apply_filter(command, envelope.text, "", exit_code=exit_code or 0)
+            if (
+                result.mechanism is not None
+                and result.text != envelope.text
+                and len(result.text) < len(envelope.text)
+            ):
+                # Preserve the command-aware mechanism as the primary label,
+                # then remove repeated search/path prefixes from its result.
+                # The second fold is independently round-trip verified.
+                folded_text = compact_search_and_paths(result.text)
+                filtered_text = folded_text or result.text
+                savings_steps = None
+                if folded_text is not None:
+                    savings_steps = (
+                        SavingsStep(result.mechanism, envelope.text, result.text),
+                        SavingsStep(
+                            LOSSLESS_SEARCH_PATH_MECHANISM,
+                            result.text,
+                            folded_text,
+                        ),
+                    )
+                return decision_from_replacement(
+                    envelope,
+                    filtered_text,
+                    mechanism=result.mechanism,
+                    savings_steps=savings_steps,
+                )
+
+    # Chained commands and absolute binaries often obscure an otherwise clear
+    # grep/find result from the command parser. Use only reversible shape folds
+    # as the final shell fallback; ambiguous output remains byte-for-byte intact.
+    folded = compact_search_and_paths(envelope.text)
+    if folded is None:
+        return None
     return decision_from_replacement(
         envelope,
-        result.text,
-        mechanism=result.mechanism,
+        folded,
+        mechanism=LOSSLESS_SEARCH_PATH_MECHANISM,
     )
 
 
@@ -145,37 +202,43 @@ def analytics_events(
     tool_use_id: str | None,
     applied: bool,
     **extra: object,
-) -> tuple[dict, dict]:
+) -> tuple[dict, ...]:
     """Build the standard mechanism and per-tool telemetry for a decision."""
+    saving_events = []
+    for step in decision.savings_steps:
+        step_raw_tokens = estimate_tokens(step.original_text)
+        step_compressed_tokens = estimate_tokens(step.compressed_text)
+        saving_events.append(
+            mechanism_saving_event(
+                step.mechanism,
+                applied=applied,
+                tokens_saved_estimate=max(0, step_raw_tokens - step_compressed_tokens),
+                measurement_kind="measured",
+                raw_token_estimate=step_raw_tokens,
+                compressed_token_estimate=step_compressed_tokens,
+            )
+        )
+
     raw_tokens = estimate_tokens(decision.original_text)
     compressed_tokens = estimate_tokens(decision.compressed_text)
-    saved = max(0, raw_tokens - compressed_tokens)
-    return (
-        mechanism_saving_event(
-            decision.mechanism,
-            applied=applied,
-            tokens_saved_estimate=saved,
-            measurement_kind="measured",
-            raw_token_estimate=raw_tokens,
-            compressed_token_estimate=compressed_tokens,
-        ),
-        {
-            "event_type": "ToolTransformation",
-            "tool_use_id": tool_use_id,
-            "was_compressed": True,
-            "compression_strategy": decision.mechanism,
-            "raw_token_estimate": raw_tokens,
-            "compressed_token_estimate": compressed_tokens,
-            "tokens_saved_estimate": saved,
-            "raw_chars": decision.raw_chars,
-            "compressed_chars": decision.compressed_chars,
-            "token_estimator": "chars_div_4_v1",
-            "compression_ratio": decision.compressed_chars / max(1, decision.raw_chars),
-            "measurement_kind": "measured",
-            "applied": applied,
-            **extra,
-        },
-    )
+    transformation_event = {
+        "event_type": "ToolTransformation",
+        "tool_use_id": tool_use_id,
+        "was_compressed": True,
+        "compression_strategy": decision.mechanism,
+        "compression_strategies": [step.mechanism for step in decision.savings_steps],
+        "raw_token_estimate": raw_tokens,
+        "compressed_token_estimate": compressed_tokens,
+        "tokens_saved_estimate": max(0, raw_tokens - compressed_tokens),
+        "raw_chars": decision.raw_chars,
+        "compressed_chars": decision.compressed_chars,
+        "token_estimator": "chars_div_4_v1",
+        "compression_ratio": decision.compressed_chars / max(1, decision.raw_chars),
+        "measurement_kind": "measured",
+        "applied": applied,
+        **extra,
+    }
+    return (*saving_events, transformation_event)
 
 
 def extract_text_envelope(value: object) -> TextEnvelope | None:
@@ -212,6 +275,20 @@ def extract_text_envelope(value: object) -> TextEnvelope | None:
 
 
 def _find_text_path(value: object) -> tuple[tuple[_PathPart, ...], str] | None:
+    if isinstance(value, list):
+        if len(value) > _MAX_CONTENT_BLOCKS:
+            return None
+        text_blocks = [
+            (index, block.get("text"))
+            for index, block in enumerate(value)
+            if isinstance(block, dict)
+            and block.get("type") in {"text", "output_text", "input_text"}
+            and isinstance(block.get("text"), str)
+        ]
+        if len(text_blocks) == 1:
+            index, text = text_blocks[0]
+            return (index, "text"), text
+        return None
     if not isinstance(value, dict):
         return None
 
@@ -241,6 +318,55 @@ def _find_text_path(value: object) -> tuple[tuple[_PathPart, ...], str] | None:
             index, text = text_blocks[0]
             return ("content", index, "text"), text
     return None
+
+
+def _compact_known_native_tool(tool_name: str, tool_input: dict, text: str) -> str | None:
+    """Compact only native tools with a stable, explicitly recognized shape."""
+    normalized = tool_name.lower()
+    if normalized.endswith(("__browser_snapshot", "__browser_accessibility_snapshot")):
+        return filter_generic(text)
+    if "supabase" in normalized and normalized.endswith("__execute_sql"):
+        query = tool_input.get("query")
+        if isinstance(query, str) and _SQL_READ_PREFIX.match(query):
+            return _compact_supabase_rows(text)
+    return None
+
+
+def _compact_supabase_rows(text: str) -> str | None:
+    """Sample a large Supabase read result while preserving its safety envelope.
+
+    The adapter only accepts the observed execute_sql JSON envelope containing
+    one untrusted-data block whose body is a JSON array. Mutations, malformed
+    values, small results, and future wire shapes pass through unchanged.
+    """
+    try:
+        outer = json.loads(text)
+        if not isinstance(outer, dict) or not isinstance(outer.get("result"), str):
+            return None
+        result_text = outer["result"]
+        match = _SQL_UNTRUSTED_BLOCK.search(result_text)
+        if match is None:
+            return None
+        rows = json.loads(match.group("data"))
+        if not isinstance(rows, list) or len(rows) <= _SQL_MIN_ROWS:
+            return None
+        omitted = len(rows) - _SQL_HEAD_ROWS - _SQL_TAIL_ROWS
+        sampled = [
+            *rows[:_SQL_HEAD_ROWS],
+            {
+                "_rclm_omitted_rows": omitted,
+                "_rclm_note": "Re-run with a narrower WHERE or LIMIT/OFFSET to inspect omitted rows.",
+            },
+            *rows[-_SQL_TAIL_ROWS:],
+        ]
+        sampled_json = json.dumps(sampled, separators=(",", ":"), ensure_ascii=False)
+        outer["result"] = (
+            result_text[: match.start("data")] + sampled_json + result_text[match.end("data") :]
+        )
+        replacement = json.dumps(outer, separators=(",", ":"), ensure_ascii=False)
+        return replacement if len(replacement) < len(text) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _replace_path(value: object, path: tuple[_PathPart, ...], replacement: str) -> object:

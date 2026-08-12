@@ -26,6 +26,17 @@ def _request(tmp_path: Path, command: str) -> read_cache.ReadRequest:
     return request
 
 
+def test_read_request_capture_round_trip_and_invalid_metadata_fail_open(tmp_path: Path) -> None:
+    _write_lines(tmp_path / "source.py", 10)
+    request = _request(tmp_path, "cat source.py")
+
+    captured = read_cache.serialize_read_request(request)
+
+    assert read_cache.deserialize_read_request(captured) == request
+    assert read_cache.deserialize_read_request({**captured, "content_hash": "not-a-hash"}) is None
+    assert read_cache.deserialize_read_request({**captured, "end_line": 11}) is None
+
+
 def test_real_captured_posix_commands_match_expected_syntax() -> None:
     fixture = json.loads(FIXTURES.read_text(encoding="utf-8"))
     assert "production session_tool_calls" in fixture["source"]

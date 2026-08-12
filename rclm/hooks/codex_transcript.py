@@ -115,6 +115,8 @@ def _extract(entries: Iterable[dict]) -> CodexTranscriptData:
                 info = payload.get("info")
                 if isinstance(info, dict):
                     usage.add_snapshot(info.get("total_token_usage"))
+            elif payload.get("type") == "patch_apply_end":
+                data.file_diffs.extend(_parse_patch_apply_end(payload, timestamp))
             _extract_event_message(payload, timestamp, data, seen_messages)
             continue
 
@@ -311,6 +313,73 @@ def _parse_tool_input(arguments: object) -> dict:
     except json.JSONDecodeError:
         return {"input": arguments}
     return parsed if isinstance(parsed, dict) else {"input": parsed}
+
+
+def _parse_patch_apply_end(payload: dict, timestamp: str = "") -> list[FileDiff]:
+    """Parse Codex's authoritative post-apply change map into file diffs."""
+    if payload.get("success") is False:
+        return []
+
+    changes = payload.get("changes")
+    if not isinstance(changes, dict):
+        return []
+
+    diffs: list[FileDiff] = []
+    for source_path, raw_change in changes.items():
+        if not isinstance(source_path, str) or not source_path:
+            continue
+        if not isinstance(raw_change, dict):
+            continue
+
+        unified_diff = raw_change.get("unified_diff", "")
+        if not isinstance(unified_diff, str):
+            unified_diff = ""
+        before_text, after_text = _diff_sides(unified_diff)
+        before: str | None = before_text
+        after: str | None = after_text
+
+        operation = raw_change.get("type")
+        if operation == "add":
+            before = None
+        elif operation == "delete":
+            after = None
+
+        move_path = raw_change.get("move_path")
+        path = move_path if isinstance(move_path, str) and move_path else source_path
+        diffs.append(
+            FileDiff(
+                path=path,
+                before=before,
+                after=after,
+                unified_diff=unified_diff,
+                timestamp=timestamp,
+            )
+        )
+
+    return diffs
+
+
+def _diff_sides(unified_diff: str) -> tuple[str, str]:
+    """Reconstruct the before/after hunk fragments from a unified diff."""
+    before: list[str] = []
+    after: list[str] = []
+    for line in unified_diff.splitlines():
+        if (
+            line.startswith("@@")
+            or line.startswith("--- ")
+            or line.startswith("+++ ")
+            or line == "\\ No newline at end of file"
+        ):
+            continue
+        if line.startswith("+"):
+            after.append(line[1:])
+        elif line.startswith("-"):
+            before.append(line[1:])
+        elif line.startswith(" "):
+            content = line[1:]
+            before.append(content)
+            after.append(content)
+    return "\n".join(before), "\n".join(after)
 
 
 def _parse_apply_patch(patch_text: str, timestamp: str = "") -> list[FileDiff]:

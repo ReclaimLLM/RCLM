@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import random
 import re
 from collections import OrderedDict
 
@@ -72,7 +71,8 @@ def maybe_dedupe(
     seen = lru.get(digest)
     if seen:
         lru.move_to_end(digest)
-        phrase = random.choice(_DUPLICATE_PHRASES).format(count=seen["char_count"])
+        phrase_index = int(digest[:8], 16) % len(_DUPLICATE_PHRASES)
+        phrase = _DUPLICATE_PHRASES[phrase_index].format(count=seen["char_count"])
         pointer = (
             f"[RCLM] Identical to the result of `{seen['tool_name']}` at turn "
             f"{seen['turn']} ({phrase})."

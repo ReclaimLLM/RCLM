@@ -1,9 +1,8 @@
 """Core replay loop: reproduce the shipped mechanisms over captured tool calls.
 
-Mirrors the real hook precedence exactly (see e.g. claude_handler.py's
-PostToolUse: range_cache claims Read/shell-read calls first; exec_compaction
-then only runs for shell calls the range cache didn't claim; hash_dedupe then
-only runs for calls neither of the above claimed):
+Mirrors the real hook precedence (see e.g. claude_handler.py's PostToolUse):
+range-cache hits win, while cache misses fall through so execution compaction
+and hash dedupe can still inspect the unchanged result:
 
     range_cache (H1)  ->  exec_compaction (shell compaction)  ->  hash_dedupe
 
@@ -21,10 +20,9 @@ replay falls back to a full serialization of the captured result — still
 counted, but never mechanism-eligible.
 
 `is_reachable` marks whether some selected mechanism actually looked at a
-call's tool type at all (regardless of whether it found anything to reduce)
-— it is set per call by whichever `_try_*` function produced the record, not
-inferred after the fact from the tool name, so a Read call H1 examined but
-didn't cache-hit on is correctly "reachable", not "uncoverable".
+call's tool type at all (regardless of whether it found anything to reduce).
+It is set per call by whichever `_try_*` function produced the best record,
+not inferred after the fact from the tool name.
 """
 
 from __future__ import annotations
@@ -164,16 +162,20 @@ def _try_range_cache(
     original_text: str,
     read_state: dict,
     turn: int,
-) -> tuple[ToolCallReplay | None, dict]:
-    """Return (record_or_None, updated_read_state). None means H1 doesn't
-    claim this call — caller falls through to the next mechanism.
+    captured_metadata: object = None,
+) -> tuple[ToolCallReplay | None, ToolCallReplay | None, dict]:
+    """Return (terminal, fallback, updated_read_state).
+
+    A cache hit is terminal. A cache miss or an unparseable native Read is a
+    fallback record: downstream mechanisms still get a chance, but Replay
+    retains the most precise classification if none of them changes the text.
 
     Only called when `extract_text_envelope` already succeeded, so
     `original_text` is always real captured text here.
     """
     if tool_name.lower() not in _READ_ATTEMPT_TOOL_NAMES or not isinstance(tool_input, dict):
-        return None, read_state
-    built = build_read_request(tool_name, tool_input, original_text)
+        return None, None, read_state
+    built = build_read_request(tool_name, tool_input, original_text, captured_metadata)
     if built is None:
         # A Read-shaped call H1 can't confidently parse a range for is
         # unresolvable — we cannot tell whether H1 would have reduced it.
@@ -181,18 +183,19 @@ def _try_range_cache(
         # claimed by H1 and falls through to shell compaction / dedupe.
         if tool_name.lower() == "read":
             return (
+                None,
                 ToolCallReplay(
                     index=index,
                     tool_name=tool_name,
                     classification="unresolvable",
                     mechanism=None,
-                    original_tokens=0,
-                    compressed_tokens=0,
+                    original_tokens=count_tokens(original_text),
+                    compressed_tokens=count_tokens(original_text),
                     is_reachable=True,
                 ),
                 read_state,
             )
-        return None, read_state
+        return None, None, read_state
 
     request, trailing = built
     block = original_text[: len(original_text) - len(trailing)] if trailing else original_text
@@ -211,9 +214,11 @@ def _try_range_cache(
                 compressed_tokens=count_tokens(compressed_text),
                 is_reachable=True,
             ),
+            None,
             read_state,
         )
     return (
+        None,
         ToolCallReplay(
             index=index,
             tool_name=tool_name,
@@ -329,6 +334,10 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
         tool_name = tool_call.get("tool_name") or ""
         tool_input = tool_call.get("tool_input")
         tool_response = tool_call.get("tool_result")
+        extra_fields = tool_call.get("extra_fields")
+        captured_read_request = (
+            extra_fields.get("replay_read_request") if isinstance(extra_fields, dict) else None
+        )
         turn = index + 1  # monotonic proxy for turn order; see module docstring
 
         if _is_image(tool_response):
@@ -352,32 +361,51 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
         original_text = envelope.text
 
         record: ToolCallReplay | None = None
-        range_claimed = False
+        fallback: ToolCallReplay | None = None
         if "range_cache" in mechanisms:
-            record, read_state = _try_range_cache(
-                index, tool_name, tool_input, original_text, read_state, turn
+            record, fallback, read_state = _try_range_cache(
+                index,
+                tool_name,
+                tool_input,
+                original_text,
+                read_state,
+                turn,
+                captured_read_request,
             )
-            range_claimed = record is not None
 
         if record is None and "shell_compaction" in mechanisms:
-            record = _try_shell_compaction(
+            shell_record = _try_shell_compaction(
                 index, tool_name, tool_input, tool_response, original_text
             )
+            if shell_record is not None:
+                if shell_record.classification == "shaped":
+                    record = shell_record
+                elif fallback is None:
+                    fallback = shell_record
 
-        if record is None and "hash_dedupe" in mechanisms and not range_claimed:
-            record, dedupe_state = _try_dedupe(index, tool_name, original_text, dedupe_state, turn)
+        if record is None and "hash_dedupe" in mechanisms:
+            dedupe_record, dedupe_state = _try_dedupe(
+                index, tool_name, original_text, dedupe_state, turn
+            )
+            if dedupe_record.classification == "shaped":
+                record = dedupe_record
+            elif fallback is None:
+                fallback = dedupe_record
 
         if record is None:
-            tokens = count_tokens(original_text)
-            record = ToolCallReplay(
-                index=index,
-                tool_name=tool_name,
-                classification="uncovered",
-                mechanism=None,
-                original_tokens=tokens,
-                compressed_tokens=tokens,
-                is_reachable=False,
-            )
+            if fallback is not None:
+                record = fallback
+            else:
+                tokens = count_tokens(original_text)
+                record = ToolCallReplay(
+                    index=index,
+                    tool_name=tool_name,
+                    classification="uncovered",
+                    mechanism=None,
+                    original_tokens=tokens,
+                    compressed_tokens=tokens,
+                    is_reachable=False,
+                )
         result.calls.append(record)
 
     return result

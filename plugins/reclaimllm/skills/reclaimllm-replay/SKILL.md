@@ -59,10 +59,11 @@ this way when relaying results:
   `hash_dedupe`); pass a subset only if the user wants to isolate one
   mechanism.
 - `replay_corpus(days=30, source="all", model_family?, project?, session_category?, mechanisms?, limit?, min_turns?, min_tool_calls?)` —
-  a filtered set of sessions. `days` is a session-activity window (measured
-  on when each session started, not when it was ingested). `limit` is the
+  a filtered set of the caller's own sessions. `days` is an exact rolling
+  ingestion window measured on `ingested_at`. For `source="codex"`, stored
+  models must start with `gpt-` or `codex-`. `limit` is the
   target fully eligible session count. Replay fetches up to four times that
-  many recent `session` records (capped at 200), applies both eligibility
+  many recent `session` records (capped at 100), applies both eligibility
   tiers in order, and stops at `limit` eligible sessions or scan exhaustion.
 - `replay_compare(days=30, source="all", ..., configs?, min_turns?, min_tool_calls?)` —
   same corpus, multiple mechanism sets, one call, so bundles stay
@@ -71,13 +72,12 @@ this way when relaying results:
 
 All four tools accept `min_turns` (default **5**) and `min_tool_calls`
 (default **5**). PRD §6's documented floors are 10/10; the tool layer
-defaults lower so short-session users still get a number. This is a
+defaults lower so shorter-session users can still get a number. This is a
 visible, stated deviation — every result's `provenance` carries
 `min_turns_applied`/`min_tool_calls_applied` (or the equivalent
 `*_applied` fields on `replay_eligibility`'s response), and it must be
-surfaced to the user whenever a result is reported: "at min_turns=1,
-min_tool_calls=1 (both far below the documented floor of 10)". At these
-defaults the two gates barely filter anything — treat a low `considered`/
+surfaced to the user whenever a result is reported: "at min_turns=5,
+min_tool_calls=5 (both below the documented floor of 10)". Treat a low `considered`/
 `eligible` count as itself informative (most sessions are short or
 tool-call-light), not as evidence of a broken query. Do not treat requests
 to lower these further as routine — flag the tradeoff (smaller/shorter
@@ -87,12 +87,8 @@ for any other loosened filter.
 Single-session lookups (`replay_eligibility(session_id=...)`,
 `replay_session`) also fill missing completion, turn-count, and tool-count
 metadata from the captured blob. Corpus replay uses the same fallback after
-a record enters the activity window. This fallback is *not* applied during
-the initial corpus-window screening
-(`replay_corpus`/`replay_compare`/corpus-mode `replay_eligibility`), which
-still requires the row's own `started_at` to consider a session a
-candidate at all — a low corpus count can still mean "row not backfilled
-yet," not "genuinely no eligible sessions."
+a record enters the ingestion window. Initial corpus screening requires the
+row's database-owned `ingested_at`, which is populated for every stored row.
 
 ## Honesty Rules — do not soften these
 

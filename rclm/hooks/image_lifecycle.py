@@ -78,6 +78,43 @@ def _find_mcp_image_block(block: object) -> _ImageRef | None:
     return _ImageRef(base64_data=data, rebuild=_rebuild)
 
 
+def _find_anthropic_image_block(block: object) -> _ImageRef | None:
+    """Anthropic content block: ``{type: image, source: {type: base64, ...}}``.
+
+    Claude transcripts store native image results in this Messages API shape,
+    commonly as the sole item in a top-level content list. Keep it distinct
+    from MCP's flat ``data``/``mimeType`` block so each wire envelope is
+    rebuilt without renaming provider fields.
+    """
+    if not isinstance(block, dict) or block.get("type") != "image":
+        return None
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return None
+    data = source.get("data")
+    media_type = source.get("media_type")
+    if not isinstance(data, str) or not data or not isinstance(media_type, str):
+        return None
+
+    def _rebuild(
+        new_b64: str,
+        new_media_type: str,
+        _size_bytes: int,
+        _dims: tuple[int, int],
+        *,
+        _block=block,
+        _source=source,
+    ) -> dict:
+        new_source = dict(_source)
+        new_source["data"] = new_b64
+        new_source["media_type"] = new_media_type
+        new_block = dict(_block)
+        new_block["source"] = new_source
+        return new_block
+
+    return _ImageRef(base64_data=data, rebuild=_rebuild)
+
+
 def _find_claude_read_image(tool_response: object) -> _ImageRef | None:
     """Claude Code's native `Read`-of-an-image-file shape:
     {"type": "image", "file": {"base64": ..., "type": "image/png", "dimensions": {...}}}.
@@ -119,7 +156,7 @@ def _find_claude_read_image(tool_response: object) -> _ImageRef | None:
 
 def _find_in_list(items: list) -> _ImageRef | None:
     for index, item in enumerate(items):
-        inner = _find_mcp_image_block(item)
+        inner = _find_mcp_image_block(item) or _find_anthropic_image_block(item)
         if inner is None:
             continue
 
@@ -203,6 +240,10 @@ def find_image(tool_response: object) -> _ImageRef | None:
         return ref
 
     ref = _find_mcp_image_block(tool_response)
+    if ref is not None:
+        return ref
+
+    ref = _find_anthropic_image_block(tool_response)
     if ref is not None:
         return ref
 

@@ -23,9 +23,11 @@ Event-specific fields:
   UserPromptSubmit: prompt
   Stop:             last_assistant_message, stop_hook_active
 
-File diffs are extracted from the transcript JSONL file at Stop time.
-Codex records file edits as ``apply_patch`` tool calls in the transcript
-(type=custom_tool_call, name=apply_patch). The patch format is::
+File diffs are extracted from the transcript JSONL file at Stop time. Current
+Codex versions emit authoritative ``event_msg`` / ``patch_apply_end`` change
+maps. Older versions record edits as direct ``apply_patch`` tool calls
+(type=custom_tool_call, name=apply_patch), which remain supported. Their patch
+format is::
 
     *** Begin Patch
     *** Update File: /path/to/file

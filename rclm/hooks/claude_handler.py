@@ -145,6 +145,10 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
 def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
+    cfg = _config.load()
+    captured_tool_input = tool_input
+    if _config.dlp_enabled(cfg):
+        captured_tool_input = dlp.redact_high_confidence_value(tool_input) or tool_input
 
     # Captured before this call is recorded, so loop-breaker sees only prior history.
     prior_events = session_store.read_events(session_id)
@@ -154,13 +158,12 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         {
             "event_type": "PreToolUse",
             "tool_name": tool_name,
-            "tool_input": tool_input,
+            "tool_input": captured_tool_input,
             "tool_use_id": payload.get("tool_use_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
 
-    cfg = _config.load()
     policy = _config.effective_hook_policy(cfg, provider="claude")
     # Loop-breaker is not a compression mechanism; org compression policy
     # must not silently change its legacy shadow behavior.
@@ -243,6 +246,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
                         {
                             "event_type": "ReadCacheWrapped",
                             "tool_use_id": payload.get("tool_use_id"),
+                            "replay_read_request": read_cache.serialize_read_request(request),
                         },
                     )
         except Exception:
@@ -351,18 +355,47 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             else:
                 logger.warning("DLP could not inspect %s output: %s", tool_name, exc)
 
-    session_store.append_event(
-        session_id,
-        {
-            "event_type": "PostToolUse",
-            "tool_name": tool_name,
-            "tool_input": tool_input,
-            "tool_response": captured_response,
-            "dlp_redacted": dlp_replacement is not None,
-            "tool_use_id": payload.get("tool_use_id"),
-            "timestamp": payload.get("timestamp", _now()),
-        },
+    tool_use_id = payload.get("tool_use_id")
+    wrapped_event = next(
+        (
+            event
+            for event in reversed(prior_events)
+            if event.get("event_type") == "ReadCacheWrapped"
+            and event.get("tool_use_id") == tool_use_id
+        ),
+        None,
     )
+    range_claimed = wrapped_event is not None
+    request = (
+        read_cache.deserialize_read_request(wrapped_event.get("replay_read_request"))
+        if wrapped_event is not None
+        else None
+    )
+    if policy.enabled("range_cache") and request is None and tool_name in {"Read", "Bash"}:
+        if tool_name == "Read":
+            request = read_cache.native_read_request(tool_input, cwd=cwd)
+        elif not range_claimed:
+            command = tool_input.get("command", "")
+            shell = tool_input.get("shell") or ("posix" if os.name == "posix" else os.name)
+            if isinstance(command, str):
+                request = read_cache.parse_shell_read(command, cwd=cwd, shell=shell)
+
+    captured_post_input = tool_input
+    if _config.dlp_enabled(cfg):
+        captured_post_input = dlp.redact_high_confidence_value(tool_input) or tool_input
+    post_event = {
+        "event_type": "PostToolUse",
+        "tool_name": tool_name,
+        "tool_input": captured_post_input,
+        "tool_response": captured_response,
+        "dlp_redacted": dlp_replacement is not None,
+        "tool_use_id": tool_use_id,
+        "timestamp": payload.get("timestamp", _now()),
+    }
+    if request is not None:
+        post_event["replay_read_request"] = read_cache.serialize_read_request(request)
+
+    session_store.append_event(session_id, post_event)
 
     shadow = policy.legacy_shadow
     hook_output: dict = {"hookEventName": "PostToolUse"}
@@ -455,23 +488,9 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         hook_output["updatedToolOutput"] = dlp_replacement
         context_notes.append("[rclm DLP] Secrets were redacted from the tool response.")
 
-    tool_use_id = payload.get("tool_use_id")
-    range_claimed = any(
-        event.get("event_type") == "ReadCacheWrapped" and event.get("tool_use_id") == tool_use_id
-        for event in prior_events
-    )
     if policy.enabled("range_cache") and tool_name in {"Read", "Bash"}:
         try:
-            request = None
-            if tool_name == "Read":
-                request = read_cache.native_read_request(tool_input, cwd=cwd)
-            elif not range_claimed:
-                command = tool_input.get("command", "")
-                shell = tool_input.get("shell") or ("posix" if os.name == "posix" else os.name)
-                if isinstance(command, str):
-                    request = read_cache.parse_shell_read(command, cwd=cwd, shell=shell)
             if request is not None:
-                range_claimed = True
                 state = session_store.read_read_cache_state(session_id)
                 turn = (
                     sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
@@ -490,6 +509,10 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 session_store.write_read_cache_state(session_id, application.state)
                 for event in application.events:
                     session_store.append_event(session_id, event)
+                # A first-seen range updates H1 state but leaves the result
+                # unchanged. Let compaction/dedupe inspect that unchanged text;
+                # only a real cache-hit replacement claims precedence.
+                range_claimed = range_claimed or bool(application.events)
         except Exception:
             logger.exception("range cache failed; passing through tool result")
 
@@ -511,7 +534,14 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                     session_store.append_event(session_id, event)
                 if not shadow:
                     effective_text = decision.compressed_text
-                    hook_output["updatedToolOutput"] = decision.wire_replacement
+                    # Claude's PostToolUse contract accepts text/object output,
+                    # not a top-level content array. Preserve list envelopes in
+                    # capture, but serialize them for the model-visible update.
+                    hook_output["updatedToolOutput"] = (
+                        decision.model_text
+                        if isinstance(decision.wire_replacement, list)
+                        else decision.wire_replacement
+                    )
         except Exception:
             logger.exception("tool-result compaction failed; passing through tool result")
 
@@ -801,7 +831,17 @@ def _handle_stop(
         for event in events
         if event.get("event_type") == "ToolTransformation" and event.get("tool_use_id")
     }
+    replay_read_requests = {
+        event.get("tool_use_id"): event.get("replay_read_request")
+        for event in events
+        if event.get("event_type") == "PostToolUse"
+        and event.get("tool_use_id")
+        and event.get("replay_read_request")
+    }
     for call in transcript_data.tool_calls:
+        replay_read_request = replay_read_requests.get(call.tool_use_id)
+        if replay_read_request:
+            call.extra_fields["replay_read_request"] = replay_read_request
         transformation = transformations.get(call.tool_use_id)
         if transformation:
             for key in (
@@ -820,6 +860,7 @@ def _handle_stop(
                 call.extra_fields["compression_file_path"] = transformation["file_path"]
     if _config.dlp_enabled(cfg):
         dlp.reconcile_captured_tool_results(transcript_data.tool_calls, events)
+        dlp.reconcile_captured_tool_inputs(transcript_data.tool_calls, events)
     file_diffs = _extract_file_diffs_from_tool_calls(transcript_data.tool_calls)
 
     # Compute analytics from tool calls and file diffs.

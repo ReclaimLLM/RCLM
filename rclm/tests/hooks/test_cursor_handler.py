@@ -213,7 +213,7 @@ def test_stop_uploads_record(mock_upload, monkeypatch, tmp_path):
     )
     payload = {
         "conversation_id": session_id,
-        "cwd": "/test/dir",
+        "workspace_roots": ["/test/dir", "/test/other-root"],
         "timestamp": "2024-01-01T00:00:10Z",
     }
 
@@ -234,6 +234,21 @@ def test_stop_uploads_record(mock_upload, monkeypatch, tmp_path):
 
     # Store should be cleaned up
     assert len(session_store.read_events(session_id)) == 0
+
+
+def test_resolve_cwd_prefers_event_cwd_over_workspace_roots(monkeypatch, tmp_path):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+
+    assert (
+        cursor_handler._resolve_cwd(
+            "conv-cwd",
+            {
+                "cwd": "/test/tool-directory",
+                "workspace_roots": ["/test/workspace-root"],
+            },
+        )
+        == "/test/tool-directory"
+    )
 
 
 @patch("rclm.hooks.cursor_handler.close_session")

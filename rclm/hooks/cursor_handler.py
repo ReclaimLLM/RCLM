@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import difflib
 import json
 import logging
 import os
@@ -42,14 +41,30 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _cwd_from_payload(payload: dict) -> str:
+    """Return Cursor's current directory from event- or workspace-level fields."""
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        return cwd
+
+    workspace_roots = payload.get("workspace_roots")
+    if isinstance(workspace_roots, list):
+        for root in workspace_roots:
+            if isinstance(root, str) and root.strip():
+                return root
+
+    return ""
+
+
 def _resolve_cwd(session_id: str, payload: dict) -> str:
     """Return the CWD for this session: payload first, then stored events, then ''."""
-    cwd = payload.get("cwd", "")
+    cwd = _cwd_from_payload(payload)
     if cwd:
         return cwd
     for ev in session_store.read_events(session_id):
-        if "cwd" in ev:
-            return ev["cwd"]
+        stored_cwd = ev.get("cwd")
+        if isinstance(stored_cwd, str) and stored_cwd.strip():
+            return stored_cwd
     return ""
 
 
@@ -116,7 +131,7 @@ def _handle_before_submit_prompt(session_id: str, payload: dict) -> None:
 
 
 def _handle_session_start(session_id: str, payload: dict) -> None:
-    cwd = payload.get("cwd", "")
+    cwd = _cwd_from_payload(payload)
     session_store.append_event(
         session_id,
         {
@@ -299,19 +314,6 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         logger.exception("Cursor MCP dedupe failed; passing through tool output")
 
 
-def _unified_diff(path: str, before: str | None, after: str | None) -> str:
-    before_lines = (before or "").splitlines(keepends=True)
-    after_lines = (after or "").splitlines(keepends=True)
-    return "".join(
-        difflib.unified_diff(
-            before_lines,
-            after_lines,
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-        )
-    )
-
-
 def _extract_file_diffs_from_payload(payload: dict) -> list[FileDiff]:
     path = payload.get("file_path") or payload.get("filepath") or payload.get("path") or "unknown"
     timestamp = payload.get("timestamp", "")
@@ -329,7 +331,7 @@ def _extract_file_diffs_from_payload(payload: dict) -> list[FileDiff]:
                     path=path,
                     before=before,
                     after=after,
-                    unified_diff=_unified_diff(path, before, after),
+                    unified_diff=cursor_transcript.build_unified_diff(path, before, after),
                     timestamp=timestamp,
                 )
             )
@@ -419,7 +421,7 @@ def _merge_file_diffs(primary: list[FileDiff], secondary: list[FileDiff]) -> lis
         if key not in seen:
             merged.append(diff)
             seen.add(key)
-    return merged
+    return cursor_transcript.coalesce_file_diffs(merged)
 
 
 def _build_messages_from_events(events: list[dict]) -> list[dict]:

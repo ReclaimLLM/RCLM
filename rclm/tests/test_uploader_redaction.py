@@ -5,7 +5,7 @@ import json
 import pytest
 
 from rclm import _config, _uploader
-from rclm._models import HookSessionRecord
+from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import upload
 from rclm.hooks import dlp
 
@@ -87,6 +87,37 @@ async def test_upload_redacts_nested_env_values_before_post(tmp_path, monkeypatc
     payload = session.posts[0]["data"]
     assert "nested-upload-secret" not in payload
     assert "[REDACTED:TOKEN]" in payload
+
+
+@pytest.mark.asyncio
+async def test_upload_redacts_inline_jwt_from_tool_input_without_env_match(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _config.patch(
+        server_url="https://api.example.test",
+        api_key="key",
+        dlp=True,
+        redaction={"enabled": False},
+    )
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.signature_value_12345"
+    record = _record(str(project))
+    record.tool_calls = [
+        ToolCall(
+            tool_use_id="call-1",
+            tool_name="Bash",
+            tool_input={"command": f"curl -H 'Authorization: Bearer {jwt}'"},
+            tool_result="ok",
+            timestamp="2026-04-27T00:00:30+00:00",
+        )
+    ]
+    session = _Session()
+
+    await upload(record, session)
+
+    payload = session.posts[0]["data"]
+    assert jwt not in payload
+    assert "[REDACTED:JWT]" in payload
 
 
 @pytest.mark.asyncio

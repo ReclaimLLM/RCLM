@@ -45,6 +45,13 @@ class TestFilterPytest:
     def test_no_match_for_non_test_command(self):
         assert filter_test("git status", "some output") is None
 
+    def test_output_is_deterministic_for_replay(self):
+        output = (
+            "tests/test_foo.py::test_one PASSED\n"
+            "========================= 1 passed in 0.05s =========================\n"
+        )
+        assert filter_test("pytest tests/", output) == filter_test("pytest tests/", output)
+
     def test_nonzero_without_a_parsed_failure_passes_through(self):
         assert filter_test("pytest tests/", "fatal runner crash\n", exit_code=2) is None
 

@@ -6,7 +6,7 @@ output in that case, especially for a non-zero exit status.
 
 from __future__ import annotations
 
-import random
+import hashlib
 import re
 
 DEFAULT_MAX_CHARS = 8_000
@@ -58,14 +58,22 @@ def _cap(lines: list[str], max_chars: int) -> str:
         kept.append(line)
         used += extra
     if dropped:
-        message = random.choice(_CAP_MESSAGES).format(dropped=dropped, max_chars=max_chars)
+        kept_text = "\n".join(kept)
+        seed = f"{max_chars}:{dropped}:{kept_text}"
+        message = _stable_choice(_CAP_MESSAGES, seed).format(dropped=dropped, max_chars=max_chars)
         kept.append(f"[RCLM] {message}")
     return "\n".join(kept)
 
 
 def _passed_line(count: int | str) -> str:
-    phrase = random.choice(_DETAILS_OMITTED_PHRASES)
+    phrase = _stable_choice(_DETAILS_OMITTED_PHRASES, str(count))
     return f"{count} passed ({phrase})"
+
+
+def _stable_choice(options: tuple[str, ...], seed: str) -> str:
+    """Select varied copy deterministically so Replay remains reproducible."""
+    digest = hashlib.sha256(seed.encode("utf-8", errors="surrogateescape")).digest()
+    return options[int.from_bytes(digest[:4], "big") % len(options)]
 
 
 def _filter_pytest(output: str, *, exit_code: int, max_chars: int) -> str | None:

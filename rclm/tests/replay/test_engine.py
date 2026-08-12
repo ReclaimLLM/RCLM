@@ -87,6 +87,30 @@ class TestImageExclusion:
         assert result.calls[0].classification == "image"
         assert result.text_result_tokens == 0
 
+    def test_anthropic_content_block_excluded_from_denominator(self):
+        blob = _blob(
+            [
+                {
+                    "tool_use_id": "toolu_1",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "/image.png"},
+                    "tool_result": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8=",
+                            },
+                        }
+                    ],
+                }
+            ]
+        )
+        result = replay_blob(blob)
+        assert result.calls[0].classification == "image"
+        assert result.text_result_tokens == 0
+
 
 class TestDedupe:
     def test_repeated_large_result_is_deduped_on_second_occurrence(self):
@@ -141,7 +165,7 @@ class TestRangeCacheH1:
         assert result.calls[1].classification == "shaped"
         assert result.calls[1].mechanism == "range_cache"
 
-    def test_unparseable_read_is_unresolvable_and_excluded_from_totals(self):
+    def test_unparseable_read_is_unresolvable_but_still_counted_in_denominator(self):
         blob = _blob(
             [
                 {
@@ -154,9 +178,39 @@ class TestRangeCacheH1:
         )
         result = replay_blob(blob, mechanisms=("range_cache",))
         assert result.calls[0].classification == "unresolvable"
-        assert result.text_result_tokens == 0
+        assert result.text_result_tokens > 0
         assert result.tokens_removed == 0
         assert len(result.unresolvable_calls) == 1
+
+    def test_captured_read_metadata_replays_plain_claude_output_without_filesystem(self):
+        content = "".join(f"line {line}: value\n" for line in range(1, 81))
+        metadata = {
+            "schema_version": 1,
+            "absolute_path": "/past/a.py",
+            "display_path": "a.py",
+            "content_hash": "a" * 64,
+            "line_count": 80,
+            "size": len(content),
+            "start_line": 1,
+            "end_line": 80,
+            "output_style": "native",
+        }
+        calls = [
+            {
+                "tool_use_id": f"toolu_{index}",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/past/a.py"},
+                "tool_result": content,
+                "extra_fields": {"replay_read_request": metadata},
+            }
+            for index in (1, 2)
+        ]
+
+        result = replay_blob(_blob(calls), mechanisms=("range_cache",))
+
+        assert result.calls[0].classification == "uncovered"
+        assert result.calls[1].classification == "shaped"
+        assert result.calls[1].mechanism == "range_cache"
 
     def test_trailing_system_reminder_is_reattached_unchanged(self):
         lines = [f"line {i}" for i in range(1, 21)]
@@ -207,6 +261,44 @@ class TestPrecedence:
         )
         result = replay_blob(blob, mechanisms=("range_cache", "hash_dedupe"))
         assert result.calls[1].mechanism == "range_cache"
+
+    def test_range_cache_miss_falls_through_to_shell_compaction(self):
+        content = "\n".join(f"unique line {line}" for line in range(1, 101)) + "\n"
+        blob = _blob(
+            [
+                {
+                    "tool_use_id": "toolu_1",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "sed -n '1,100p' file.txt"},
+                    "tool_result": content,
+                }
+            ]
+        )
+
+        result = replay_blob(blob, mechanisms=("range_cache", "shell_compaction"))
+
+        assert result.calls[0].classification == "shaped"
+        assert result.calls[0].mechanism == "H3_exec_compaction"
+
+    def test_unresolvable_read_falls_through_to_hash_dedupe(self):
+        content = "same unnumbered read output\n" * 100
+        blob = _blob(
+            [
+                {
+                    "tool_use_id": f"toolu_{index}",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "/a.py"},
+                    "tool_result": content,
+                }
+                for index in (1, 2)
+            ]
+        )
+
+        result = replay_blob(blob, mechanisms=("range_cache", "hash_dedupe"))
+
+        assert result.calls[0].classification == "unresolvable"
+        assert result.calls[1].classification == "shaped"
+        assert result.calls[1].mechanism == "hash_dedupe"
 
 
 class TestDeterminism:

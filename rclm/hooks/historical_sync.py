@@ -688,7 +688,7 @@ def _parse_cursor_session(path: Path) -> HookSessionRecord | None:
     ended_at = max(timestamps) if timestamps else None
     duration_s = _timestamps_to_duration(started_at, ended_at)
 
-    analytics = compute_session_analytics(transcript_data.tool_calls, [])
+    analytics = compute_session_analytics(transcript_data.tool_calls, transcript_data.file_diffs)
 
     return HookSessionRecord(
         session_id=session_id,
@@ -701,7 +701,7 @@ def _parse_cursor_session(path: Path) -> HookSessionRecord | None:
         model=transcript_data.model or CURSOR_MODEL_DEFAULT,
         messages=transcript_data.messages,
         tool_calls=transcript_data.tool_calls,
-        file_diffs=[],
+        file_diffs=transcript_data.file_diffs,
         total_input_tokens=transcript_data.total_input_tokens,
         total_output_tokens=transcript_data.total_output_tokens,
         tool_token_stats=analytics.get("tool_token_stats"),

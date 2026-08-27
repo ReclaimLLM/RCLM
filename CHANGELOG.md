@@ -3,6 +3,13 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.28] — 2026-08-27
+
+### Fixed
+- Fixed Codex file-diff capture when newer tool calls wrap one or more `apply_patch` bodies inside escaped `exec` inputs (`rclm/hooks/codex_transcript.py`)
+
+---
+
 ## [v0.1.27] — 2026-08-12
 
 ### Added

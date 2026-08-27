@@ -399,6 +399,50 @@ def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
     assert data.file_diffs[0].timestamp == "2026-04-07T12:52:34.670Z"
 
 
+def test_codex_transcript_parses_exec_wrapped_apply_patch_diffs(tmp_path):
+    transcript_path = tmp_path / "session.jsonl"
+    exec_input = (
+        'const patch = "*** Begin Patch\\n'
+        "*** Update File: /repo/existing.txt\\n"
+        "-old\\n"
+        "+new\\n"
+        "*** Add File: /repo/new.txt\\n"
+        "+first\\n"
+        "+second\\n"
+        '*** End Patch";\n'
+        "text(await tools.apply_patch(patch));"
+    )
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-26T19:05:18.344Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "call_id": "call-exec-patch",
+                    "name": "exec",
+                    "input": exec_input,
+                },
+            }
+        )
+        + "\n"
+    )
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert len(data.tool_calls) == 1
+    assert data.tool_calls[0].tool_name == "exec"
+    assert len(data.file_diffs) == 2
+    assert data.file_diffs[0].path == "/repo/existing.txt"
+    assert data.file_diffs[0].before == "old"
+    assert data.file_diffs[0].after == "new"
+    assert data.file_diffs[1].path == "/repo/new.txt"
+    assert data.file_diffs[1].before is None
+    assert data.file_diffs[1].after == "first\nsecond"
+    assert all(diff.timestamp == "2026-08-26T19:05:18.344Z" for diff in data.file_diffs)
+
+
 def test_codex_transcript_parses_patch_apply_end_diffs(tmp_path):
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(

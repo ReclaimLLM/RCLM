@@ -12,6 +12,11 @@ from rclm._models import FileDiff, ToolCall
 
 logger = logging.getLogger(__name__)
 
+_APPLY_PATCH_TOOL_NAMES = frozenset({"apply_patch", "ApplyPatch"})
+_PATCH_WRAPPER_TOOL_NAMES = frozenset({"exec", "exec_command", "bash", "shell", "Bash", "Shell"})
+_BEGIN_PATCH = "*** Begin Patch"
+_END_PATCH = "*** End Patch"
+
 
 @dataclass(frozen=True)
 class CodexUsage:
@@ -131,12 +136,12 @@ def _extract(entries: Iterable[dict]) -> CodexTranscriptData:
             if call is not None:
                 pending_calls[payload.get("call_id", "")] = call
                 data.tool_calls.append(call)
-                if call.tool_name == "apply_patch":
-                    # Preserve provider-neutral FileDiffs by extracting patch hunks
-                    # at parse time instead of leaking raw Codex patch text upward.
-                    patch_text = call.tool_input.get("input", "")
-                    if isinstance(patch_text, str) and patch_text:
-                        data.file_diffs.extend(_parse_apply_patch(patch_text, timestamp))
+                # Preserve provider-neutral FileDiffs by extracting patch hunks
+                # at parse time instead of leaking raw Codex patch text upward.
+                # Newer Codex versions route tools through an ``exec`` wrapper,
+                # so the apply_patch body may be embedded in JavaScript source.
+                for patch_text in _patch_texts_from_tool_call(call):
+                    data.file_diffs.extend(_parse_apply_patch(patch_text, timestamp))
         elif response_type == "function_call_output":
             call_id = payload.get("call_id", "")
             call = pending_calls.get(call_id)
@@ -313,6 +318,62 @@ def _parse_tool_input(arguments: object) -> dict:
     except json.JSONDecodeError:
         return {"input": arguments}
     return parsed if isinstance(parsed, dict) else {"input": parsed}
+
+
+def _unescape_js_string_fragment(text: str) -> str:
+    """Decode common escapes used for patch bodies in Codex exec wrappers."""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            escaped = text[index + 1]
+            replacements = {"n": "\n", "r": "\r", "t": "\t"}
+            if escaped in replacements:
+                out.append(replacements[escaped])
+                index += 2
+                continue
+            if escaped in {'"', "'", "\\"}:
+                out.append(escaped)
+                index += 2
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _extract_embedded_apply_patches(text: str) -> list[str]:
+    """Extract complete apply_patch bodies from a wrapped tool input."""
+    patches: list[str] = []
+    search_from = 0
+    while True:
+        begin = text.find(_BEGIN_PATCH, search_from)
+        if begin < 0:
+            break
+        end = text.find(_END_PATCH, begin)
+        if end < 0:
+            break
+        end += len(_END_PATCH)
+        patches.append(_unescape_js_string_fragment(text[begin:end]))
+        search_from = end
+    return patches
+
+
+def _patch_texts_from_tool_call(call: ToolCall) -> list[str]:
+    """Return top-level or exec-wrapped apply_patch inputs for one tool call."""
+    if call.tool_name in _APPLY_PATCH_TOOL_NAMES:
+        patch_text = call.tool_input.get("input")
+        return [patch_text] if isinstance(patch_text, str) and patch_text.strip() else []
+
+    if call.tool_name not in _PATCH_WRAPPER_TOOL_NAMES:
+        return []
+
+    patches: list[str] = []
+    for key in ("input", "cmd", "command"):
+        value = call.tool_input.get(key)
+        if isinstance(value, str) and value:
+            patches.extend(_extract_embedded_apply_patches(value))
+    return patches
 
 
 def _parse_patch_apply_end(payload: dict, timestamp: str = "") -> list[FileDiff]:

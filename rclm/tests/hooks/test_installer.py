@@ -640,6 +640,13 @@ def test_with_mcp_installs_local_mcp_configs(tmp_path, monkeypatch):
     assert "args = []" in codex
     assert "tool_timeout_sec = 600" in codex
 
+    antigravity = _read_settings(tmp_path / ".agents" / "mcp_config.json")
+    assert antigravity["mcpServers"]["reclaimllm"] == {
+        "command": "/bin/rclm-mcp",
+        "args": [],
+        "timeout": 600_000,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Compression flag

@@ -56,6 +56,22 @@ def test_install_mcp_adds_gemini_settings(tmp_path, monkeypatch):
     }
 
 
+def test_install_mcp_adds_antigravity_config(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mcp_install, "_resolve_binary", lambda: "/bin/rclm-mcp")
+
+    paths = mcp_install.install_mcp(use_global=False, providers=["antigravity"])
+
+    assert len(paths) == 1
+    assert paths[0].resolve() == (tmp_path / ".agents" / "mcp_config.json").resolve()
+    data = mcp_install._load_json(tmp_path / ".agents" / "mcp_config.json")
+    assert data["mcpServers"]["reclaimllm"] == {
+        "command": "/bin/rclm-mcp",
+        "args": [],
+        "timeout": 600_000,
+    }
+
+
 def test_install_mcp_respects_providers_filter(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(mcp_install, "_resolve_binary", lambda: "/bin/rclm-mcp")
@@ -68,3 +84,4 @@ def test_install_mcp_respects_providers_filter(tmp_path, monkeypatch):
     assert not (tmp_path / ".gemini" / "settings.json").exists()
     assert not (tmp_path / ".cursor" / "mcp.json").exists()
     assert not (tmp_path / ".codex" / "config.toml").exists()
+    assert not (tmp_path / ".agents" / "mcp_config.json").exists()

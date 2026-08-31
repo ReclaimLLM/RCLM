@@ -186,9 +186,22 @@ _CURSOR_HOOKS_TO_INJECT: dict[str, list[dict]] = {
 _ANTIGRAVITY_HOOK_NAME = "rclm-antigravity-hooks"
 _ANTIGRAVITY_HOOKS_TO_INJECT: dict = {
     _ANTIGRAVITY_HOOK_NAME: {
+        "PreToolUse": [
+            {
+                "matcher": "",
+                "hooks": [{"type": "command", "command": "rclm-antigravity-hooks PreToolUse"}],
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "",
+                "hooks": [{"type": "command", "command": "rclm-antigravity-hooks PostToolUse"}],
+            }
+        ],
         "Stop": [{"type": "command", "command": "rclm-antigravity-hooks Stop"}],
     }
 }
+
 
 # ---------------------------------------------------------------------------
 # Flag parsing
@@ -698,10 +711,16 @@ def _install_antigravity(use_global: bool) -> None:
     hooks = copy.deepcopy(_ANTIGRAVITY_HOOKS_TO_INJECT)
     if binary != binary_name:
         for entries in hooks[_ANTIGRAVITY_HOOK_NAME].values():
-            for handler in entries:
-                cmd = handler.get("command", "")
-                if cmd == binary_name or cmd.startswith(binary_name + " "):
-                    handler["command"] = binary + cmd[len(binary_name) :]
+            for item in entries:
+                if "hooks" in item:
+                    for hook in item["hooks"]:
+                        cmd = hook.get("command", "")
+                        if cmd == binary_name or cmd.startswith(binary_name + " "):
+                            hook["command"] = binary + cmd[len(binary_name) :]
+                else:
+                    cmd = item.get("command", "")
+                    if cmd == binary_name or cmd.startswith(binary_name + " "):
+                        item["command"] = binary + cmd[len(binary_name) :]
 
     data = _load_json(path)
     _merge_antigravity_hooks(data, hooks)

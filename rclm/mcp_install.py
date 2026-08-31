@@ -112,7 +112,7 @@ def install_mcp(use_global: bool = True, providers: list[str] | None = None) -> 
     command = _resolve_binary()
     root = Path.home() if use_global else Path(".")
     if providers is None:
-        providers = ["claude", "gemini", "cursor", "codex"]
+        providers = ["claude", "gemini", "cursor", "codex", "antigravity"]
 
     installed: list[Path] = []
 
@@ -133,6 +133,15 @@ def install_mcp(use_global: bool = True, providers: list[str] | None = None) -> 
     if "codex" in providers:
         path = root / ".codex" / "config.toml"
         _install_codex_mcp(path, command)
+        installed.append(path)
+    if "antigravity" in providers:
+        # Global: ~/.gemini/config/mcp_config.json; local: .agents/mcp_config.json
+        path = (
+            Path.home() / ".gemini" / "config" / "mcp_config.json"
+            if use_global
+            else root / ".agents" / "mcp_config.json"
+        )
+        _install_json_mcp(path, command)
         installed.append(path)
 
     return installed

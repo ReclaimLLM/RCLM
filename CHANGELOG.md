@@ -3,6 +3,18 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.29] — 2026-08-31
+
+### Added
+- Antigravity MCP install support: `install_mcp` writes `reclaimllm` to `~/.gemini/config/mcp_config.json` (global) or `.agents/mcp_config.json` (local) and includes Antigravity in the default provider set (`rclm/mcp_install.py`)
+- Antigravity `PreToolUse` and `PostToolUse` hook registration with valid allow/empty JSON responses (`rclm/hooks/installer.py`, `rclm/hooks/antigravity_handler.py`)
+- Tests for Antigravity MCP config install and PreToolUse/PostToolUse hook contract (`rclm/tests/test_mcp_install.py`, `rclm/tests/hooks/test_antigravity_handler.py`, `rclm/tests/hooks/test_installer.py`)
+
+### Changed
+- Antigravity hook binary path rewriting now handles nested `hooks[]` entries for PreToolUse/PostToolUse matchers (`rclm/hooks/installer.py`)
+
+---
+
 ## [v0.1.28] — 2026-08-27
 
 ### Fixed

@@ -97,6 +97,14 @@ def _handle_stop(payload: dict) -> None:
     asyncio.run(_upload_and_close(record))
 
 
+def _handle_pre_tool_use(payload: dict) -> None:
+    print(json.dumps({"decision": "allow"}))
+
+
+def _handle_post_tool_use(payload: dict) -> None:
+    print("{}")
+
+
 def main() -> None:
     hook_name = sys.argv[1] if len(sys.argv) > 1 else ""
     try:
@@ -107,7 +115,11 @@ def main() -> None:
         sys.exit(0)
 
     try:
-        if hook_name == "Stop":
+        if hook_name == "PreToolUse":
+            _handle_pre_tool_use(payload)
+        elif hook_name == "PostToolUse":
+            _handle_post_tool_use(payload)
+        elif hook_name == "Stop":
             _handle_stop(payload)
     except Exception:
         logger.exception("rclm-antigravity-hooks: unhandled error in hook %s", hook_name)

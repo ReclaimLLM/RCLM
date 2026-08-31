@@ -149,10 +149,7 @@ def test_stop_falls_back_to_unknown_model_when_missing(tmp_path, monkeypatch):
     assert uploaded[0].cwd == ""
 
 
-def test_non_stop_events_are_ignored_without_error(monkeypatch):
-    """PreToolUse/PostToolUse/PreInvocation/PostInvocation are never registered
-    by the installer, but if Antigravity ever fires one anyway, the handler
-    must exit cleanly rather than attempt to build/upload a record."""
+def test_pre_and_post_tool_use_events_respond_with_valid_contract(monkeypatch, capsys):
     uploaded: list[HookSessionRecord] = []
 
     async def fake_upload(record, *, max_retries=3):
@@ -160,7 +157,15 @@ def test_non_stop_events_are_ignored_without_error(monkeypatch):
 
     monkeypatch.setattr(antigravity_handler, "upload_single", fake_upload)
 
-    for event in ("PreToolUse", "PostToolUse", "PreInvocation", "PostInvocation"):
+    _run_handler("PreToolUse", {"conversationId": "ag-sid-3"}, monkeypatch)
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"decision": "allow"}
+
+    _run_handler("PostToolUse", {"conversationId": "ag-sid-3"}, monkeypatch)
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {}
+
+    for event in ("PreInvocation", "PostInvocation"):
         _run_handler(event, {"conversationId": "ag-sid-3"}, monkeypatch)
 
     assert uploaded == []

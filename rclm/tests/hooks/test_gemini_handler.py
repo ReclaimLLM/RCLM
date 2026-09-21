@@ -383,6 +383,8 @@ def test_session_end_builds_and_uploads_record(monkeypatch, tmp_path):
 
     assert len(uploaded) == 1
     rec = uploaded[0]
+    assert rec.capture_source == "native_agent"
+    assert rec.agent_client == "gemini_cli"
     assert isinstance(rec, HookSessionRecord)
     assert rec.session_id == "gsid-7"
     assert rec.cwd == "/work"

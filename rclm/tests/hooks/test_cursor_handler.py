@@ -225,6 +225,8 @@ def test_stop_uploads_record(mock_upload, monkeypatch, tmp_path):
     assert mock_upload.called
     record = mock_upload.call_args[0][0]
     assert record.session_id == session_id
+    assert record.capture_source == "native_agent"
+    assert record.agent_client == "cursor"
     assert record.cwd == "/test/dir"
     assert record.duration_s == 10.0
     assert len(record.messages) == 1

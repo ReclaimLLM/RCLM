@@ -11,6 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import TypeAlias
 
 from rclm.compress.filters.lossless import MECHANISM as LOSSLESS_SEARCH_PATH_MECHANISM
@@ -20,11 +21,11 @@ from rclm.compress.runner import apply_filter
 from rclm.hooks import image_lifecycle
 from rclm.hooks._analytics import estimate_tokens, mechanism_saving_event
 from rclm.hooks.compress import is_compressible_command
+from rclm.hooks.tool_semantics import command_text, normalized_tool_name, tool_family
 
 _PathPart: TypeAlias = str | int
 _MAX_JSON_PARSE_CHARS = 2_000_000
 _MAX_CONTENT_BLOCKS = 64
-_SHELL_TOOL_NAMES = frozenset({"bash", "exec", "exec_command", "shell"})
 _SQL_READ_PREFIX = re.compile(r"^\s*(?:select|explain|show)\b", re.IGNORECASE)
 _SQL_UNTRUSTED_BLOCK = re.compile(
     r"<(?P<tag>untrusted-data-[A-Za-z0-9-]+)>\n(?P<data>.*?)\n</(?P=tag)>",
@@ -33,6 +34,17 @@ _SQL_UNTRUSTED_BLOCK = re.compile(
 _SQL_HEAD_ROWS = 12
 _SQL_TAIL_ROWS = 6
 _SQL_MIN_ROWS = 30
+_ANTIGRAVITY_COMMAND_EXIT = re.compile(r"The command exited with code (?P<code>\d+)\.")
+_ANTIGRAVITY_OUTPUT = re.compile(r"\nOutput:\n(?P<output>.*)\Z", re.DOTALL)
+_DIFF_BLOCK = re.compile(
+    r"\[diff_block_start\]\n(?P<diff>.*?)\n\[diff_block_end\]",
+    re.DOTALL,
+)
+_DIFF_HUNK = re.compile(
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
+    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -108,6 +120,26 @@ def decision_from_replacement(
     )
 
 
+def attach_recall_stub(
+    source: object,
+    decision: TransformDecision,
+    stub: str,
+    *,
+    tool_name: str = "",
+) -> TransformDecision:
+    """Append a persisted exact-recall handle without changing wire shape."""
+    envelope = extract_tool_text_envelope(tool_name, source)
+    if envelope is None:
+        return decision
+    replacement = decision.compressed_text.rstrip("\n") + "\n" + stub + "\n"
+    recalled = decision_from_replacement(
+        envelope,
+        replacement,
+        mechanism=decision.mechanism,
+    )
+    return recalled or decision
+
+
 def compact_tool_result(
     tool_name: str,
     tool_input: object,
@@ -129,7 +161,7 @@ def compact_tool_result(
     if isinstance(tool_response, str) and _looks_like_encoded_image(tool_response):
         return None
 
-    envelope = extract_text_envelope(tool_response)
+    envelope = extract_tool_text_envelope(tool_name, tool_response)
     if envelope is None:
         return None
     if _looks_like_encoded_image(envelope.text):
@@ -138,18 +170,22 @@ def compact_tool_result(
     exit_code = _exit_code(tool_response)
     if exit_code not in (None, 0):
         return None
+    wrapped_exit_code = _wrapped_command_exit_code(envelope.text)
+    if wrapped_exit_code not in (None, 0):
+        return None
 
-    native_replacement = _compact_known_native_tool(tool_name, tool_input, envelope.text)
-    if native_replacement is not None:
+    native_decision = _compact_known_native_tool(tool_name, tool_input, envelope.text)
+    if native_decision is not None:
+        native_replacement, native_mechanism = native_decision
         return decision_from_replacement(
             envelope,
             native_replacement,
-            mechanism="H3_exec_compaction",
+            mechanism=native_mechanism,
         )
 
-    if tool_name.lower() not in _SHELL_TOOL_NAMES:
+    if tool_family(tool_name) != "shell":
         return None
-    command = tool_input.get("command") or tool_input.get("cmd")
+    command = command_text(tool_input)
     if isinstance(command, str):
         shell = tool_input.get("shell")
         if not isinstance(shell, str) or not shell.strip():
@@ -274,6 +310,24 @@ def extract_text_envelope(value: object) -> TextEnvelope | None:
     return TextEnvelope(value, path, text)
 
 
+def extract_tool_text_envelope(tool_name: str, value: object) -> TextEnvelope | None:
+    """Extract text with narrow support for Codex's ordered exec block arrays."""
+    envelope = extract_text_envelope(value)
+    if envelope is not None:
+        return envelope
+    if tool_family(tool_name) != "shell" or not isinstance(value, list) or not value:
+        return None
+    if not all(
+        isinstance(block, dict)
+        and block.get("type") in {"text", "output_text", "input_text"}
+        and isinstance(block.get("text"), str)
+        for block in value
+    ):
+        return None
+    combined = "".join(block["text"] for block in value)
+    return TextEnvelope(value, (), combined) if combined else None
+
+
 def _find_text_path(value: object) -> tuple[tuple[_PathPart, ...], str] | None:
     if isinstance(value, list):
         if len(value) > _MAX_CONTENT_BLOCKS:
@@ -320,16 +374,127 @@ def _find_text_path(value: object) -> tuple[tuple[_PathPart, ...], str] | None:
     return None
 
 
-def _compact_known_native_tool(tool_name: str, tool_input: dict, text: str) -> str | None:
+def _compact_known_native_tool(
+    tool_name: str, tool_input: dict, text: str
+) -> tuple[str, str] | None:
     """Compact only native tools with a stable, explicitly recognized shape."""
-    normalized = tool_name.lower()
-    if normalized.endswith(("__browser_snapshot", "__browser_accessibility_snapshot")):
-        return filter_generic(text)
-    if "supabase" in normalized and normalized.endswith("__execute_sql"):
+    normalized = normalized_tool_name(tool_name)
+    if normalized in {"browser_snapshot", "browser_accessibility_snapshot"}:
+        replacement = filter_generic(text)
+        return (replacement, "H3_exec_compaction") if replacement is not None else None
+    if "supabase" in tool_name.lower() and normalized == "execute_sql":
         query = tool_input.get("query")
         if isinstance(query, str) and _SQL_READ_PREFIX.match(query):
-            return _compact_supabase_rows(text)
+            replacement = _compact_supabase_rows(text)
+            return (replacement, "H3_exec_compaction") if replacement is not None else None
+    if normalized == "view_file":
+        replacement = _compact_antigravity_view(text)
+        return (replacement, "provider_canonicalization") if replacement is not None else None
+    if normalized == "run_command":
+        replacement = _compact_antigravity_command(tool_input, text)
+        return (replacement, "H3_exec_compaction") if replacement is not None else None
+    if normalized == "exec" and text.startswith(("Script completed\n", "Chunk ID:")):
+        replacement = filter_generic(text)
+        return (replacement, "provider_output_shaping") if replacement is not None else None
+    if normalized in {"grep_search", "find_by_name", "list_dir"}:
+        canonical = _strip_antigravity_timing(text)
+        replacement = filter_generic(canonical) or (canonical if canonical != text else None)
+        return (replacement, "provider_output_shaping") if replacement is not None else None
+    if normalized in {"replace_file_content", "multi_replace_file_content", "write_to_file"}:
+        replacement = _compact_edit_receipt(normalized, tool_input, text)
+        return (replacement, "edit_receipt") if replacement is not None else None
     return None
+
+
+def _strip_antigravity_timing(text: str) -> str:
+    """Drop volatile capture timestamps while leaving result semantics intact."""
+    lines = text.splitlines(keepends=True)
+    while lines and lines[0].startswith(("Created At: ", "Completed At: ")):
+        lines.pop(0)
+    return "".join(lines)
+
+
+def _compact_antigravity_view(text: str) -> str | None:
+    """Remove verbose boilerplate from the observed ``view_file`` envelope."""
+    canonical = _strip_antigravity_timing(text)
+    lines = canonical.splitlines(keepends=True)
+    kept: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(
+            "The following code has been modified to include a line number before every line"
+        ):
+            continue
+        if stripped.startswith("The above content does NOT show the entire file contents"):
+            continue
+        kept.append(line)
+    replacement = "".join(kept).strip("\n") + "\n"
+    return replacement if len(replacement) < len(text) else None
+
+
+def _wrapped_command_exit_code(text: str) -> int | None:
+    match = _ANTIGRAVITY_COMMAND_EXIT.search(text)
+    return int(match.group("code")) if match is not None else None
+
+
+def _compact_antigravity_command(tool_input: dict, text: str) -> str | None:
+    """Compact the command output while retaining the provider's exit status."""
+    exit_code = _wrapped_command_exit_code(text)
+    command = command_text(tool_input)
+    output_match = _ANTIGRAVITY_OUTPUT.search(text)
+    if exit_code != 0 or command is None or output_match is None:
+        return None
+    output = output_match.group("output")
+    shell = tool_input.get("shell")
+    if not isinstance(shell, str) or not shell.strip():
+        shell = "posix" if os.name == "posix" else os.name
+    filtered = None
+    if is_compressible_command(command, shell=shell):
+        result = apply_filter(command, output, "", exit_code=0)
+        if result.text != output and len(result.text) < len(output):
+            filtered = result.text
+    if filtered is None:
+        filtered = filter_generic(output)
+    canonical_output = filtered if filtered is not None else output
+    replacement = f"The command exited with code 0.\nOutput:\n{canonical_output}"
+    return replacement if len(replacement) < len(text) else None
+
+
+def _compact_edit_receipt(normalized: str, tool_input: dict, text: str) -> str | None:
+    """Replace a successful echoed patch with a deterministic, auditable receipt."""
+    match = _DIFF_BLOCK.search(text)
+    if match is None:
+        return None
+    diff = match.group("diff")
+    target = tool_input.get("TargetFile") or tool_input.get("file_path")
+    if not isinstance(target, str) or not target:
+        return None
+    # The observed provider response names the target before the diff.  Refuse
+    # a receipt when it disagrees with the input rather than guessing.
+    if normalized != "write_to_file" and target not in text[: match.start()]:
+        return None
+    added = sum(
+        1 for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")
+    )
+    removed = sum(
+        1 for line in diff.splitlines() if line.startswith("-") and not line.startswith("---")
+    )
+    hunks = list(_DIFF_HUNK.finditer(diff))
+    if not hunks and not (added or removed):
+        return None
+    ranges = []
+    for hunk in hunks[:12]:
+        start = int(hunk.group("new_start"))
+        count = int(hunk.group("new_count") or 1)
+        ranges.append(f"{start}-{max(start, start + count - 1)}")
+    digest = sha256(text.encode("utf-8", errors="surrogateescape")).hexdigest()
+    receipt = (
+        f"[rclm edit receipt] tool={normalized} target={target}\n"
+        f"hunks={len(hunks)} added={added} removed={removed} "
+        f"new_line_ranges={','.join(ranges) or 'unknown'}\n"
+        f"source_sha256={digest} (exact result retained in session capture)\n"
+    )
+    return receipt if len(receipt) < len(text) else None
 
 
 def _compact_supabase_rows(text: str) -> str | None:

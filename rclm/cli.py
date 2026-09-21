@@ -23,6 +23,20 @@ def _cmd_convert_session(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_recall_result(args: argparse.Namespace) -> None:
+    from rclm.hooks.recallable_artifacts import RecallableArtifactStore
+
+    result = RecallableArtifactStore().recall(
+        args.session_id,
+        args.handle,
+        start=args.start,
+        end=args.end,
+    )
+    if result is None:
+        raise SystemExit("artifact not found or requested range is invalid")
+    sys.stdout.write(result.text)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="rclm",
@@ -82,6 +96,16 @@ def main() -> None:
         help="Force LLM regeneration even when existing annotations are available",
     )
     cs.set_defaults(func=_cmd_convert_session)
+
+    recall = subparsers.add_parser(
+        "recall-result",
+        help="Read an exact character range from a locally evicted tool result",
+    )
+    recall.add_argument("session_id")
+    recall.add_argument("handle")
+    recall.add_argument("--start", type=int, default=0)
+    recall.add_argument("--end", type=int, default=None)
+    recall.set_defaults(func=_cmd_recall_result)
 
     # ─────────────────────────────────────────────────────────────────────────
 

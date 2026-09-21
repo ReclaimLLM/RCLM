@@ -169,6 +169,27 @@ def test_top_level_multiple_text_blocks_are_ambiguous():
     assert extract_text_envelope(response) is None
 
 
+def test_codex_exec_combines_ordered_custom_output_text_blocks() -> None:
+    response = [
+        {"type": "input_text", "text": "Script completed\nOutput:\n"},
+        {"type": "input_text", "text": _large_output()},
+    ]
+
+    decision = compact_tool_result("exec", {"cmd": "cat build.log"}, response)
+
+    assert decision is not None
+    assert isinstance(decision.wire_replacement, str)
+    assert "lines omitted" in decision.compressed_text
+
+
+def test_non_shell_multi_text_blocks_remain_ambiguous() -> None:
+    response = [
+        {"type": "input_text", "text": _large_output()},
+        {"type": "input_text", "text": "separate meaning"},
+    ]
+    assert compact_tool_result("unknown_tool", {}, response) is None
+
+
 def test_compacts_large_playwright_snapshot_in_top_level_text_block():
     snapshot = "\n".join(f"- generic [ref=e{line}]: item {line}" for line in range(100))
 
@@ -241,3 +262,51 @@ def test_analytics_include_char_counts_and_explicit_estimator():
     assert transformation["raw_chars"] == len(decision.original_text)
     assert transformation["compressed_chars"] == len(decision.compressed_text)
     assert transformation["token_estimator"] == "chars_div_4_v1"
+
+
+def test_canonicalizes_antigravity_view_file_boilerplate() -> None:
+    content = (
+        "Created At: 2026-09-15T10:07:39-04:00\n"
+        "Completed At: 2026-09-15T10:07:39-04:00\n"
+        "File Path: `file:///repo/a.py`\nTotal Lines: 2\nTotal Bytes: 12\n"
+        "Showing lines 1 to 2\n"
+        "The following code has been modified to include a line number before every line, "
+        "in the format: <line_number>: <original_line>. Please note that any changes "
+        "targeting the original code should remove the line number, colon, and leading space.\n"
+        "1: one\n2: two\n"
+        "The above content does NOT show the entire file contents. If you need to view any "
+        "lines of the file which were not shown to complete your task, call this tool again "
+        "to view those lines.\n"
+    )
+
+    decision = compact_tool_result("view_file", {"AbsolutePath": "/repo/a.py"}, content)
+
+    assert decision is not None
+    assert "Created At" not in decision.compressed_text
+    assert "1: one\n2: two" in decision.compressed_text
+
+
+def test_compacts_antigravity_successful_edit_to_receipt() -> None:
+    target = "/repo/a.py"
+    content = (
+        "Created At: now\nCompleted At: later\n"
+        f"The following changes were made by the replace_file_content tool to: {target}.\n"
+        "[diff_block_start]\n@@ -1,2 +1,2 @@\n-old\n+new\n same\n[diff_block_end]\n"
+        + "explanation "
+        * 100
+    )
+
+    decision = compact_tool_result("replace_file_content", {"TargetFile": target}, content)
+
+    assert decision is not None
+    assert "[rclm edit receipt]" in decision.compressed_text
+    assert "added=1 removed=1" in decision.compressed_text
+    assert target in decision.compressed_text
+
+
+def test_antigravity_failed_command_passes_through() -> None:
+    content = (
+        "Created At: now\nCompleted At: later\n\n"
+        "The command exited with code 1.\nOutput:\n" + _large_output()
+    )
+    assert compact_tool_result("run_command", {"CommandLine": "pytest"}, content) is None

@@ -294,6 +294,7 @@ class ReclaimLLMClient:
         self.headers = {
             "X-API-Key": creds.api_key,
             "Content-Type": "application/json",
+            "X-ReclaimLLM-Client": "mcp",
         }
 
     async def _request(

@@ -190,11 +190,7 @@ def save(server_url: str, api_key: str, **extra: object) -> None:
         for key in ("compress", "dedupe", "compression_thresholds"):
             existing.pop(key, None)
     existing.update({"server_url": server_url, "api_key": api_key, **extra})
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
-        json.dumps(existing, indent=2),
-        encoding="utf-8",
-    )
+    _write_private_config(existing)
 
 
 def patch(**fields: object) -> None:
@@ -204,8 +200,19 @@ def patch(**fields: object) -> None:
     """
     existing = load()
     existing.update(fields)
+    _write_private_config(existing)
+
+
+def _write_private_config(data: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
-        json.dumps(existing, indent=2),
-        encoding="utf-8",
-    )
+    os.chmod(CONFIG_PATH.parent, 0o700)
+    temporary = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2))
+        os.replace(temporary, CONFIG_PATH)
+        os.chmod(CONFIG_PATH, 0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise

@@ -1,10 +1,10 @@
 # RCLM — Data Capture for AI Tools
 
-Every time you use an AI coding assistant, you produce valuable reasoning and code. **RCLM** (ReclaimLLM) ensures that data belongs to you. It is a lightweight capture layer that records your AI sessions from Claude Code, Gemini CLI, Codex CLI, and OpenClaw, shipping them to your personal ReclaimLLM account for search, analysis, and continuation.
+Every time you use an AI coding assistant, you produce valuable reasoning and code. **RCLM** (ReclaimLLM) ensures that data belongs to you. It is a lightweight capture layer that records your AI sessions from Claude Code, Codex CLI, Cursor, Antigravity, Gemini CLI, and OpenClaw, shipping them to your ReclaimLLM account for search, analysis, and continuation.
 
 ## Key Features
 
-- **Native Hooks:** Zero-config integration into Claude Code, Gemini CLI, Codex CLI, and OpenClaw.
+- **Native Hooks:** One installer for Claude Code, Codex CLI, Cursor, Antigravity, Gemini CLI, and opt-in OpenClaw.
 - **Historical Sync:** One-command backfill for all your past AI sessions.
 - **DLP & Privacy:** Automatic redaction of secrets from `.env` files before they reach the model.
 - **Context Compression:** Read caching, result dedup, exec-output compaction, and automatic image downscaling cut token usage without losing information — see [Context Compression & DLP](#context-compression--dlp).
@@ -23,8 +23,14 @@ pip install rclm
 
 ### 2. Setup Hooks
 ```bash
-# Integrates with Claude Code, Gemini CLI, Codex CLI, and OpenClaw
+# Integrates with Claude Code, Codex CLI, Cursor, Antigravity, and Gemini CLI
 rclm-hooks-install
+
+# Install only selected clients
+rclm-hooks-install --claude --cursor
+
+# OpenClaw remains opt-in
+rclm-hooks-install --openclaw
 ```
 This will open a browser to `reclaimllm.com` to link your account. Once linked, every session is automatically captured.
 
@@ -32,7 +38,22 @@ This will open a browser to `reclaimllm.com` to link your account. Once linked, 
 ```bash
 # Upload sessions that predated the installation
 rclm-sync
+
+# Or select one source
+rclm-sync --antigravity
 ```
+
+Failed uploads—including rejected credentials and server errors—are saved after local redaction in `~/.reclaimllm/failed_uploads/`. Retry them with `rclm-sync --failed`. ReclaimLLM-owned config, session sidecars, sync indexes, and failed-upload files use owner-only permissions. Provider-owned transcript files remain under the provider's control and may contain unredacted content.
+
+To remove hooks while preserving unrelated client settings:
+
+```bash
+rclm-hooks-uninstall                    # all default clients
+rclm-hooks-uninstall --cursor           # one client
+rclm-hooks-uninstall --antigravity
+```
+
+Each captured session records the coding client separately from the underlying model provider, so a Cursor session using Claude remains attributed to Cursor. The dashboard exposes this as a coding-agent badge and filter.
 
 ---
 
@@ -104,7 +125,7 @@ When you need the complete captured session instead of a summary, ask the target
 
 ### Replay: verifying token savings
 
-`replay_eligibility`, `replay_session`, `replay_corpus`, and `replay_compare` reproduce RCLM's shipped compression mechanisms (`range_cache`, `shell_compaction`, `hash_dedupe`) over already-captured sessions and report the real tool-result token reduction, without calling a model or re-running any historical command:
+`replay_eligibility`, `replay_session`, `replay_corpus`, and `replay_compare` reproduce RCLM's shipped compression mechanisms (`range_cache`, `shell_compaction`, `stateful_delta`, `hash_dedupe`) over already-captured sessions and report the real tool-result token reduction, without calling a model or re-running any historical command:
 
 - "Would compression help on my last 50 sessions?" → `replay_eligibility`
 - "How much did compression save on session `<id>`?" → `replay_session`
@@ -122,6 +143,7 @@ Every result states sessions considered vs. eligible vs. excluded; a session or 
 | `rclm-hooks-install` | Install/configure native hooks for local LLM CLIs. |
 | `rclm-sync` | Discover and upload historical transcripts. |
 | `rclm convert-session` | Export a session to Markdown context for tool switching. |
+| `rclm recall-result` | Recall an exact character range from a locally evicted tool result. |
 | `rclm-proxy` | Start/setup a LiteLLM proxy for OpenAI-compatible capture. |
 | `rclm-update` | Check for and apply updates to the `rclm` package. |
 
@@ -141,7 +163,7 @@ rclm-hooks-install --image-lifecycle --image-max-dim=1280  # Set the max image d
 
 Image downscaling (`--image-lifecycle`) resizes and re-encodes oversized tool-result images — full-page screenshots, MCP screenshot-tool output — before they enter the model's context, and never upscales. It applies for real on Claude Code sessions; on Codex it currently reports measured before/after savings only, since Codex CLI does not yet apply hook-driven rewrites of MCP tool output. Requires the optional `images` extra: `pip install 'rclm[images]'`.
 
-Text compression uses each coding client's native hooks; it does not require proxy or LLM-gateway traffic. Claude Code and Codex support recognized shell-output compaction. Cursor wraps recognized shell commands before execution and limits post-result replacement to structured MCP output. Unknown commands, failures, images, and ambiguous structured results pass through unchanged. Identical-result dedupe remains off by default (`--dedupe`).
+Text compression uses each coding client's native hooks; it does not require proxy or LLM-gateway traffic. Claude Code and Codex support recognized shell-output compaction plus differential output for repeated commands and searches. Successful compacted results are stored locally behind bounded SHA-256 recall handles, and deterministic file/test/error state is retained in a typed task ledger. Antigravity caps `view_file` requests to 200 lines and wraps supported commands before execution; its PostToolUse contract cannot replace output. Cursor wraps recognized shell commands before execution and limits post-result replacement to structured MCP output. Unknown commands, failures, images, and ambiguous structured results pass through unchanged. Identical-result dedupe remains off by default (`--dedupe`).
 
 ### Folder Capture Filters
 Limit uploads to specific project folders during installation:

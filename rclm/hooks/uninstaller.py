@@ -1,4 +1,4 @@
-"""Remove rclm hooks from Claude Code, Gemini CLI, Codex CLI, and/or OpenClaw settings.
+"""Remove rclm hooks from supported coding-agent settings.
 
 Removes any hook entries whose command starts with ``rclm-``.
 All other hooks are left untouched.
@@ -13,6 +13,8 @@ Usage:
     rclm-hooks-uninstall --claude        # Claude Code only
     rclm-hooks-uninstall --gemini        # Gemini CLI only
     rclm-hooks-uninstall --codex         # Codex CLI only
+    rclm-hooks-uninstall --cursor        # Cursor only
+    rclm-hooks-uninstall --antigravity   # Antigravity only
     rclm-hooks-uninstall --openclaw      # OpenClaw only
     rclm-hooks-uninstall --purge-config  # also delete ~/.reclaimllm/config.json
 """
@@ -21,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -41,6 +45,8 @@ def _parse_flags() -> argparse.Namespace:
   %(prog)s --claude           # Claude Code only
   %(prog)s --gemini           # Gemini CLI only
   %(prog)s --codex            # Codex CLI only
+  %(prog)s --cursor           # Cursor only
+  %(prog)s --antigravity      # Antigravity only
   %(prog)s --openclaw         # OpenClaw only
   %(prog)s --purge-config     # also delete ~/.reclaimllm/config.json""",
     )
@@ -65,6 +71,8 @@ def _parse_flags() -> argparse.Namespace:
         action="store_true",
         help="Target OpenClaw plugin hooks",
     )
+    parser.add_argument("--cursor", action="store_true", help="Target Cursor hooks.json")
+    parser.add_argument("--antigravity", action="store_true", help="Target Antigravity hooks.json")
     parser.add_argument(
         "--local",
         action="store_true",
@@ -91,7 +99,11 @@ def _command_belongs_to_rclm(command: str) -> bool:
     PATH (e.g. /home/user/.venv/bin/rclm-claude-hooks), so this checks the basename
     of the first token rather than a literal string prefix on the full command.
     """
-    first_token = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = []
+    first_token = tokens[0] if tokens else ""
     return Path(first_token).name.startswith("rclm-")
 
 
@@ -169,15 +181,69 @@ def _uninstall_settings_provider(path: Path) -> None:
     if count == 0:
         print(f"No rclm hooks found in {path}.")
     else:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(updated, fh, indent=2)
-            fh.write("\n")
+        _write_json(path, updated)
         print(f"Removed {count} rclm hook entr{'y' if count == 1 else 'ies'} from {path}.")
 
 
 def _uninstall_codex(path: Path) -> None:
     """Uninstall rclm hooks from a Codex hooks.json file (same nested format as Claude/Gemini)."""
     _uninstall_settings_provider(path)
+
+
+def _uninstall_cursor(path: Path) -> None:
+    """Remove direct command entries from Cursor's event-keyed hooks object."""
+    if not path.exists():
+        print(f"Nothing to do — {path} does not exist.")
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(f"Warning: {path} contains invalid JSON — cannot safely modify it.", file=sys.stderr)
+        return
+    hooks = data.get("hooks")
+    removed = 0
+    if isinstance(hooks, dict):
+        for event_name, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            kept = [
+                entry
+                for entry in entries
+                if not (
+                    isinstance(entry, dict)
+                    and _command_belongs_to_rclm(str(entry.get("command", "")))
+                )
+            ]
+            removed += len(entries) - len(kept)
+            if kept:
+                hooks[event_name] = kept
+            else:
+                del hooks[event_name]
+        if not hooks:
+            data.pop("hooks", None)
+    if removed:
+        _write_json(path, data)
+        print(f"Removed {removed} rclm hook entr{'y' if removed == 1 else 'ies'} from {path}.")
+    else:
+        print(f"No rclm hooks found in {path}.")
+
+
+def _uninstall_antigravity(path: Path) -> None:
+    """Remove the single Antigravity hook namespace owned by ReclaimLLM."""
+    if not path.exists():
+        print(f"Nothing to do — {path} does not exist.")
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(f"Warning: {path} contains invalid JSON — cannot safely modify it.", file=sys.stderr)
+        return
+    removed = data.pop("rclm-antigravity-hooks", None) is not None
+    if removed:
+        _write_json(path, data)
+        print(f"Removed rclm Antigravity hooks from {path}.")
+    else:
+        print(f"No rclm hooks found in {path}.")
 
 
 def _uninstall_openclaw(use_global: bool) -> None:
@@ -195,6 +261,16 @@ def _uninstall_openclaw(use_global: bool) -> None:
         print("No rclm OpenClaw plugin hooks found.")
 
 
+def _write_json(path: Path, data: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -203,15 +279,21 @@ def _uninstall_openclaw(use_global: bool) -> None:
 def main() -> None:
     args = _parse_flags()
 
-    providers = [p for p in ("claude", "gemini", "codex", "openclaw") if getattr(args, p)]
+    providers = [
+        p
+        for p in ("claude", "gemini", "codex", "cursor", "antigravity", "openclaw")
+        if getattr(args, p)
+    ]
     if not providers:
         providers = (
-            ["claude", "gemini", "codex"]
+            ["claude", "gemini", "codex", "cursor", "antigravity"]
             if args.local
             else [
                 "claude",
                 "gemini",
                 "codex",
+                "cursor",
+                "antigravity",
                 "openclaw",
             ]
         )
@@ -240,6 +322,20 @@ def main() -> None:
                 else Path(".codex") / "hooks.json"
             )
             _uninstall_codex(path)
+        elif provider == "cursor":
+            path = (
+                Path.home() / ".cursor" / "hooks.json"
+                if use_global
+                else Path(".cursor") / "hooks.json"
+            )
+            _uninstall_cursor(path)
+        elif provider == "antigravity":
+            path = (
+                Path.home() / ".gemini" / "config" / "hooks.json"
+                if use_global
+                else Path(".agents") / "hooks.json"
+            )
+            _uninstall_antigravity(path)
         elif provider == "openclaw":
             _uninstall_openclaw(use_global)
 

@@ -17,6 +17,7 @@ from rclm import _config
 from rclm._models import HookSessionRecord
 from rclm._uploader import close_session, upload_single
 from rclm.hooks import dlp, session_store
+from rclm.hooks.capture_metadata import native_metadata
 from rclm.hooks.openclaw_transcript import (
     as_dict,
     bounded,
@@ -115,22 +116,25 @@ def _handle_append_event(session_id: str, payload: dict, hook_name: str) -> None
     session_store.append_event(session_id, stored)
 
 
-async def _upload_and_close(record: HookSessionRecord, *, max_retries: int) -> None:
+async def _upload_and_close(record: HookSessionRecord, *, max_retries: int):
     """upload_single, then close the module-level aiohttp session before this
     asyncio.run() call's event loop is torn down -- see claude_handler's
     identical helper for why (aiohttp session/loop binding)."""
     try:
-        await upload_single(record, max_retries=max_retries)
+        return await upload_single(record, max_retries=max_retries)
     finally:
         await close_session()
 
 
 def _handle_session_end(session_id: str, payload: dict) -> None:
+    if session_store.has_marker(session_id, "finalized"):
+        return
     now = timestamp_from_payload(payload)
     events = session_store.read_events(session_id)
     started_at = started_at_from_events(events, now)
     ended_at = now
 
+    model = first_model_from_events(events, model_from_payload(payload))
     record = HookSessionRecord(
         session_id=session_id,
         cwd=first_cwd_from_events(events, cwd_from_payload(payload)),
@@ -138,16 +142,25 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
         ended_at=ended_at,
         duration_s=duration_s(started_at, ended_at),
         transcript_path=None,
-        model=first_model_from_events(events, model_from_payload(payload)),
+        model=model,
         messages=build_messages(events),
         tool_calls=build_tool_calls(events),
         file_diffs=[],
         total_input_tokens=None,
         total_output_tokens=None,
+        **native_metadata(
+            "openclaw",
+            adapter_name="openclaw_hooks",
+            model=model,
+            agent_client_version=str(payload.get("version") or "") or None,
+            capabilities={"transcript": False, "tool_calls": True, "file_diffs": False},
+        ),
     )
 
-    asyncio.run(_upload_and_close(record, max_retries=1))
-    session_store.cleanup(session_id)
+    outcome = asyncio.run(_upload_and_close(record, max_retries=1))
+    if getattr(outcome, "cleanup_safe", outcome is None):
+        session_store.cleanup(session_id)
+        session_store.write_marker(session_id, "finalized")
 
 
 _ACCUMULATE_EVENTS = {

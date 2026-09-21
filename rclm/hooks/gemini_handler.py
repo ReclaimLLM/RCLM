@@ -30,12 +30,23 @@ from datetime import datetime, timezone
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import close_session, upload_single
-from rclm.hooks import bootstrap, dedupe, dlp, read_cache, session_store
+from rclm.hooks import (
+    bootstrap,
+    context_memory,
+    dedupe,
+    dlp,
+    read_cache,
+    result_delta,
+    session_store,
+    tool_result_transform,
+)
 from rclm.hooks._analytics import (
     aggregate_mechanism_savings,
     estimate_tokens,
     mechanism_saving_event,
 )
+from rclm.hooks.capture_metadata import native_metadata
+from rclm.hooks.transcript_io import read_json_document
 from rclm.hooks.updater import schedule_session_end_update
 
 logger = logging.getLogger(__name__)
@@ -168,6 +179,7 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
     replaced = dlp_replacement is not None
     tool_input = payload.get("tool_input", {})
     tool_use_id = payload.get("tool_use_id") or f"gemini-tool-{len(prior_events)}"
+    artifact_handle: str | None = None
 
     if policy.enabled("range_cache") and tool_name in {"write_file", "replace"}:
         try:
@@ -215,8 +227,83 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
         except Exception:
             logger.exception("range cache failed; passing through tool result")
 
+    delta_claimed = False
+    if policy.enabled("exec_compaction") and not range_claimed:
+        shadow = policy.shadow_for("exec_compaction")
+        try:
+            state = session_store.read_result_delta_state(session_id)
+            delta = result_delta.process_delta(tool_name, tool_input, effective_text, state)
+            session_store.write_result_delta_state(session_id, delta.state)
+            if delta.replacement is not None:
+                replacement = delta.replacement
+                if not shadow:
+                    replacement, artifact_handle = context_memory.make_text_recallable(
+                        session_id,
+                        effective_text,
+                        replacement,
+                        provider="gemini",
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        tool_use_id=tool_use_id,
+                    )
+                raw_tokens = estimate_tokens(effective_text)
+                compressed_tokens = estimate_tokens(replacement)
+                session_store.append_event(
+                    session_id,
+                    mechanism_saving_event(
+                        "stateful_delta",
+                        applied=not shadow,
+                        tokens_saved_estimate=max(0, raw_tokens - compressed_tokens),
+                        measurement_kind="measured",
+                        raw_token_estimate=raw_tokens,
+                        compressed_token_estimate=compressed_tokens,
+                    ),
+                )
+                if not shadow:
+                    effective_text = replacement
+                    replaced = True
+                delta_claimed = not shadow
+        except Exception:
+            logger.exception("stateful result delta failed; passing through tool result")
+
+    if policy.enabled("exec_compaction") and not range_claimed and not delta_claimed:
+        shadow = policy.shadow_for("exec_compaction")
+        try:
+            decision = tool_result_transform.compact_tool_result(
+                tool_name,
+                tool_input,
+                effective_text,
+            )
+            if decision is not None:
+                if not shadow:
+                    decision, artifact_handle = context_memory.make_decision_recallable(
+                        session_id,
+                        effective_text,
+                        decision,
+                        provider="gemini",
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        tool_use_id=tool_use_id,
+                    )
+                for event in tool_result_transform.analytics_events(
+                    decision,
+                    tool_use_id=tool_use_id,
+                    applied=not shadow,
+                ):
+                    session_store.append_event(session_id, event)
+                if not shadow:
+                    effective_text = decision.model_text
+                    replaced = True
+        except Exception:
+            logger.exception("tool-result compaction failed; passing through tool result")
+
     compression = _config.compression_config(cfg)
-    if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
+    if (
+        policy.enabled("hash_dedupe")
+        and compression["dedupe"]
+        and not range_claimed
+        and not delta_claimed
+    ):
         shadow = policy.shadow_for("hash_dedupe")
         try:
             state = session_store.read_dedupe_state(session_id)
@@ -264,6 +351,19 @@ def _handle_after_tool(session_id: str, payload: dict) -> dict | None:
         except Exception:
             logger.exception("hash dedupe failed; passing through tool result")
 
+    try:
+        context_memory.observe_tool(
+            session_id,
+            tool_name,
+            tool_input,
+            captured_response,
+            tool_use_id=tool_use_id,
+            artifact_handle=artifact_handle,
+            cwd=cwd,
+        )
+    except Exception:
+        logger.exception("task ledger update failed; continuing without ledger state")
+
     if replaced:
         return {"decision": "deny", "reason": effective_text}
 
@@ -290,13 +390,11 @@ def _parse_gemini_transcript(transcript_path: str | None) -> dict:
         "model": None,
         "total_input_tokens": None,
         "total_output_tokens": None,
+        "warnings": [],
     }
-    if not transcript_path:
-        return result
-    try:
-        with open(transcript_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
+    data, warnings = read_json_document(transcript_path, logger=logger)
+    result["warnings"] = warnings
+    if data is None:
         return result
 
     total_input = 0
@@ -443,17 +541,19 @@ def _extract_file_diffs(events: list[dict]) -> list[FileDiff]:
     return diffs
 
 
-async def _upload_and_close(record: HookSessionRecord) -> None:
+async def _upload_and_close(record: HookSessionRecord):
     """upload_single, then close the module-level aiohttp session before this
     asyncio.run() call's event loop is torn down -- see claude_handler's
     identical helper for why (aiohttp session/loop binding)."""
     try:
-        await upload_single(record)
+        return await upload_single(record)
     finally:
         await close_session()
 
 
 def _handle_session_end(session_id: str, payload: dict) -> None:
+    if session_store.has_marker(session_id, "finalized"):
+        return
     now = _now()
     events = session_store.read_events(session_id)
 
@@ -476,6 +576,7 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
     transcript_path = payload.get("transcript_path")
     transcript_data = _parse_gemini_transcript(transcript_path)
 
+    model = transcript_data["model"] or "gemini-unknown"
     record = HookSessionRecord(
         session_id=session_id,
         cwd=cwd,
@@ -483,7 +584,7 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
         ended_at=ended_at,
         duration_s=duration_s,
         transcript_path=transcript_path,
-        model=transcript_data["model"] or "gemini-unknown",
+        model=model,
         messages=_build_messages(events),
         tool_calls=_build_tool_calls(events),
         file_diffs=_extract_file_diffs(events),
@@ -491,11 +592,23 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
         total_output_tokens=transcript_data["total_output_tokens"],
         mechanism_savings=aggregate_mechanism_savings(events),
         hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "gemini"),
+        **native_metadata(
+            "gemini_cli",
+            adapter_name="gemini_cli_hooks",
+            model=model,
+            provider="google",
+            agent_client_version=payload.get("version") or payload.get("client_version"),
+            capabilities={"transcript": False, "tool_calls": True, "file_diffs": True},
+            warnings=transcript_data["warnings"],
+        ),
     )
 
-    asyncio.run(_upload_and_close(record))
+    outcome = asyncio.run(_upload_and_close(record))
+    if not getattr(outcome, "cleanup_safe", outcome is None):
+        return
     schedule_session_end_update()
     session_store.cleanup(session_id)
+    session_store.write_marker(session_id, "finalized")
 
 
 # ---------------------------------------------------------------------------

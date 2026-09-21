@@ -30,6 +30,7 @@ from rclm.hooks import (
     tool_result_transform,
 )
 from rclm.hooks._analytics import aggregate_mechanism_savings
+from rclm.hooks.capture_metadata import native_metadata
 from rclm.hooks.compress import maybe_compress
 from rclm.hooks.cursor_transcript import _clean_user_text
 
@@ -438,17 +439,19 @@ def _build_messages_from_events(events: list[dict]) -> list[dict]:
     return messages
 
 
-async def _upload_and_close(record: HookSessionRecord) -> None:
+async def _upload_and_close(record: HookSessionRecord):
     """upload_single, then close the module-level aiohttp session before this
     asyncio.run() call's event loop is torn down -- see claude_handler's
     identical helper for why (aiohttp session/loop binding)."""
     try:
-        await upload_single(record)
+        return await upload_single(record)
     finally:
         await close_session()
 
 
 def _handle_stop(session_id: str, payload: dict) -> None:
+    if session_store.has_marker(session_id, "finalized"):
+        return
     now = _now()
     events = session_store.read_events(session_id)
     cwd = _resolve_cwd(session_id, payload)
@@ -481,6 +484,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
 
     if transcript_data and (transcript_data.messages or transcript_data.tool_calls):
         # Use data parsed from transcript
+        model = transcript_data.model or CURSOR_MODEL_DEFAULT
         record = HookSessionRecord(
             session_id=session_id,
             cwd=cwd,
@@ -488,14 +492,26 @@ def _handle_stop(session_id: str, payload: dict) -> None:
             ended_at=ended_at,
             duration_s=duration_s,
             transcript_path=transcript_path,
-            model=transcript_data.model or CURSOR_MODEL_DEFAULT,
+            model=model,
             messages=transcript_data.messages,
             tool_calls=transcript_data.tool_calls,
             file_diffs=_merge_file_diffs(event_file_diffs, transcript_data.file_diffs),
             total_input_tokens=transcript_data.total_input_tokens,
             total_output_tokens=transcript_data.total_output_tokens,
+            usage_source="provider"
+            if transcript_data.total_input_tokens is not None
+            or transcript_data.total_output_tokens is not None
+            else None,
             mechanism_savings=mechanism_savings,
             hook_policy_snapshot=hook_policy_snapshot,
+            **native_metadata(
+                "cursor",
+                adapter_name="cursor_hooks",
+                model=model,
+                agent_client_version=payload.get("cursor_version") or payload.get("version"),
+                capabilities={"transcript": True, "tool_calls": True, "file_diffs": True},
+                warnings=transcript_data.warnings,
+            ),
         )
     else:
         # Fallback to accumulated events
@@ -512,14 +528,25 @@ def _handle_stop(session_id: str, payload: dict) -> None:
             file_diffs=event_file_diffs,
             mechanism_savings=mechanism_savings,
             hook_policy_snapshot=hook_policy_snapshot,
+            **native_metadata(
+                "cursor",
+                adapter_name="cursor_hooks",
+                model=CURSOR_MODEL_DEFAULT,
+                agent_client_version=payload.get("cursor_version") or payload.get("version"),
+                capabilities={"transcript": False, "tool_calls": True, "file_diffs": True},
+                warnings=["transcript_fallback_used"],
+            ),
         )
 
-    asyncio.run(_upload_and_close(record))
+    outcome = asyncio.run(_upload_and_close(record))
+    if not getattr(outcome, "cleanup_safe", outcome is None):
+        return
     for event in events:
         if event.get("event_type") == "DLPTempFile":
             with contextlib.suppress(OSError):
                 os.unlink(event["path"])
     session_store.cleanup(session_id)
+    session_store.write_marker(session_id, "finalized")
 
 
 _HANDLERS = {

@@ -9,6 +9,7 @@ import pytest
 from jsonschema import validate
 
 from rclm._models import HookSessionRecord
+from rclm._uploader import UploadOutcome, UploadStatus
 from rclm.hooks import codex_handler, codex_transcript
 
 
@@ -194,6 +195,7 @@ def test_codex_post_tool_use_compacts_recognized_shell_output(monkeypatch, tmp_p
     assert output["continue"] is False
     assert output["decision"] == "block"
     assert "40 lines omitted" in output["reason"]
+    assert "rclm://artifact/sha256/" in output["reason"]
     assert output["stopReason"] == (
         "ReclaimLLM compacted this tool result before it entered the model context."
     )
@@ -357,6 +359,51 @@ def test_codex_transcript_captures_developer_role_messages(tmp_path):
             "timestamp": "2026-07-29T09:36:35Z",
         },
     ]
+
+
+def test_codex_transcript_pairs_custom_tool_call_output_blocks(tmp_path):
+    transcript_path = tmp_path / "session.jsonl"
+    output = [
+        {"type": "input_text", "text": "Script completed\nOutput:\n"},
+        {"type": "input_text", "text": "README.md\npyproject.toml"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "low"},
+    ]
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-24T10:53:32.655Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call",
+                            "call_id": "call-exec",
+                            "name": "exec",
+                            "input": "text((await tools.exec_command({cmd: 'ls'})).output);",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "timestamp": "2026-08-24T10:53:32.740Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": "call-exec",
+                            "output": output,
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert len(data.tool_calls) == 1
+    assert data.tool_calls[0].tool_use_id == "call-exec"
+    assert data.tool_calls[0].tool_result == output
 
 
 def test_codex_transcript_parses_custom_apply_patch_diffs(tmp_path):
@@ -587,6 +634,49 @@ def test_codex_transcript_parses_model_and_cumulative_usage_with_reset(tmp_path)
     )
 
 
+def test_codex_transcript_ignores_repeated_cumulative_usage_snapshot(tmp_path):
+    transcript_path = tmp_path / "repeated-usage.jsonl"
+    snapshot = {
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 40,
+                    "output_tokens": 20,
+                    "reasoning_output_tokens": 5,
+                }
+            },
+        },
+    }
+    transcript_path.write_text("\n".join(json.dumps(snapshot) for _ in range(3)) + "\n")
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert data.usage == codex_transcript.CodexUsage(100, 40, 20, 5)
+
+
+def test_codex_transcript_deduplicates_replayed_call_and_file_diff(tmp_path):
+    transcript_path = tmp_path / "replayed.jsonl"
+    call = {
+        "timestamp": "2026-09-21T00:00:00Z",
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call",
+            "call_id": "call-1",
+            "name": "apply_patch",
+            "input": "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch\n",
+        },
+    }
+    transcript_path.write_text("\n".join((json.dumps(call), json.dumps(call))) + "\n")
+
+    data = codex_transcript.parse_transcript(str(transcript_path))
+
+    assert [tool.tool_use_id for tool in data.tool_calls] == ["call-1"]
+    assert [file_diff.path for file_diff in data.file_diffs] == ["a.txt"]
+
+
 def test_codex_stop_prefers_transcript_data(monkeypatch, tmp_path):
     from rclm.hooks import session_store
 
@@ -652,6 +742,12 @@ def test_codex_stop_prefers_transcript_data(monkeypatch, tmp_path):
     record = uploaded_records[0]
     assert isinstance(record, HookSessionRecord)
     assert record.model == "transcript-model"
+    assert record.capture_source == "native_agent"
+    assert record.agent_client == "codex"
+    assert record.adapter_name == "codex_cli_hooks"
+    assert record.model_provider == "openai"
+    assert record.capture_capabilities["transcript_primary"] is True
+    assert record.extra_fields["client_session_id"] == "sid-codex"
     assert [m["content"] for m in record.messages] == [
         "transcript user",
         "transcript assistant",
@@ -771,6 +867,116 @@ def test_codex_stop_falls_back_when_transcript_empty(monkeypatch, tmp_path):
         "hook assistant",
     ]
     assert record.model == "hook-model"
+    assert "transcript_path_missing_hook_fallback" in record.capture_warnings
+
+
+def test_codex_build_tool_calls_pairs_multiple_calls_in_one_turn_by_tool_id():
+    events = [
+        {
+            "event_type": "PreToolUse",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-1",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "pwd"},
+        },
+        {
+            "event_type": "PreToolUse",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-2",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "ls"},
+        },
+        {
+            "event_type": "PostToolUse",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-1",
+            "tool_name": "exec_command",
+            "tool_response": "/repo",
+        },
+        {
+            "event_type": "PostToolUse",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-2",
+            "tool_name": "exec_command",
+            "tool_response": "a.py",
+        },
+    ]
+
+    calls = codex_handler._build_tool_calls(events)
+
+    assert [(call.tool_use_id, call.tool_input, call.tool_result) for call in calls] == [
+        ("call-1", {"cmd": "pwd"}, "/repo"),
+        ("call-2", {"cmd": "ls"}, "a.py"),
+    ]
+
+
+def test_codex_stop_reconciles_transcript_and_hook_tool_calls(monkeypatch, tmp_path):
+    from rclm._models import ToolCall
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    for call_id, command, result in (
+        ("call-1", "pwd", "/repo"),
+        ("call-2", "ls", "a.py"),
+    ):
+        session_store.append_event(
+            "sid-reconcile",
+            {
+                "event_type": "PreToolUse",
+                "turn_id": "turn-1",
+                "tool_use_id": call_id,
+                "tool_name": "exec_command",
+                "tool_input": {"cmd": command},
+            },
+        )
+        session_store.append_event(
+            "sid-reconcile",
+            {
+                "event_type": "PostToolUse",
+                "turn_id": "turn-1",
+                "tool_use_id": call_id,
+                "tool_name": "exec_command",
+                "tool_response": result,
+            },
+        )
+    uploaded = []
+
+    async def fake_upload_single(record):
+        uploaded.append(record)
+        return UploadOutcome(UploadStatus.UPLOADED)
+
+    monkeypatch.setattr("rclm.hooks.codex_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.codex_transcript.parse_transcript",
+        lambda _path: codex_transcript.CodexTranscriptData(
+            tool_calls=[ToolCall("call-1", "exec_command", {"cmd": "pwd"}, None, "")]
+        ),
+    )
+
+    _run_handler("Stop", {"session_id": "sid-reconcile"}, monkeypatch)
+
+    assert [call.tool_use_id for call in uploaded[0].tool_calls] == ["call-1", "call-2"]
+    assert uploaded[0].tool_calls[0].tool_result == "/repo"
+
+
+def test_codex_stop_retains_sidecar_when_upload_not_cleanup_safe(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_store.append_event("sid-retained", {"event_type": "SessionStart"})
+
+    async def fake_upload_single(_record):
+        return UploadOutcome(UploadStatus.FAILED)
+
+    monkeypatch.setattr("rclm.hooks.codex_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.codex_transcript.parse_transcript",
+        lambda _path: codex_transcript.CodexTranscriptData(),
+    )
+
+    _run_handler("Stop", {"session_id": "sid-retained"}, monkeypatch)
+
+    assert session_store.read_events("sid-retained")
 
 
 def test_codex_post_tool_use_dlp_output_matches_codex_schema(monkeypatch, tmp_path, capsys):

@@ -19,6 +19,27 @@ _HOOK_HEALTH_MAX_RECORDS = 100
 _ORPHANED_SIDECAR_MAX_AGE_S = 7 * 24 * 60 * 60
 
 
+def _ensure_private_dir(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+
+
+def _atomic_private_write(destination: Path, contents: str) -> None:
+    """Atomically replace a local capture sidecar with owner-only permissions."""
+    _ensure_private_dir(destination.parent)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(contents)
+        os.replace(temporary, destination)
+        os.chmod(destination, 0o600)
+    except Exception:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+
+
 def _session_path(session_id: str) -> Path:
     return _SESSIONS_DIR / f"{session_id}.jsonl"
 
@@ -37,6 +58,10 @@ def _mechanism_savings_path(session_id: str) -> Path:
 
 def _image_eviction_path(session_id: str) -> Path:
     return _SESSIONS_DIR / f"{session_id}.imageeviction.json"
+
+
+def _result_delta_path(session_id: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.resultdelta.json"
 
 
 def _hook_health_dir() -> Path:
@@ -61,8 +86,7 @@ def has_marker(session_id: str, marker: str) -> bool:
 
 
 def write_marker(session_id: str, marker: str) -> None:
-    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _marker_path(session_id, marker).write_text("1", encoding="utf-8")
+    _atomic_private_write(_marker_path(session_id, marker), "1")
 
 
 def read_dedupe_state(session_id: str) -> dict[str, dict]:
@@ -74,8 +98,7 @@ def read_dedupe_state(session_id: str) -> dict[str, dict]:
 
 
 def write_dedupe_state(session_id: str, state: dict[str, dict]) -> None:
-    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _dedupe_path(session_id).write_text(json.dumps(state), encoding="utf-8")
+    _atomic_private_write(_dedupe_path(session_id), json.dumps(state))
 
 
 def read_read_cache_state(session_id: str) -> dict:
@@ -88,11 +111,7 @@ def read_read_cache_state(session_id: str) -> dict:
 
 def write_read_cache_state(session_id: str, state: dict) -> None:
     """Atomically persist range-cache state for one session."""
-    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    destination = _read_cache_path(session_id)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
-    os.replace(temporary, destination)
+    _atomic_private_write(_read_cache_path(session_id), json.dumps(state, separators=(",", ":")))
 
 
 def read_mechanism_savings_state(session_id: str) -> dict:
@@ -105,11 +124,9 @@ def read_mechanism_savings_state(session_id: str) -> dict:
 
 def write_mechanism_savings_state(session_id: str, state: dict) -> None:
     """Atomically persist cumulative mechanism savings for one host session."""
-    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    destination = _mechanism_savings_path(session_id)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
-    os.replace(temporary, destination)
+    _atomic_private_write(
+        _mechanism_savings_path(session_id), json.dumps(state, separators=(",", ":"))
+    )
 
 
 def read_image_eviction_state(session_id: str) -> dict:
@@ -122,21 +139,30 @@ def read_image_eviction_state(session_id: str) -> dict:
 
 def write_image_eviction_state(session_id: str, state: dict) -> None:
     """Atomically persist image-eviction LRU state for one session."""
-    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    destination = _image_eviction_path(session_id)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
-    os.replace(temporary, destination)
+    _atomic_private_write(
+        _image_eviction_path(session_id), json.dumps(state, separators=(",", ":"))
+    )
+
+
+def read_result_delta_state(session_id: str) -> dict:
+    try:
+        data = json.loads(_result_delta_path(session_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_result_delta_state(session_id: str, state: dict) -> None:
+    """Atomically persist bounded differential-result state for one session."""
+    _atomic_private_write(_result_delta_path(session_id), json.dumps(state, separators=(",", ":")))
 
 
 def write_hook_health(session_id: str, record: dict) -> None:
     """Atomically persist one metadata-only hook-health record and bound history."""
     directory = _hook_health_dir()
-    directory.mkdir(parents=True, exist_ok=True)
     destination = _hook_health_path(session_id)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
-    os.replace(temporary, destination)
+    _ensure_private_dir(directory.parent)
+    _atomic_private_write(destination, json.dumps(record, separators=(",", ":")))
 
     try:
         records = sorted(
@@ -168,6 +194,8 @@ def prune_stale_sidecars(*, max_age_s: int = _ORPHANED_SIDECAR_MAX_AGE_S) -> Non
         "*.readcache.json",
         "*.mechanisms.json",
         "*.imageeviction.json",
+        "*.resultdelta.json",
+        "*.marker",
     ):
         for path in _SESSIONS_DIR.glob(pattern):
             try:
@@ -179,10 +207,12 @@ def prune_stale_sidecars(*, max_age_s: int = _ORPHANED_SIDECAR_MAX_AGE_S) -> Non
 
 def append_event(session_id: str, event: dict) -> None:
     """Append one JSON event dict as a line to the session file."""
-    _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(_SESSIONS_DIR)
     path = _session_path(session_id)
-    with open(path, "a", encoding="utf-8") as fh:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(event) + "\n")
+    os.chmod(path, 0o600)
 
 
 def read_events(session_id: str) -> list[dict]:
@@ -221,3 +251,5 @@ def cleanup(session_id: str) -> None:
         _mechanism_savings_path(session_id).unlink()
     with contextlib.suppress(FileNotFoundError):
         _image_eviction_path(session_id).unlink()
+    with contextlib.suppress(FileNotFoundError):
+        _result_delta_path(session_id).unlink()

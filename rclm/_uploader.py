@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import aiohttp
@@ -32,6 +34,31 @@ _RETRY_DELAYS = (0.5, 1.0, 2.0)  # seconds, exponential backoff
 AnyRecord = ProxyRecord | SessionRecord | HookSessionRecord
 
 
+class UploadStatus(str, Enum):
+    UPLOADED = "uploaded"
+    SKIPPED_BY_POLICY = "skipped_by_policy"
+    QUARANTINED = "quarantined"
+    WITHHELD_BY_DLP = "withheld_by_dlp"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class UploadOutcome:
+    status: UploadStatus
+    quarantine_path: Path | None = None
+    http_status: int | None = None
+
+    @property
+    def successful(self) -> bool:
+        """Whether the remote upload completed or local policy intentionally skipped it."""
+        return self.status in {UploadStatus.UPLOADED, UploadStatus.SKIPPED_BY_POLICY}
+
+    @property
+    def cleanup_safe(self) -> bool:
+        """Whether the source can be removed without losing the only recoverable copy."""
+        return self.successful or self.status is UploadStatus.QUARANTINED
+
+
 def _to_json(record: AnyRecord) -> str:
     return json.dumps(dataclasses.asdict(record))
 
@@ -53,7 +80,7 @@ async def upload(
     session: aiohttp.ClientSession,
     *,
     max_retries: int = len(_RETRY_DELAYS),
-) -> None:
+) -> UploadOutcome:
     """POST record as JSON to configured ReclaimLLM ingest endpoint.
 
     Retries up to ``max_retries`` times with exponential backoff (default 3).
@@ -63,7 +90,7 @@ async def upload(
     redaction_settings = redaction.load_settings(cfg)
     if redaction.should_skip_record(record, redaction_settings):
         logger.info("rclm upload skipped by local redaction folder filters")
-        return
+        return UploadOutcome(UploadStatus.SKIPPED_BY_POLICY)
 
     try:
         payload = _to_redacted_json(
@@ -77,13 +104,16 @@ async def upload(
             f"rclm: DLP withheld session {record.session_id}; no data was uploaded or quarantined",
             file=sys.stderr,
         )
-        return
+        return UploadOutcome(UploadStatus.WITHHELD_BY_DLP)
 
     creds = _config.resolve_credentials(cfg)
     if creds is None:
         print(f"rclm: {auth.AUTH_REQUIRED_MESSAGE}", file=sys.stderr)
-        _quarantine(record, payload=payload)
-        return
+        path = _quarantine(record, payload=payload)
+        return UploadOutcome(
+            UploadStatus.QUARANTINED if path else UploadStatus.FAILED,
+            quarantine_path=path,
+        )
     url = creds.server_url + INGEST_PATH
     # if len(record.messages) == 0:
     #     logger.warning("Record has empty messages; skipping upload")
@@ -94,14 +124,19 @@ async def upload(
     for attempt, delay in enumerate(delays, start=1):
         try:
             async with session.post(url, data=payload, headers=headers) as resp:
-                if resp.status < 500:
-                    # 2xx/4xx: do not retry (4xx is a client-config error, not transient)
-                    if resp.status >= 400:
-                        logger.warning(
-                            "rclm upload got %s from server; giving up",
-                            resp.status,
-                        )
-                    return
+                if 200 <= resp.status < 300:
+                    return UploadOutcome(UploadStatus.UPLOADED, http_status=resp.status)
+                if resp.status < 500 and resp.status != 429:
+                    logger.warning(
+                        "rclm upload got %s from server; quarantining",
+                        resp.status,
+                    )
+                    path = _quarantine(record, payload=payload)
+                    return UploadOutcome(
+                        UploadStatus.QUARANTINED if path else UploadStatus.FAILED,
+                        quarantine_path=path,
+                        http_status=resp.status,
+                    )
                 logger.warning(
                     "rclm upload attempt %d/%d got %s; retrying in %.1fs",
                     attempt,
@@ -120,10 +155,14 @@ async def upload(
         await asyncio.sleep(delay)
 
     logger.error("rclm upload failed after all retries; quarantining record locally")
-    _quarantine(record, payload=payload)
+    path = _quarantine(record, payload=payload)
+    return UploadOutcome(
+        UploadStatus.QUARANTINED if path else UploadStatus.FAILED,
+        quarantine_path=path,
+    )
 
 
-def _quarantine(record: AnyRecord, *, payload: str | None = None) -> None:
+def _quarantine(record: AnyRecord, *, payload: str | None = None) -> Path | None:
     """Write the failed record to ~/.reclaimllm/failed_uploads/ with owner-only permissions.
 
     Emits a one-line stderr notice pointing to the file. The directory and file
@@ -140,17 +179,23 @@ def _quarantine(record: AnyRecord, *, payload: str | None = None) -> None:
                 redaction.load_settings(cfg),
                 dlp_enabled=_config.dlp_enabled(cfg),
             )
-        path.write_text(payload, encoding="utf-8")
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(temporary, path)
         os.chmod(path, 0o600)
         print(
             f"rclm: upload failed; record saved to {path}",
             file=sys.stderr,
         )
+        return path
     except Exception as exc:
         print(
             f"rclm: upload failed and could not quarantine record: {exc}",
             file=sys.stderr,
         )
+        return None
 
 
 async def run_upload_worker(queue: asyncio.Queue) -> None:
@@ -180,10 +225,12 @@ async def _get_session() -> aiohttp.ClientSession:
     return _session
 
 
-async def upload_single(record: AnyRecord, *, max_retries: int = len(_RETRY_DELAYS)) -> None:
+async def upload_single(
+    record: AnyRecord, *, max_retries: int = len(_RETRY_DELAYS)
+) -> UploadOutcome:
     """Upload one record, reusing the module-level session."""
     session = await _get_session()
-    await upload(record, session, max_retries=max_retries)
+    return await upload(record, session, max_retries=max_retries)
 
 
 async def close_session() -> None:

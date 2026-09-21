@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rclm.hooks.read_cache import FileMetadata, ReadRequest, process_read, serialize_read_request
 from rclm.replay.read_request import (
+    build_antigravity_view_request,
     build_native_read_request,
     build_read_request,
     build_shell_read_request,
@@ -113,3 +114,18 @@ class TestDispatchAndInterop:
         block = content[: len(content) - len(trailing)] if trailing else content
         decision = process_read(request, block, {}, turn=1)
         assert decision.reliable
+
+    def test_builds_antigravity_view_file_request(self):
+        content = (
+            "Created At: now\nCompleted At: later\nFile Path: `file:///repo/a.py`\n"
+            "Total Lines: 3\nTotal Bytes: 12\nShowing lines 1 to 3\n"
+            "Line numbering note\n1: one\n2: two\n3: three\nTrailing note\n"
+        )
+        built = build_antigravity_view_request({"AbsolutePath": "/repo/a.py"}, content)
+
+        assert built is not None
+        request, block, prefix, suffix = built
+        assert (request.start_line, request.end_line) == (1, 3)
+        assert block == "1: one\n2: two\n3: three\n"
+        assert prefix.startswith("Created At")
+        assert suffix == "Trailing note\n"

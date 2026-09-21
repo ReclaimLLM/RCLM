@@ -14,17 +14,31 @@ from typing import Any
 
 from rclm.hooks import dedupe
 from rclm.hooks.read_cache import process_read
+from rclm.hooks.result_delta import process_delta
 from rclm.hooks.tool_result_transform import (
     compact_tool_result,
     decision_from_replacement,
     extract_text_envelope,
 )
-from rclm.replay.read_request import build_read_request
+from rclm.hooks.tool_semantics import supports_result_compaction
+from rclm.replay.read_request import build_antigravity_view_request, build_read_request
 
 PROTOCOL_VERSION = 1
-_KNOWN_MECHANISMS = frozenset({"range_cache", "shell_compaction", "hash_dedupe"})
-_SHELL_TOOLS = frozenset({"bash", "exec", "exec_command", "shell"})
-_READ_TOOLS = frozenset({"read", *_SHELL_TOOLS})
+_KNOWN_MECHANISMS = frozenset({"range_cache", "shell_compaction", "stateful_delta", "hash_dedupe"})
+_READ_TOOLS = frozenset(
+    {
+        "read",
+        "read_file",
+        "read_text_file",
+        "view_file",
+        "bash",
+        "exec",
+        "exec_command",
+        "shell",
+        "run_command",
+        "run_shell_command",
+    }
+)
 
 
 class RCLMBenchAdapter:
@@ -37,6 +51,7 @@ class RCLMBenchAdapter:
             raise ValueError(f"Unknown RCLM mechanism(s): {', '.join(unknown)}")
         self.mechanisms = frozenset(requested)
         self.read_state: dict[str, Any] = {}
+        self.delta_state: dict[str, Any] = {}
         self.dedupe_state: dict[str, Any] = {}
 
     def transform(self, frame: dict[str, Any]) -> dict[str, Any]:
@@ -57,17 +72,24 @@ class RCLMBenchAdapter:
             built = build_read_request(tool_name, tool_input, envelope.text)
             if built is not None:
                 request, trailing = built
-                block = (
-                    envelope.text[: len(envelope.text) - len(trailing)]
-                    if trailing
-                    else envelope.text
-                )
+                prefix = ""
+                if lowered == "view_file":
+                    antigravity = build_antigravity_view_request(tool_input, envelope.text)
+                    if antigravity is None:
+                        return _result(sequence, "ineligible", tool_result)
+                    request, block, prefix, trailing = antigravity
+                else:
+                    block = (
+                        envelope.text[: len(envelope.text) - len(trailing)]
+                        if trailing
+                        else envelope.text
+                    )
                 decision = process_read(request, block, self.read_state, turn=sequence)
                 self.read_state = decision.state
                 if decision.cache_hit and decision.replacement is not None:
                     transformed = decision_from_replacement(
                         envelope,
-                        decision.replacement + trailing,
+                        prefix + decision.replacement + trailing,
                         mechanism="range_cache",
                     )
                     if transformed is not None:
@@ -78,7 +100,7 @@ class RCLMBenchAdapter:
                             mechanism="range_cache",
                         )
                 return _result(sequence, "ineligible", tool_result)
-            if lowered == "read":
+            if lowered in {"read", "read_file", "read_text_file", "view_file"}:
                 return _result(
                     sequence,
                     "ineligible",
@@ -86,7 +108,24 @@ class RCLMBenchAdapter:
                     warning="read range could not be resolved",
                 )
 
-        if "shell_compaction" in self.mechanisms and lowered in _SHELL_TOOLS:
+        if "stateful_delta" in self.mechanisms:
+            delta = process_delta(tool_name, tool_input, envelope.text, self.delta_state)
+            self.delta_state = delta.state
+            if delta.replacement is not None:
+                decision = decision_from_replacement(
+                    envelope,
+                    delta.replacement,
+                    mechanism="stateful_delta",
+                )
+                if decision is not None:
+                    return _result(
+                        sequence,
+                        "applied",
+                        decision.wire_replacement,
+                        mechanism="stateful_delta",
+                    )
+
+        if "shell_compaction" in self.mechanisms and supports_result_compaction(tool_name):
             decision = compact_tool_result(tool_name, tool_input, tool_result)
             if decision is not None:
                 return _result(

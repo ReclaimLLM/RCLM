@@ -80,6 +80,9 @@ def test_stop_uploads_record_built_from_transcript(tmp_path, monkeypatch):
 
     assert len(uploaded) == 1
     record = uploaded[0]
+    assert record.capture_source == "native_agent"
+    assert record.agent_client == "antigravity"
+    assert record.adapter_name == "antigravity_hooks"
     assert record.session_id == "ag-sid-1"
     assert record.cwd == "/repo"
     assert record.model == "Gemini 3.6 Flash (High)"
@@ -169,6 +172,45 @@ def test_pre_and_post_tool_use_events_respond_with_valid_contract(monkeypatch, c
         _run_handler(event, {"conversationId": "ag-sid-3"}, monkeypatch)
 
     assert uploaded == []
+
+
+def test_pre_tool_caps_unbounded_view_file(monkeypatch, capsys):
+    _run_handler(
+        "PreToolUse",
+        {
+            "conversationId": "ag-sid-view",
+            "toolCall": {
+                "name": "view_file",
+                "args": {"AbsolutePath": "/repo/a.py", "StartLine": 401},
+            },
+        },
+        monkeypatch,
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "decision": "allow",
+        "overwrite": {"EndLine": 600},
+    }
+
+
+def test_pre_tool_routes_supported_command_through_compressor(monkeypatch, capsys):
+    monkeypatch.setattr(
+        antigravity_handler,
+        "maybe_compress",
+        lambda *args, **kwargs: {"command": "rclm-compress --encoded-command abc"},
+    )
+    _run_handler(
+        "PreToolUse",
+        {
+            "conversationId": "ag-sid-command",
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "pytest -q"}},
+        },
+        monkeypatch,
+    )
+
+    assert json.loads(capsys.readouterr().out)["overwrite"] == {
+        "CommandLine": "rclm-compress --encoded-command abc"
+    }
 
 
 def test_malformed_json_exits_zero(monkeypatch):

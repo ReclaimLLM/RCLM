@@ -36,6 +36,8 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -173,14 +175,9 @@ _CURSOR_HOOKS_TO_INJECT: dict[str, list[dict]] = {
 
 # Antigravity hooks.json format: {"<hook-name>": {"<EventName>": [entries]}} --
 # keyed by an arbitrary hook name we choose, not by event name (unlike Claude/
-# Codex/Gemini). Stop is the only event registered: Antigravity's PreToolUse/
-# PostToolUse have no channel to mutate tool input or redact output, so none
-# of rclm's active mechanisms apply there, and the full session is already
-# recoverable from transcript.jsonl at Stop. See antigravity_handler.py.
-#
-# Stop/PreInvocation/PostInvocation entries are a *flat* list of handler
-# objects ({"type": ..., "command": ...} directly) -- unlike PreToolUse/
-# PostToolUse, which are matcher-scoped groups ({"matcher": ..., "hooks": [...]}).
+# Codex/Gemini). Stop provides capture. PreToolUse is retained for the verified
+# read-cap and command-compaction contract; the no-op PostToolUse hook is not
+# installed. Stop entries are a flat list of handler objects.
 # Confirmed against the installed CLI's own docs
 # (~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/hooks.md).
 _ANTIGRAVITY_HOOK_NAME = "rclm-antigravity-hooks"
@@ -190,12 +187,6 @@ _ANTIGRAVITY_HOOKS_TO_INJECT: dict = {
             {
                 "matcher": "",
                 "hooks": [{"type": "command", "command": "rclm-antigravity-hooks PreToolUse"}],
-            }
-        ],
-        "PostToolUse": [
-            {
-                "matcher": "",
-                "hooks": [{"type": "command", "command": "rclm-antigravity-hooks PostToolUse"}],
             }
         ],
         "Stop": [{"type": "command", "command": "rclm-antigravity-hooks Stop"}],
@@ -439,20 +430,21 @@ def _with_absolute_binary(
     """Return a deep copy of hooks_to_inject with bare binary name replaced by absolute path."""
     if resolved == binary_name:
         return hooks_to_inject
+    resolved_command = shlex.quote(resolved)
     result = copy.deepcopy(hooks_to_inject)
     if is_cursor:
         for entries in result.values():
             for hook in entries:
                 cmd = hook.get("command", "")
                 if cmd == binary_name or cmd.startswith(binary_name + " "):
-                    hook["command"] = resolved + cmd[len(binary_name) :]
+                    hook["command"] = resolved_command + cmd[len(binary_name) :]
     else:
         for entries in result.values():
             for entry in entries:
                 for hook in entry.get("hooks", []):
                     cmd = hook.get("command", "")
                     if cmd == binary_name or cmd.startswith(binary_name + " "):
-                        hook["command"] = resolved + cmd[len(binary_name) :]
+                        hook["command"] = resolved_command + cmd[len(binary_name) :]
     return result
 
 
@@ -622,7 +614,7 @@ def _apply_statusline(settings: dict) -> None:
         )
     settings["statusLine"] = {
         "type": "command",
-        "command": _resolve_binary("rclm-claude-statusline"),
+        "command": shlex.quote(_resolve_binary("rclm-claude-statusline")),
         "padding": 0,
         "refreshInterval": _STATUSLINE_REFRESH_INTERVAL_S,
     }
@@ -708,6 +700,7 @@ def _install_antigravity(use_global: bool) -> None:
 
     binary_name = "rclm-antigravity-hooks"
     binary = _resolve_binary(binary_name)
+    binary_command = shlex.quote(binary)
     hooks = copy.deepcopy(_ANTIGRAVITY_HOOKS_TO_INJECT)
     if binary != binary_name:
         for entries in hooks[_ANTIGRAVITY_HOOK_NAME].values():
@@ -716,11 +709,11 @@ def _install_antigravity(use_global: bool) -> None:
                     for hook in item["hooks"]:
                         cmd = hook.get("command", "")
                         if cmd == binary_name or cmd.startswith(binary_name + " "):
-                            hook["command"] = binary + cmd[len(binary_name) :]
+                            hook["command"] = binary_command + cmd[len(binary_name) :]
                 else:
                     cmd = item.get("command", "")
                     if cmd == binary_name or cmd.startswith(binary_name + " "):
-                        item["command"] = binary + cmd[len(binary_name) :]
+                        item["command"] = binary_command + cmd[len(binary_name) :]
 
     data = _load_json(path)
     _merge_antigravity_hooks(data, hooks)
@@ -768,9 +761,14 @@ def _load_json(path: Path) -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
         fh.write("\n")
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
 
 
 def _merge_unique(existing: object, additions: list[str]) -> list[str]:
@@ -918,23 +916,26 @@ def main() -> None:
         pass  # Never let redaction settings sync disrupt hook installation.
 
     for provider in providers:
-        if provider == "claude":
-            _install_claude(use_global, compress_enabled, statusline_enabled)
-        elif provider == "gemini":
-            _install_gemini(use_global)
-        elif provider == "codex":
-            _install_codex(use_global)
-            print(
-                "Codex CLI already shows context and rate-limit usage natively — run "
-                "`/statusline` inside codex and enable context-used, context-remaining, "
-                "five-hour-limit, and weekly-limit."
-            )
-        elif provider == "cursor":
-            _install_cursor(use_global)
-        elif provider == "openclaw":
-            _install_openclaw(use_global)
-        elif provider == "antigravity":
-            _install_antigravity(use_global)
+        try:
+            if provider == "claude":
+                _install_claude(use_global, compress_enabled, statusline_enabled)
+            elif provider == "gemini":
+                _install_gemini(use_global)
+            elif provider == "codex":
+                _install_codex(use_global)
+                print(
+                    "Codex CLI already shows context and rate-limit usage natively — run "
+                    "`/statusline` inside codex and enable context-used, context-remaining, "
+                    "five-hour-limit, and weekly-limit."
+                )
+            elif provider == "cursor":
+                _install_cursor(use_global)
+            elif provider == "openclaw":
+                _install_openclaw(use_global)
+            elif provider == "antigravity":
+                _install_antigravity(use_global)
+        except Exception as exc:
+            print(f"Warning: {provider} hook installation failed: {exc}", file=sys.stderr)
 
     if args.with_mcp:
         try:

@@ -19,15 +19,17 @@ from datetime import datetime, timezone
 
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
-from rclm._uploader import close_session, upload_single
+from rclm._uploader import UploadOutcome, close_session, upload_single
 from rclm.hooks import (
     bootstrap,
     brevity,
+    context_memory,
     dedupe,
     dlp,
     image_eviction,
     image_lifecycle,
     read_cache,
+    result_delta,
     session_store,
     tool_result_transform,
     transcript,  # noqa: E402
@@ -39,6 +41,7 @@ from rclm.hooks._analytics import (
     mechanism_saving_event,
     merge_mechanism_savings,
 )
+from rclm.hooks.capture_metadata import native_metadata
 from rclm.hooks.compress import maybe_compress
 from rclm.hooks.handoff_advisor import thresholds_from_config
 from rclm.hooks.loop_breaker import analyze as analyze_loop
@@ -55,6 +58,18 @@ CONTEXT_PACK_TIMEOUT_S = 3.0  # SessionStart blocks Claude Code's startup; keep 
 # Handoff-advisor thresholds use transcript-estimated tokens. This undercounts
 # real billed tokens, but is a fine relative growth signal within one session.
 HANDOFF_ADVISOR_MARKER = "handoff_advisor_shown"
+
+CLAUDE_CAPTURE_CAPABILITIES = {
+    "native_lifecycle_hooks": True,
+    "transcript_primary": True,
+    "hook_event_fallback": True,
+    "messages": True,
+    "tool_calls": True,
+    "file_changes": True,
+    "provider_usage": True,
+    "model_facing_transformations": True,
+    "historical_sync": True,
+}
 
 
 def _now() -> str:
@@ -483,6 +498,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     # DLP runs first so every downstream mechanism (read-cache included) only
     # ever sees secret-free content — never the raw response.
     effective_text = _response_text(captured_response)
+    artifact_handle: str | None = None
 
     if dlp_replacement is not None:
         hook_output["updatedToolOutput"] = dlp_replacement
@@ -516,7 +532,46 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             logger.exception("range cache failed; passing through tool result")
 
+    delta_claimed = False
     if policy.enabled("exec_compaction") and not range_claimed:
+        shadow = policy.shadow_for("exec_compaction")
+        try:
+            state = session_store.read_result_delta_state(session_id)
+            delta = result_delta.process_delta(tool_name, tool_input, effective_text, state)
+            session_store.write_result_delta_state(session_id, delta.state)
+            if delta.replacement is not None:
+                replacement = delta.replacement
+                if not shadow:
+                    replacement, artifact_handle = context_memory.make_text_recallable(
+                        session_id,
+                        effective_text,
+                        replacement,
+                        provider="claude",
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        tool_use_id=tool_use_id,
+                    )
+                raw_tokens = estimate_tokens(effective_text)
+                compressed_tokens = estimate_tokens(replacement)
+                session_store.append_event(
+                    session_id,
+                    mechanism_saving_event(
+                        "stateful_delta",
+                        applied=not shadow,
+                        tokens_saved_estimate=max(0, raw_tokens - compressed_tokens),
+                        measurement_kind="measured",
+                        raw_token_estimate=raw_tokens,
+                        compressed_token_estimate=compressed_tokens,
+                    ),
+                )
+                if not shadow:
+                    effective_text = replacement
+                    hook_output["updatedToolOutput"] = replacement
+                delta_claimed = not shadow
+        except Exception:
+            logger.exception("stateful result delta failed; passing through tool result")
+
+    if policy.enabled("exec_compaction") and not range_claimed and not delta_claimed:
         shadow = policy.shadow_for("exec_compaction")
         try:
             transform_input = hook_output.get("updatedToolOutput", tool_response)
@@ -526,6 +581,16 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 transform_input,
             )
             if decision is not None:
+                if not shadow:
+                    decision, artifact_handle = context_memory.make_decision_recallable(
+                        session_id,
+                        transform_input,
+                        decision,
+                        provider="claude",
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        tool_use_id=tool_use_id,
+                    )
                 for event in tool_result_transform.analytics_events(
                     decision,
                     tool_use_id=tool_use_id,
@@ -546,7 +611,12 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             logger.exception("tool-result compaction failed; passing through tool result")
 
     compression = _config.compression_config(cfg)
-    if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
+    if (
+        policy.enabled("hash_dedupe")
+        and compression["dedupe"]
+        and not range_claimed
+        and not delta_claimed
+    ):
         shadow = policy.shadow_for("hash_dedupe")
         try:
             state = session_store.read_dedupe_state(session_id)
@@ -594,6 +664,19 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             logger.exception("hash dedupe failed; passing through tool result")
 
+    try:
+        context_memory.observe_tool(
+            session_id,
+            tool_name,
+            tool_input,
+            captured_response,
+            tool_use_id=tool_use_id,
+            artifact_handle=artifact_handle,
+            cwd=cwd,
+        )
+    except Exception:
+        logger.exception("task ledger update failed; continuing without ledger state")
+
     if context_notes:
         hook_output["additionalContext"] = " ".join(context_notes)
 
@@ -622,6 +705,7 @@ def _handle_post_tool_use_failure(session_id: str, payload: dict) -> None:
         {
             "event_type": "ToolFailure",
             "tool_name": tool_name,
+            "tool_use_id": payload.get("tool_use_id"),
             "tool_input": payload.get("tool_input", {}),
             "tool_output": tool_output,
             "timestamp": payload.get("timestamp", _now()),
@@ -719,6 +803,117 @@ def _extract_file_diffs_from_tool_calls(
     return diffs
 
 
+def _build_fallback_messages(
+    events: list[dict], last_assistant_message: str = "", assistant_timestamp: str = ""
+) -> list[dict]:
+    """Build a valid partial conversation when Claude's transcript is unavailable."""
+    messages = [
+        {
+            "role": "user",
+            "content": event.get("prompt", ""),
+            "timestamp": event.get("timestamp", ""),
+        }
+        for event in events
+        if event.get("event_type") == "UserPromptSubmit" and event.get("prompt")
+    ]
+    if last_assistant_message:
+        messages.append(
+            {
+                "role": "assistant",
+                "content": last_assistant_message,
+                "timestamp": assistant_timestamp,
+            }
+        )
+    return messages
+
+
+def _build_fallback_tool_calls(events: list[dict]) -> list[ToolCall]:
+    """Pair Claude hook events by provider tool ID without collapsing calls."""
+    pending: dict[str, dict] = {}
+    calls: list[ToolCall] = []
+    anonymous_counter = 0
+
+    for event in events:
+        event_type = event.get("event_type")
+        tool_use_id = event.get("tool_use_id")
+        if event_type == "PreToolUse":
+            if tool_use_id:
+                pending[str(tool_use_id)] = event
+            continue
+        if event_type not in {"PostToolUse", "ToolFailure"}:
+            continue
+
+        pre = pending.pop(str(tool_use_id), None) if tool_use_id else None
+        call_id = str(tool_use_id) if tool_use_id else f"claude-hook-{anonymous_counter}"
+        anonymous_counter += not bool(tool_use_id)
+        calls.append(
+            ToolCall(
+                tool_use_id=call_id,
+                tool_name=event.get("tool_name") or (pre or {}).get("tool_name", ""),
+                tool_input=(pre or {}).get("tool_input", event.get("tool_input", {})),
+                tool_result=(
+                    event.get("tool_response")
+                    if event_type == "PostToolUse"
+                    else event.get("tool_output")
+                ),
+                timestamp=(pre or {}).get("timestamp", event.get("timestamp", "")),
+            )
+        )
+
+    for tool_use_id, pre in pending.items():
+        calls.append(
+            ToolCall(
+                tool_use_id=tool_use_id,
+                tool_name=pre.get("tool_name", ""),
+                tool_input=pre.get("tool_input", {}),
+                tool_result=None,
+                timestamp=pre.get("timestamp", ""),
+            )
+        )
+    return calls
+
+
+def _reconcile_messages(
+    transcript_messages: list[dict], fallback_messages: list[dict]
+) -> list[dict]:
+    """Keep transcript messages primary while adding hook-only occurrences."""
+    if not transcript_messages:
+        return fallback_messages
+    merged = list(transcript_messages)
+    remaining = [(message.get("role"), message.get("content")) for message in transcript_messages]
+    remaining_roles = [message.get("role") for message in transcript_messages]
+    for message in fallback_messages:
+        fingerprint = (message.get("role"), message.get("content"))
+        if fingerprint in remaining:
+            remaining.remove(fingerprint)
+            remaining_roles.remove(message.get("role"))
+        elif message.get("role") in remaining_roles:
+            # The transcript is authoritative when both sources describe the
+            # same ordinal turn differently; adding both would be duplication.
+            remaining_roles.remove(message.get("role"))
+        else:
+            merged.append(message)
+    return sorted(merged, key=lambda message: message.get("timestamp") or "")
+
+
+def _reconcile_tool_calls(
+    transcript_calls: list[ToolCall], fallback_calls: list[ToolCall]
+) -> list[ToolCall]:
+    """Keep transcript detail and add only hook calls missing from it."""
+    if not transcript_calls:
+        return fallback_calls
+    merged = list(transcript_calls)
+    by_id = {call.tool_use_id: call for call in transcript_calls if call.tool_use_id}
+    for fallback in fallback_calls:
+        existing = by_id.get(fallback.tool_use_id)
+        if existing is not None:
+            if existing.tool_result is None and fallback.tool_result is not None:
+                existing.tool_result = fallback.tool_result
+            continue
+        merged.append(fallback)
+    return sorted(merged, key=lambda call: call.timestamp or "")
+
+
 def _handoff_advisory(transcript_data, cfg: dict) -> str | None:
     """Suggest the handoff MCP tool once a session has grown large.
 
@@ -743,14 +938,14 @@ def _handoff_advisory(transcript_data, cfg: dict) -> str | None:
     )
 
 
-async def _upload_and_close(record: HookSessionRecord) -> None:
+async def _upload_and_close(record: HookSessionRecord) -> UploadOutcome:
     """upload_single, then close the module-level aiohttp session before this
     asyncio.run() call's event loop is torn down. aiohttp's ClientSession is
     bound to the loop that created it, so a *later*, separate asyncio.run()
     can't close it safely -- without this, aiohttp emits "Unclosed client
     session"/"Unclosed connector" ResourceWarnings to stderr on every Stop."""
     try:
-        await upload_single(record)
+        return await upload_single(record)
     finally:
         await close_session()
 
@@ -760,6 +955,8 @@ def _handle_stop(
     payload: dict,
     *,
     schedule_update: bool = False,
+    parent_session_id: str | None = None,
+    client_session_id: str | None = None,
 ) -> None:
     now = _now()
     events = session_store.read_events(session_id)
@@ -789,6 +986,22 @@ def _handle_stop(
     transcript_path = payload.get("transcript_path")
     transcript_data = transcript.parse_transcript(transcript_path)
     cfg = _config.load()
+    fallback_messages = _build_fallback_messages(
+        events,
+        payload.get("last_assistant_message", ""),
+        payload.get("timestamp", now),
+    )
+    fallback_tool_calls = _build_fallback_tool_calls(events)
+    messages = _reconcile_messages(transcript_data.messages, fallback_messages)
+    tool_calls = _reconcile_tool_calls(transcript_data.tool_calls, fallback_tool_calls)
+
+    capture_warnings: list[str] = []
+    if not transcript_path:
+        capture_warnings.append("transcript_path_missing_hook_fallback")
+    elif not transcript_data.messages and not transcript_data.tool_calls:
+        capture_warnings.append("transcript_empty_or_unrecognized_hook_fallback")
+    if not messages and not tool_calls:
+        capture_warnings.append("empty_session_content")
 
     transcript_tool_calls = len(transcript_data.tool_calls)
     previous_hook_health = session_store.read_hook_health(session_id)
@@ -838,7 +1051,7 @@ def _handle_stop(
         and event.get("tool_use_id")
         and event.get("replay_read_request")
     }
-    for call in transcript_data.tool_calls:
+    for call in tool_calls:
         replay_read_request = replay_read_requests.get(call.tool_use_id)
         if replay_read_request:
             call.extra_fields["replay_read_request"] = replay_read_request
@@ -859,12 +1072,12 @@ def _handle_stop(
             if transformation.get("file_path"):
                 call.extra_fields["compression_file_path"] = transformation["file_path"]
     if _config.dlp_enabled(cfg):
-        dlp.reconcile_captured_tool_results(transcript_data.tool_calls, events)
-        dlp.reconcile_captured_tool_inputs(transcript_data.tool_calls, events)
-    file_diffs = _extract_file_diffs_from_tool_calls(transcript_data.tool_calls)
+        dlp.reconcile_captured_tool_results(tool_calls, events)
+        dlp.reconcile_captured_tool_inputs(tool_calls, events)
+    file_diffs = _extract_file_diffs_from_tool_calls(tool_calls)
 
     # Compute analytics from tool calls and file diffs.
-    analytics = compute_session_analytics(transcript_data.tool_calls, file_diffs)
+    analytics = compute_session_analytics(tool_calls, file_diffs)
     # events now holds the whole session's history, so this is already the
     # session-cumulative summary — do not also merge in the separately
     # persisted mechanism_savings_state, or turn N+1 would double-count
@@ -888,8 +1101,8 @@ def _handle_stop(
         duration_s=duration_s,
         transcript_path=transcript_path,
         model=transcript_data.model or session_start_model or "claude-unknown",
-        messages=transcript_data.messages,
-        tool_calls=transcript_data.tool_calls,
+        messages=messages,
+        tool_calls=tool_calls,
         file_diffs=file_diffs,
         total_input_tokens=transcript_data.total_input_tokens,
         total_output_tokens=transcript_data.total_output_tokens,
@@ -902,9 +1115,38 @@ def _handle_stop(
         dominant_tool=analytics.get("dominant_tool"),
         mechanism_savings=mechanism_savings,
         hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "claude"),
+        **native_metadata(
+            "claude_code",
+            adapter_name="claude_code_hooks",
+            model=transcript_data.model or session_start_model or "claude-unknown",
+            provider="anthropic",
+            agent_client_version=(
+                payload.get("agent_client_version")
+                or payload.get("claude_version")
+                or payload.get("version")
+            ),
+            capabilities=dict(CLAUDE_CAPTURE_CAPABILITIES),
+            warnings=capture_warnings,
+            extra_fields={
+                "client_session_id": client_session_id or session_id,
+                **(
+                    {"parent_session_id": parent_session_id}
+                    if parent_session_id is not None
+                    else {}
+                ),
+            },
+        ),
     )
 
-    asyncio.run(_upload_and_close(record))
+    outcome = asyncio.run(_upload_and_close(record))
+    # Some focused tests and third-party integrations still monkeypatch the
+    # legacy None-returning uploader. Treat that compatibility shape as safe;
+    # production uploaders return UploadOutcome explicitly.
+    cleanup_safe = bool(getattr(outcome, "cleanup_safe", outcome is None))
+    session_store.append_event(
+        session_id,
+        {"event_type": "NativeUploadOutcome", "cleanup_safe": cleanup_safe, "timestamp": now},
+    )
     if mechanism_savings:
         try:
             session_store.write_mechanism_savings_state(session_id, mechanism_savings)
@@ -963,12 +1205,47 @@ def _handle_stop(
 
 
 def _handle_session_end(session_id: str, payload: dict) -> None:
-    """Clean all session-scoped state only when Claude declares the session finished."""
-    for event in session_store.read_events(session_id):
+    """Clean state only after upload or durable quarantine was confirmed."""
+    events = session_store.read_events(session_id)
+    for event in events:
         if event.get("event_type") == "DLPTempFile":
             with contextlib.suppress(OSError):
                 os.unlink(event["path"])
-    session_store.cleanup(session_id)
+    last_outcome = next(
+        (event for event in reversed(events) if event.get("event_type") == "NativeUploadOutcome"),
+        None,
+    )
+    if last_outcome and last_outcome.get("cleanup_safe") is True:
+        session_store.cleanup(session_id)
+
+
+def _handle_subagent_stop(parent_session_id: str, payload: dict) -> None:
+    """Finalize a stable child session without overwriting the parent session."""
+    agent_id = payload.get("agent_id")
+    session_store.append_event(
+        parent_session_id,
+        {
+            "event_type": "SubagentStop",
+            "agent_id": agent_id,
+            "agent_type": payload.get("agent_type"),
+            "timestamp": payload.get("timestamp", _now()),
+        },
+    )
+    if not agent_id:
+        return
+    agent_transcript_path = payload.get("agent_transcript_path")
+    if not agent_transcript_path:
+        return
+
+    child_session_id = f"{parent_session_id}:subagent:{agent_id}"
+    child_payload = dict(payload)
+    child_payload["transcript_path"] = agent_transcript_path
+    _handle_stop(
+        child_session_id,
+        child_payload,
+        parent_session_id=parent_session_id,
+        client_session_id=str(agent_id),
+    )
 
 
 _HANDLERS = {
@@ -983,7 +1260,7 @@ _HANDLERS = {
         payload,
         schedule_update=True,
     ),
-    "SubagentStop": _handle_stop,
+    "SubagentStop": _handle_subagent_stop,
 }
 
 

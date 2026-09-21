@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import difflib
-import json
 import logging
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from rclm._models import FileDiff, ToolCall
+from rclm.hooks.transcript_io import read_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +23,7 @@ class CursorTranscriptData:
     total_output_tokens: int | None = None
     session_id: str | None = None
     cwd: str = ""
+    warnings: list[str] = field(default_factory=list)
 
 
 def parse_transcript(transcript_path: str | None) -> CursorTranscriptData:
@@ -32,28 +32,10 @@ def parse_transcript(transcript_path: str | None) -> CursorTranscriptData:
     Returns an empty CursorTranscriptData if transcript_path is None or missing.
     Skips malformed JSON lines.
     """
-    if not transcript_path:
-        return CursorTranscriptData()
-
-    path = Path(transcript_path)
-    if not path.exists():
-        logger.warning("cursor transcript: file not found: %s", transcript_path)
-        return CursorTranscriptData()
-
-    raw_lines: list[dict] = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw_lines.append(json.loads(line))
-            except json.JSONDecodeError:
-                logger.warning(
-                    "cursor transcript: malformed JSON line in %s, skipping", transcript_path
-                )
-
-    return _extract(raw_lines)
+    raw_lines, warnings = read_jsonl(transcript_path, logger=logger)
+    data = _extract(raw_lines)
+    data.warnings = warnings
+    return data
 
 
 def _extract(entries: list[dict]) -> CursorTranscriptData:
@@ -235,7 +217,13 @@ def _process_tool_use(block: dict, data: CursorTranscriptData, timestamp: str | 
     """Normalize tool_use block and add to tool_calls and file_diffs if applicable."""
     tool_name = block.get("name") or block.get("tool_name") or ""
     tool_input = block.get("input") or block.get("args") or block.get("arguments", {})
-    tool_result = block.get("output") or block.get("result") or block.get("response")
+    # Some legacy/export formats include the result on the tool block itself.
+    # Key presence matters: an explicit empty result is still an observed
+    # result and must not be rewritten to None by truthiness fallback.
+    tool_result = next(
+        (block[key] for key in ("output", "result", "response") if key in block),
+        None,
+    )
 
     if not tool_name:
         return

@@ -6,6 +6,7 @@ import pytest
 from jsonschema import validate
 
 from rclm._models import HookSessionRecord
+from rclm._uploader import UploadOutcome, UploadStatus
 from rclm.hooks import claude_handler as handler
 
 CLAUDE_PRE_TOOL_USE_OUTPUT_SCHEMA = {
@@ -1112,6 +1113,7 @@ def test_post_tool_use_compacts_recognized_shell_output(monkeypatch, tmp_path, c
     validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
     replacement = output["hookSpecificOutput"]["updatedToolOutput"]
     assert "40 lines omitted" in replacement
+    assert "rclm://artifact/sha256/" in replacement
     events = session_store.read_events("sid-compact")
     transformation = next(e for e in events if e.get("event_type") == "ToolTransformation")
     assert transformation["compression_strategy"] == "H3_exec_compaction"
@@ -1241,6 +1243,12 @@ def test_stop_builds_hook_session_record_and_uploads(monkeypatch, tmp_path):
     assert record.cache_creation_tokens == 200
     assert record.usage_source == "provider"
     assert len(record.messages) == 1
+    assert record.capture_source == "native_agent"
+    assert record.agent_client == "claude_code"
+    assert record.adapter_name == "claude_code_hooks"
+    assert record.model_provider == "anthropic"
+    assert record.capture_capabilities["transcript_primary"] is True
+    assert record.extra_fields["client_session_id"] == "sid-3"
 
     # Stop must not clear the session's event log: it fires every turn, not
     # just at session end, and later turns need SessionStart to still be
@@ -1726,6 +1734,130 @@ def test_stop_without_prior_session_start_uses_fallback(monkeypatch, tmp_path):
     assert len(uploaded_records) == 1
     record = uploaded_records[0]
     assert record.cwd == "/fallback"
+
+
+def test_stop_uses_hook_fallback_for_partial_transcript(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+    from rclm.hooks.transcript import TranscriptData
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_store.append_event(
+        "sid-fallback",
+        {
+            "event_type": "UserPromptSubmit",
+            "prompt": "hook prompt",
+            "timestamp": "2026-09-21T00:00:01Z",
+        },
+    )
+    session_store.append_event(
+        "sid-fallback",
+        {
+            "event_type": "PreToolUse",
+            "tool_use_id": "tool-1",
+            "tool_name": "Write",
+            "tool_input": {"file_path": "a.txt", "content": "hello"},
+            "timestamp": "2026-09-21T00:00:02Z",
+        },
+    )
+    session_store.append_event(
+        "sid-fallback",
+        {
+            "event_type": "PostToolUse",
+            "tool_use_id": "tool-1",
+            "tool_name": "Write",
+            "tool_response": "ok",
+            "timestamp": "2026-09-21T00:00:03Z",
+        },
+    )
+    uploaded = []
+
+    async def fake_upload_single(record):
+        uploaded.append(record)
+        return UploadOutcome(UploadStatus.UPLOADED)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda _path: TranscriptData(),
+    )
+
+    _run_handler(
+        "Stop",
+        {
+            "session_id": "sid-fallback",
+            "last_assistant_message": "hook answer",
+        },
+        monkeypatch,
+    )
+
+    record = uploaded[0]
+    assert [message["content"] for message in record.messages] == [
+        "hook prompt",
+        "hook answer",
+    ]
+    assert record.tool_calls[0].tool_use_id == "tool-1"
+    assert record.tool_calls[0].tool_result == "ok"
+    assert record.file_diffs[0].path == "a.txt"
+    assert "transcript_path_missing_hook_fallback" in record.capture_warnings
+
+
+def test_session_end_retains_sidecars_when_upload_is_not_cleanup_safe(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+    from rclm.hooks.transcript import TranscriptData
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_store.append_event("sid-retained", {"event_type": "SessionStart"})
+
+    async def fake_upload_single(_record):
+        return UploadOutcome(UploadStatus.FAILED)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda _path: TranscriptData(),
+    )
+
+    _run_handler("Stop", {"session_id": "sid-retained"}, monkeypatch)
+    _run_handler("SessionEnd", {"session_id": "sid-retained"}, monkeypatch)
+
+    assert session_store.read_events("sid-retained")[-1]["cleanup_safe"] is False
+
+
+def test_subagent_stop_uses_distinct_session_identity(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+    from rclm.hooks.transcript import TranscriptData
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_store.append_event("parent", {"event_type": "SessionStart"})
+    uploaded = []
+
+    async def fake_upload_single(record):
+        uploaded.append(record)
+        return UploadOutcome(UploadStatus.UPLOADED)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda path: TranscriptData(messages=[{"role": "assistant", "content": path}]),
+    )
+
+    _run_handler(
+        "SubagentStop",
+        {
+            "session_id": "parent",
+            "agent_id": "child-1",
+            "agent_transcript_path": "/tmp/child.jsonl",
+        },
+        monkeypatch,
+    )
+
+    assert uploaded[0].session_id == "parent:subagent:child-1"
+    assert uploaded[0].transcript_path == "/tmp/child.jsonl"
+    assert uploaded[0].extra_fields["client_session_id"] == "child-1"
+    assert uploaded[0].extra_fields["parent_session_id"] == "parent"
+    assert any(
+        event["event_type"] == "SubagentStop" for event in session_store.read_events("parent")
+    )
 
 
 # ---------------------------------------------------------------------------

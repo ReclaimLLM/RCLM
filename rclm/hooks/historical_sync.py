@@ -2,7 +2,8 @@
 
 Called during install when the user opts in. Discovers existing session files from
 Claude Code (~/.claude/projects/**/*.jsonl), Gemini CLI (~/.gemini/tmp/**/chats/*.json),
-Codex CLI (~/.codex/sessions/**/*.jsonl), and OpenClaw
+Codex CLI (~/.codex/sessions/**/*.jsonl), Antigravity
+(~/.gemini/antigravity-cli/brain/**/transcript.jsonl), and OpenClaw
 (~/.openclaw/agents/main/sessions/*.jsonl*), parses them into
 HookSessionRecord objects, and uploads them via the same mechanism as live sessions.
 
@@ -15,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import hashlib
 import json
+import os
 import sys
 import uuid
 from datetime import datetime
@@ -35,9 +38,15 @@ from rclm._uploader import (
     close_session,
     upload_single,
 )
-from rclm.hooks import codex_transcript, cursor_transcript, openclaw_transcript
+from rclm.hooks import (
+    antigravity_transcript,
+    codex_transcript,
+    cursor_transcript,
+    openclaw_transcript,
+)
 from rclm.hooks import transcript as claude_transcript
 from rclm.hooks._analytics import compute_session_analytics
+from rclm.hooks.capture_metadata import native_metadata
 
 # Number of retry attempts when reprocessing quarantined failed uploads.
 # Set low (1) so a persistently-unreachable server doesn't block the user for long.
@@ -48,8 +57,16 @@ _FAILED_UPLOAD_MAX_RETRIES = 1
 # ---------------------------------------------------------------------------
 
 _SYNCED_INDEX = Path.home() / ".reclaimllm" / "synced_sessions.json"
-_HISTORICAL_PROVIDERS = ("claude", "gemini", "codex", "cursor", "openclaw")
+_HISTORICAL_PROVIDERS = (
+    "claude",
+    "gemini",
+    "codex",
+    "cursor",
+    "antigravity",
+    "openclaw",
+)
 CURSOR_MODEL_DEFAULT = "cursor-unknown"
+_SYNC_INDEX_VERSION = 1
 
 
 def _load_synced_index() -> set[str]:
@@ -64,10 +81,34 @@ def _load_synced_index() -> set[str]:
 
 def _save_synced_index(synced: set[str]) -> None:
     _SYNCED_INDEX.parent.mkdir(parents=True, exist_ok=True)
-    _SYNCED_INDEX.write_text(
-        json.dumps({"synced": sorted(synced)}, indent=2),
-        encoding="utf-8",
-    )
+    os.chmod(_SYNCED_INDEX.parent, 0o700)
+    temporary = _SYNCED_INDEX.with_suffix(_SYNCED_INDEX.suffix + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"version": _SYNC_INDEX_VERSION, "synced": sorted(synced)},
+                    indent=2,
+                )
+            )
+        os.replace(temporary, _SYNCED_INDEX)
+        os.chmod(_SYNCED_INDEX, 0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _sync_key(path: Path) -> str:
+    """Return a stable identity that changes when transcript contents change."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return f"v{_SYNC_INDEX_VERSION}:{path}:unreadable"
+    return f"v{_SYNC_INDEX_VERSION}:{path.resolve()}:{digest.hexdigest()}"
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +180,18 @@ def _iter_cursor_sessions() -> list[Path]:
             if f.is_file():
                 files.append(f)
     return files
+
+
+def _iter_antigravity_sessions() -> list[Path]:
+    """Yield one canonical transcript per Antigravity conversation."""
+    base = Path.home() / ".gemini" / "antigravity-cli" / "brain"
+    if not base.exists():
+        return []
+    return [
+        path
+        for path in base.glob("*/.system_generated/logs/transcript.jsonl")
+        if path.is_file() and not path.is_symlink()
+    ]
 
 
 def _openclaw_canonical_path(path: Path) -> Path:
@@ -712,6 +765,41 @@ def _parse_cursor_session(path: Path) -> HookSessionRecord | None:
     )
 
 
+def _parse_antigravity_session(path: Path) -> HookSessionRecord | None:
+    """Parse an Antigravity transcript into a historical session record."""
+    transcript_data = antigravity_transcript.parse_transcript(str(path))
+    if not transcript_data.messages and not transcript_data.tool_calls:
+        return None
+    timestamps = [msg["timestamp"] for msg in transcript_data.messages if msg.get("timestamp")]
+    started_at = min(timestamps) if timestamps else None
+    ended_at = max(timestamps) if timestamps else None
+    analytics = compute_session_analytics(transcript_data.tool_calls, [])
+    return HookSessionRecord(
+        session_id=path.parents[2].name,
+        cwd="",
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_s=_timestamps_to_duration(started_at, ended_at),
+        transcript_path=str(path),
+        model="antigravity-unknown",
+        messages=transcript_data.messages,
+        tool_calls=transcript_data.tool_calls,
+        file_diffs=[],
+        tool_token_stats=analytics.get("tool_token_stats"),
+        tool_call_count=analytics.get("tool_call_count"),
+        unique_files_modified=analytics.get("unique_files_modified"),
+        dominant_tool=analytics.get("dominant_tool"),
+        is_sync=True,
+        **native_metadata(
+            "antigravity",
+            adapter_name="rclm-antigravity-historical",
+            model="antigravity-unknown",
+            capabilities={"transcript": True, "tool_calls": True, "file_diffs": False},
+            warnings=transcript_data.warnings,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # OpenClaw parsing
 # ---------------------------------------------------------------------------
@@ -806,7 +894,18 @@ def _deserialize_record(data: dict) -> AnyRecord | None:
             unique_files_modified=data.get("unique_files_modified"),
             dominant_tool=data.get("dominant_tool"),
             mechanism_savings=data.get("mechanism_savings"),
+            hook_policy_snapshot=data.get("hook_policy_snapshot"),
             is_sync=data.get("is_sync", False),
+            capture_schema_version=data.get("capture_schema_version", 1),
+            capture_source=data.get("capture_source", "native_agent"),
+            agent_client=data.get("agent_client"),
+            agent_client_version=data.get("agent_client_version"),
+            adapter_name=data.get("adapter_name"),
+            adapter_version=data.get("adapter_version"),
+            model_provider=data.get("model_provider"),
+            capture_capabilities=data.get("capture_capabilities", {}),
+            capture_warnings=data.get("capture_warnings", []),
+            extra_fields=data.get("extra_fields", {}),
         )
     except Exception:
         return None
@@ -850,24 +949,14 @@ async def _reprocess_failed_uploads() -> tuple[int, int]:
             failed += 1
             continue
 
-        # Remember file size before upload so we can detect if quarantine re-wrote it.
-        mtime_before = path.stat().st_mtime
-        await upload_single(record, max_retries=_FAILED_UPLOAD_MAX_RETRIES)
-
-        # If the file's mtime changed, upload failed and quarantine re-wrote it; leave it.
-        try:
-            mtime_after = path.stat().st_mtime
-            if mtime_after != mtime_before:
-                failed += 1
-                print(f"    ✗ {path.name}")
-            else:
-                path.unlink(missing_ok=True)
-                uploaded += 1
-                print(f"    ✓ {path.name}")
-        except FileNotFoundError:
-            # File was removed somehow; treat as success.
+        outcome = await upload_single(record, max_retries=_FAILED_UPLOAD_MAX_RETRIES)
+        if getattr(outcome, "successful", outcome is None):
+            path.unlink(missing_ok=True)
             uploaded += 1
             print(f"    ✓ {path.name}")
+        else:
+            failed += 1
+            print(f"    ✗ {path.name}")
 
     return uploaded, failed
 
@@ -887,6 +976,8 @@ def _discover_sessions(providers: list[str]) -> dict[str, list[Path]]:
         result["codex"] = _iter_codex_sessions()
     if "cursor" in providers:
         result["cursor"] = _iter_cursor_sessions()
+    if "antigravity" in providers:
+        result["antigravity"] = _iter_antigravity_sessions()
     if "openclaw" in providers:
         result["openclaw"] = _iter_openclaw_sessions()
     return result
@@ -894,16 +985,41 @@ def _discover_sessions(providers: list[str]) -> dict[str, list[Path]]:
 
 def _parse_session(provider: str, path: Path) -> HookSessionRecord | None:
     try:
+        record = None
         if provider == "claude":
-            return _parse_claude_session(path)
-        if provider == "gemini":
-            return _parse_gemini_session(path)
-        if provider == "codex":
-            return _parse_codex_session(path)
-        if provider == "cursor":
-            return _parse_cursor_session(path)
-        if provider == "openclaw":
-            return _parse_openclaw_session(path)
+            record = _parse_claude_session(path)
+        elif provider == "gemini":
+            record = _parse_gemini_session(path)
+        elif provider == "codex":
+            record = _parse_codex_session(path)
+        elif provider == "cursor":
+            record = _parse_cursor_session(path)
+        elif provider == "antigravity":
+            record = _parse_antigravity_session(path)
+        elif provider == "openclaw":
+            record = _parse_openclaw_session(path)
+        if record is not None and not record.agent_client:
+            client = {
+                "claude": "claude_code",
+                "gemini": "gemini_cli",
+                "codex": "codex",
+                "cursor": "cursor",
+                "openclaw": "openclaw",
+            }.get(provider)
+            if client:
+                metadata = native_metadata(
+                    client,
+                    adapter_name=f"rclm-{provider}-historical",
+                    model=record.model,
+                    capabilities={
+                        "transcript": True,
+                        "tool_calls": True,
+                        "file_diffs": bool(record.file_diffs),
+                    },
+                )
+                for key, value in metadata.items():
+                    setattr(record, key, value)
+        return record
     except Exception:
         pass
     return None
@@ -916,20 +1032,23 @@ async def _upload_all(
     """Parse and upload all un-synced sessions. Returns count of uploaded records."""
     uploaded = 0
     for provider, paths in by_provider.items():
-        new_paths = [p for p in paths if str(p) not in already_synced]
+        new_paths = [p for p in paths if _sync_key(p) not in already_synced]
         if not new_paths:
             continue
         print(f"\n  {provider.capitalize()} ({len(new_paths)} new sessions):")
         for path in new_paths:
+            sync_key = _sync_key(path)
             record = _parse_session(provider, path)
             if record is None:
-                # Empty or unreadable session — mark as synced to skip next time.
-                already_synced.add(str(path))
+                print(f"    ! {path.name}: empty or unreadable")
                 continue
-            await upload_single(record)
-            already_synced.add(str(path))
-            uploaded += 1
-            print(f"    ✓ {path.name}")
+            outcome = await upload_single(record)
+            if getattr(outcome, "successful", outcome is None):
+                already_synced.add(sync_key)
+                uploaded += 1
+                print(f"    ✓ {path.name}")
+            else:
+                print(f"    ✗ {path.name}")
     return uploaded
 
 
@@ -1049,12 +1168,13 @@ def sync_main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Sync existing Claude/Gemini/Codex/OpenClaw sessions to ReclaimLLM.",
+        description="Sync existing coding-agent sessions to ReclaimLLM.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   %(prog)s                   # scan all providers, ask before uploading
   %(prog)s --claude          # Claude Code only
   %(prog)s --gemini --codex  # Gemini + Codex
+  %(prog)s --antigravity     # Antigravity only
   %(prog)s --openclaw        # OpenClaw only
   %(prog)s --yes             # upload without confirmation prompt
   %(prog)s --resync          # re-upload all sessions, ignoring prior sync index
@@ -1067,6 +1187,7 @@ def sync_main() -> None:
     parser.add_argument("--codex", action="store_true", help="Sync Codex CLI sessions")
     parser.add_argument("--openclaw", action="store_true", help="Sync OpenClaw sessions")
     parser.add_argument("--cursor", action="store_true", help="Sync Cursor sessions")
+    parser.add_argument("--antigravity", action="store_true", help="Sync Antigravity sessions")
     parser.add_argument(
         "--yes",
         "-y",

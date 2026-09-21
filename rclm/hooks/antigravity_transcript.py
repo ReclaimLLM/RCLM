@@ -17,13 +17,12 @@ tool_result=None rather than guessing which result belongs to which call.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from rclm._models import ToolCall
 from rclm.hooks._analytics import estimate_tokens
+from rclm.hooks.transcript_io import read_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +31,7 @@ logger = logging.getLogger(__name__)
 class AntigravityTranscriptData:
     messages: list[dict] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def parse_transcript(transcript_path: str | None) -> AntigravityTranscriptData:
@@ -40,32 +40,10 @@ def parse_transcript(transcript_path: str | None) -> AntigravityTranscriptData:
     Returns empty data if transcript_path is None or missing. Skips malformed
     JSON lines.
     """
-    if not transcript_path:
-        return AntigravityTranscriptData()
-
-    path = Path(transcript_path)
-    if not path.exists():
-        logger.warning("antigravity_transcript: file not found: %s", transcript_path)
-        return AntigravityTranscriptData()
-
-    entries: list[dict] = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning(
-                    "antigravity_transcript: malformed JSON line in %s, skipping",
-                    transcript_path,
-                )
-                continue
-            if isinstance(parsed, dict):
-                entries.append(parsed)
-
-    return _extract(entries)
+    entries, warnings = read_jsonl(transcript_path, logger=logger)
+    data = _extract(entries)
+    data.warnings = warnings
+    return data
 
 
 def _role_for(entry: dict) -> str:

@@ -236,6 +236,27 @@ class TestRangeCacheH1:
         # the non-file suffix present.
         assert result.calls[1].classification == "shaped"
 
+    def test_antigravity_view_repeat_range_is_cache_hit(self):
+        block = "".join(f"{line}: content line {line}\n" for line in range(1, 101))
+        content = (
+            "Created At: now\nCompleted At: later\nFile Path: `file:///repo/a.py`\n"
+            "Total Lines: 100\nTotal Bytes: 2000\nShowing lines 1 to 100\n"
+            f"Line numbering note\n{block}Trailing note\n"
+        )
+        calls = [
+            {
+                "tool_name": "view_file",
+                "tool_input": {"AbsolutePath": "/repo/a.py", "StartLine": 1, "EndLine": 100},
+                "tool_result": content,
+            }
+            for _ in range(2)
+        ]
+
+        result = replay_blob(_blob(calls), mechanisms=("range_cache",))
+
+        assert result.calls[1].classification == "shaped"
+        assert result.calls[1].mechanism == "range_cache"
+
 
 class TestPrecedence:
     def test_range_cache_claims_read_before_dedupe_gets_a_chance(self):

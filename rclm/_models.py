@@ -100,3 +100,13 @@ class HookSessionRecord:
     )
     hook_policy_snapshot: dict | None = None
     is_sync: bool = False  # True for historical sync uploads; server skips if session exists
+    capture_schema_version: int = 1
+    capture_source: str = "native_agent"
+    agent_client: str | None = None
+    agent_client_version: str | None = None
+    adapter_name: str | None = None
+    adapter_version: str | None = None
+    model_provider: str | None = None
+    capture_capabilities: dict = field(default_factory=dict)
+    capture_warnings: list[str] = field(default_factory=list)
+    extra_fields: dict = field(default_factory=dict)

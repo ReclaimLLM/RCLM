@@ -122,6 +122,8 @@ def test_llm_and_tool_events_build_uploaded_record(monkeypatch):
 
     assert len(uploaded) == 1
     record = uploaded[0]
+    assert record.capture_source == "native_agent"
+    assert record.agent_client == "openclaw"
     assert record.session_id == "oc-sid-2"
     assert record.cwd == "/work"
     assert record.model == "openclaw-unknown"

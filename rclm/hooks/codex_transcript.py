@@ -134,7 +134,13 @@ def _extract(entries: Iterable[dict]) -> CodexTranscriptData:
         elif response_type in {"function_call", "custom_tool_call"}:
             call = _build_tool_call(payload, timestamp)
             if call is not None:
-                pending_calls[payload.get("call_id", "")] = call
+                call_id = payload.get("call_id", "")
+                # Checkpointed/resumed Codex transcripts can repeat an already
+                # emitted response item. The provider call ID is stable, so do
+                # not duplicate either the call or its derived file changes.
+                if call_id in pending_calls:
+                    continue
+                pending_calls[call_id] = call
                 data.tool_calls.append(call)
                 # Preserve provider-neutral FileDiffs by extracting patch hunks
                 # at parse time instead of leaking raw Codex patch text upward.
@@ -142,14 +148,33 @@ def _extract(entries: Iterable[dict]) -> CodexTranscriptData:
                 # so the apply_patch body may be embedded in JavaScript source.
                 for patch_text in _patch_texts_from_tool_call(call):
                     data.file_diffs.extend(_parse_apply_patch(patch_text, timestamp))
-        elif response_type == "function_call_output":
+        elif response_type in {"function_call_output", "custom_tool_call_output"}:
             call_id = payload.get("call_id", "")
             call = pending_calls.get(call_id)
             if call is not None:
+                # ``function_call_output`` is normally a string. Codex exec
+                # tools use ``custom_tool_call_output`` and retain the
+                # Responses API content-block list (including image blocks).
+                # Keep that value intact so downstream capture can distinguish
+                # text from non-text results without lossy reconstruction.
                 call.tool_result = payload.get("output")
 
+    data.file_diffs = _dedupe_file_diffs(data.file_diffs)
     data.usage = usage.total()
     return data
+
+
+def _dedupe_file_diffs(file_diffs: list[FileDiff]) -> list[FileDiff]:
+    """Deduplicate the same edit reported by tool and lifecycle records."""
+    deduped: list[FileDiff] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    for file_diff in file_diffs:
+        fingerprint = (file_diff.path, file_diff.before, file_diff.after)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        deduped.append(file_diff)
+    return deduped
 
 
 def _parse_usage_snapshot(raw: object) -> CodexUsage | None:

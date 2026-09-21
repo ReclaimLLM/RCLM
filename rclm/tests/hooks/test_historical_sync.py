@@ -13,9 +13,11 @@ from rclm.hooks.historical_sync import (
     _HISTORICAL_PROVIDERS,
     _derive_session_id,
     _discover_sessions,
+    _iter_antigravity_sessions,
     _iter_cursor_sessions,
     _iter_openclaw_sessions,
     _load_synced_index,
+    _parse_antigravity_session,
     _parse_claude_session,
     _parse_codex_session,
     _parse_cursor_session,
@@ -23,6 +25,7 @@ from rclm.hooks.historical_sync import (
     _parse_openclaw_session,
     _parse_session,
     _save_synced_index,
+    _sync_key,
     _upload_all,
     prompt_and_run_sync,
 )
@@ -152,6 +155,42 @@ def test_iter_cursor_sessions(tmp_path):
 
     assert len(result) == 1
     assert result[0] == f
+
+
+def test_iter_and_parse_antigravity_session(tmp_path):
+    session_id = "8e7e69f4-6673-43ee-8604-ecfb82a14a6f"
+    transcript = (
+        tmp_path
+        / ".gemini"
+        / "antigravity-cli"
+        / "brain"
+        / session_id
+        / ".system_generated"
+        / "logs"
+        / "transcript.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    _write_jsonl(
+        transcript,
+        [
+            {
+                "step_index": 1,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-09-21T12:00:00Z",
+                "content": "hello",
+            }
+        ],
+    )
+
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        assert _iter_antigravity_sessions() == [transcript]
+
+    record = _parse_antigravity_session(transcript)
+    assert record is not None
+    assert record.session_id == session_id
+    assert record.agent_client == "antigravity"
+    assert record.capture_source == "native_agent"
 
 
 # ---------------------------------------------------------------------------
@@ -846,7 +885,7 @@ async def test_upload_all_skips_already_synced(tmp_path):
     """Files already in the synced index are not parsed or uploaded."""
     path = tmp_path / "session.jsonl"
     _write_jsonl(path, _claude_entries())
-    already_synced = {str(path)}
+    already_synced = {_sync_key(path)}
 
     with patch("rclm.hooks.historical_sync.upload_single", new_callable=AsyncMock) as mock_upload:
         uploaded = await _upload_all({"claude": [path]}, already_synced)
@@ -866,12 +905,12 @@ async def test_upload_all_uploads_new_sessions(tmp_path):
         uploaded = await _upload_all({"claude": [path]}, already_synced)
 
     assert uploaded == 1
-    assert str(path) in already_synced
+    assert _sync_key(path) in already_synced
 
 
 @pytest.mark.asyncio
-async def test_upload_all_marks_empty_session_as_synced(tmp_path):
-    """Empty/unreadable sessions are marked synced so they are not retried."""
+async def test_upload_all_keeps_empty_session_retryable(tmp_path):
+    """A growing or temporarily unreadable transcript must be reconsidered later."""
     path = tmp_path / "empty.jsonl"
     path.write_text("")
     already_synced: set[str] = set()
@@ -880,8 +919,16 @@ async def test_upload_all_marks_empty_session_as_synced(tmp_path):
         uploaded = await _upload_all({"claude": [path]}, already_synced)
 
     assert uploaded == 0
-    assert str(path) in already_synced
+    assert already_synced == set()
     mock_upload.assert_not_called()
+
+
+def test_sync_key_changes_when_transcript_changes(tmp_path):
+    path = tmp_path / "session.jsonl"
+    path.write_text("one")
+    first = _sync_key(path)
+    path.write_text("two")
+    assert _sync_key(path) != first
 
 
 # ---------------------------------------------------------------------------

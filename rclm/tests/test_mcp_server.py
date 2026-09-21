@@ -791,3 +791,14 @@ async def test_request_raises_clear_message_on_401(tmp_path, monkeypatch):
 
     assert "rclm-login" in str(exc_info.value)
     assert session_kwargs["timeout"].total == 600
+    assert session_kwargs["headers"]["X-ReclaimLLM-Client"] == "mcp"
+
+
+def test_reclaimllm_client_headers_contain_mcp_identifier(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"server_url": "https://api.test", "api_key": "test-key"}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+
+    client = mcp_server.ReclaimLLMClient()
+    assert client.headers["X-ReclaimLLM-Client"] == "mcp"
+    assert client.headers["X-API-Key"] == "test-key"

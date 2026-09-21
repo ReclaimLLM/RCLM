@@ -3,6 +3,51 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.30] — 2026-09-21
+
+### Added
+- Added provider-neutral tool semantics, bounded task ledgers, and session-scoped content-addressed artifacts with exact full/range recall through `rclm recall-result` (`rclm/hooks/{tool_semantics,task_ledger,recallable_artifacts}.py`, `rclm/cli.py`)
+- Added versioned native-agent capture metadata—client, model provider, adapter, capabilities, and warnings—across Claude Code, Codex CLI, Cursor, Antigravity, Gemini CLI, OpenClaw, and historical sync (`rclm/_models.py`, `rclm/hooks/capture_metadata.py`, provider handlers)
+- Added Antigravity historical transcript discovery plus selective Cursor and Antigravity uninstall support (`rclm/hooks/historical_sync.py`, `rclm/hooks/uninstaller.py`)
+- Added an offline session-corpus benchmark for per-mechanism and combined token-reduction analysis, Codex result repair, Antigravity view-cap modeling, and repeated-context cost estimates (`scripts/benchmark_session_corpus.py`, `scripts/README.md`)
+
+### Changed
+- Unified tool-result shaping across native provider envelopes, including Codex ordered custom-output blocks and Antigravity command, search, listing, view, and edit-result formats (`rclm/hooks/tool_result_transform.py`, `rclm/hooks/tool_semantics.py`)
+- Uploads now return explicit outcomes, retain local state after retryable failures, clean up only after remote success or a safe terminal outcome, and use content-sensitive keys for historical sync retries (`rclm/_uploader.py`, provider handlers, `rclm/hooks/historical_sync.py`)
+- Claude, Codex, and Gemini now compose result compaction with recallable artifacts, stateful deltas, and task-ledger updates while preserving their provider-specific hook contracts (`rclm/hooks/{claude,codex,gemini}_handler.py`)
+- Replay now supports `stateful_delta`, Antigravity/Gemini read shapes, provider-aware compaction, and a separate repeated-context cost model (`rclm/replay/**`)
+- Hook installation now quotes resolved executable paths safely and continues installing other selected providers when one provider configuration fails (`rclm/hooks/installer.py`)
+
+### Fixed
+- Fixed Codex transcript parsing for `custom_tool_call_output`, multiple calls in one turn, replayed call/diff duplication, repeated cumulative usage snapshots, and transcript/sidecar result reconciliation (`rclm/hooks/codex_transcript.py`, `rclm/hooks/codex_handler.py`)
+- Fixed Claude partial-transcript fallback and subagent identity so hook-side messages, tool results, diffs, and child-session provenance remain captureable (`rclm/hooks/claude_handler.py`)
+- Fixed Cursor transcript parsing so explicit empty or falsy tool results are preserved instead of treated as missing (`rclm/hooks/cursor_transcript.py`)
+- Fixed uninstall command matching for quoted executable paths and made Cursor/Antigravity removal preserve unrelated hooks (`rclm/hooks/uninstaller.py`)
+
+### Removed
+- Removed Antigravity's no-op `PostToolUse` registration; verified `PreToolUse` reduction and `Stop` capture hooks remain installed (`rclm/hooks/installer.py`)
+
+### Security
+- Added bounded transcript readers that reject symlinks and oversized inputs, and owner-only atomic writes for ReclaimLLM config, session state, sync indexes, task ledgers, artifacts, and hook configuration (`rclm/_config.py`, `rclm/hooks/{transcript_io,session_store,task_ledger,recallable_artifacts}.py`)
+- HTTP client errors now quarantine the already-redacted payload with private permissions, while retryable failures retain local capture state for later delivery (`rclm/_uploader.py`)
+
+### Performance
+- Added stateful deltas for overlapping repeated results, deterministic edit receipts, provider boilerplate canonicalization, and a 200-line default cap for unbounded Antigravity `view_file` calls (`rclm/hooks/{result_delta,tool_result_transform,antigravity_handler}.py`)
+- Superseded large results can now leave compact immutable recall stubs in model context while their exact text remains available locally, reducing repeated context reads without discarding recoverability (`rclm/hooks/recallable_artifacts.py`, `rclm/replay/context_cost.py`)
+
+---
+
+## [Unreleased]
+
+### Added
+- Added a versioned native-agent capture contract with explicit client, model-provider, adapter, capability, and warning metadata across Claude Code, Codex CLI, Cursor, Antigravity, Gemini CLI, OpenClaw, and historical sync.
+- Added Antigravity historical transcript discovery and Cursor/Antigravity uninstall support.
+
+### Changed
+- Uploads now return explicit outcomes; local capture state is cleaned only after remote success, an intentional folder-policy skip, or secure local quarantine.
+- HTTP client errors are quarantined after redaction, transcript reads are bounded and reject symlinks, and ReclaimLLM-owned config/session/index files use owner-only permissions.
+- Antigravity no longer installs its no-op PostToolUse hook; its verified PreToolUse reduction hook and Stop capture hook remain enabled.
+
 ## [v0.1.29] — 2026-08-31
 
 ### Added

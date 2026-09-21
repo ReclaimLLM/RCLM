@@ -73,6 +73,25 @@ def test_parses_tool_calls(tmp_path):
     assert tc.tool_use_id == "tool-1"
 
 
+def test_preserves_explicit_empty_tool_result(tmp_path):
+    entries = [
+        {
+            "type": "tool",
+            "name": "shell",
+            "input": {"command": "true"},
+            "output": "",
+            "timestamp": "2024-01-01T00:00:02Z",
+            "id": "tool-empty",
+        }
+    ]
+    path = _write_transcript(tmp_path / "cursor.jsonl", entries)
+
+    data = parse_transcript(path)
+
+    assert len(data.tool_calls) == 1
+    assert data.tool_calls[0].tool_result == ""
+
+
 def test_parses_meta_and_alternate_format(tmp_path):
     entries = [
         {

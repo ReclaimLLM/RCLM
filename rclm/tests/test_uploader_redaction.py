@@ -6,7 +6,7 @@ import pytest
 
 from rclm import _config, _uploader
 from rclm._models import HookSessionRecord, ToolCall
-from rclm._uploader import upload
+from rclm._uploader import UploadStatus, upload
 from rclm.hooks import dlp
 
 
@@ -24,7 +24,8 @@ def _record(cwd: str = "/tmp/project") -> HookSessionRecord:
 
 
 class _Response:
-    status = 201
+    def __init__(self, status: int = 201) -> None:
+        self.status = status
 
     async def __aenter__(self):
         return self
@@ -34,12 +35,13 @@ class _Response:
 
 
 class _Session:
-    def __init__(self) -> None:
+    def __init__(self, status: int = 201) -> None:
         self.posts: list[dict] = []
+        self.status = status
 
     def post(self, url: str, *, data: str, headers: dict):
         self.posts.append({"url": url, "data": data, "headers": headers})
-        return _Response()
+        return _Response(self.status)
 
 
 @pytest.mark.asyncio
@@ -259,3 +261,20 @@ async def test_upload_missing_credentials_quarantines_with_message(tmp_path, mon
     err = capsys.readouterr().err
     assert "not authenticated" in err
     assert "rclm-login" in err
+
+
+@pytest.mark.asyncio
+async def test_upload_4xx_returns_quarantined_outcome(tmp_path, monkeypatch):
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setattr(_uploader, "_FAILED_UPLOADS_DIR", tmp_path / "failed_uploads")
+    _config.patch(server_url="https://api.example.test", api_key="bad-key", dlp=False)
+
+    outcome = await upload(_record(), _Session(status=401))
+
+    assert outcome.status is UploadStatus.QUARANTINED
+    assert outcome.cleanup_safe is True
+    assert outcome.successful is False
+    assert outcome.http_status == 401
+    assert outcome.quarantine_path is not None
+    assert outcome.quarantine_path.exists()
+    assert outcome.quarantine_path.stat().st_mode & 0o777 == 0o600

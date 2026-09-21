@@ -53,15 +53,17 @@ from datetime import datetime, timezone
 
 from rclm import _config
 from rclm._models import HookSessionRecord, ToolCall
-from rclm._uploader import close_session, upload_single
+from rclm._uploader import UploadOutcome, close_session, upload_single
 from rclm.hooks import (
     bootstrap,
     codex_transcript,
+    context_memory,
     dedupe,
     dlp,
     image_eviction,
     image_lifecycle,
     read_cache,
+    result_delta,
     session_store,
     tool_result_transform,
 )
@@ -70,12 +72,24 @@ from rclm.hooks._analytics import (
     estimate_tokens,
     mechanism_saving_event,
 )
+from rclm.hooks.capture_metadata import native_metadata
 from rclm.hooks.compress import maybe_compress
 from rclm.hooks.updater import schedule_session_end_update
 
 logger = logging.getLogger(__name__)
 
 THRESHOLD_ZERO_DURATION = 5.0  # seconds
+CODEX_CAPTURE_CAPABILITIES = {
+    "native_lifecycle_hooks": True,
+    "transcript_primary": True,
+    "hook_event_fallback": True,
+    "messages": True,
+    "tool_calls": True,
+    "file_changes": True,
+    "provider_usage": True,
+    "model_facing_transformations": True,
+    "historical_sync": True,
+}
 
 _DLP_STOP_REASON = (
     "ReclaimLLM DLP withheld the original tool result because it contained an env-file "
@@ -112,7 +126,7 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
             "event_type": "SessionStart",
             "cwd": payload.get("cwd", ""),
             "model": payload.get("model"),
-            "timestamp": _now(),
+            "timestamp": payload.get("timestamp", _now()),
         },
     )
     with contextlib.suppress(Exception):
@@ -135,7 +149,7 @@ def _handle_user_prompt_submit(session_id: str, payload: dict) -> None:
             "event_type": "UserPromptSubmit",
             "prompt": payload.get("prompt", ""),
             "turn_id": payload.get("turn_id"),
-            "timestamp": _now(),
+            "timestamp": payload.get("timestamp", _now()),
         },
     )
 
@@ -156,7 +170,7 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
             "tool_input": tool_input,
             "tool_use_id": payload.get("tool_use_id"),
             "turn_id": payload.get("turn_id"),
-            "timestamp": _now(),
+            "timestamp": payload.get("timestamp", _now()),
         },
     )
 
@@ -276,8 +290,9 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             "tool_name": tool_name,
             "tool_response": captured_response,
             "dlp_redacted": dlp_replacement is not None,
+            "tool_use_id": payload.get("tool_use_id"),
             "turn_id": payload.get("turn_id"),
-            "timestamp": _now(),
+            "timestamp": payload.get("timestamp", _now()),
         },
     )
 
@@ -375,6 +390,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         captured_response if isinstance(captured_response, str) else str(captured_response or "")
     )
     replaced = False
+    artifact_handle: str | None = None
 
     if dlp_replacement is not None:
         effective_text = dlp_replacement
@@ -415,7 +431,47 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             logger.exception("range cache failed; passing through tool result")
 
+    delta_claimed = False
     if policy.enabled("exec_compaction") and not range_claimed:
+        shadow = policy.shadow_for("exec_compaction")
+        try:
+            state = session_store.read_result_delta_state(session_id)
+            delta = result_delta.process_delta(tool_name, tool_input, effective_text, state)
+            session_store.write_result_delta_state(session_id, delta.state)
+            if delta.replacement is not None:
+                replacement = delta.replacement
+                if not shadow:
+                    replacement, artifact_handle = context_memory.make_text_recallable(
+                        session_id,
+                        effective_text,
+                        replacement,
+                        provider="codex",
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        tool_use_id=tool_use_id,
+                    )
+                raw_tokens = estimate_tokens(effective_text)
+                compressed_tokens = estimate_tokens(replacement)
+                session_store.append_event(
+                    session_id,
+                    mechanism_saving_event(
+                        "stateful_delta",
+                        applied=not shadow,
+                        tokens_saved_estimate=max(0, raw_tokens - compressed_tokens),
+                        measurement_kind="measured",
+                        raw_token_estimate=raw_tokens,
+                        compressed_token_estimate=compressed_tokens,
+                    ),
+                )
+                if not shadow:
+                    effective_text = replacement
+                    replaced = True
+                    replacement_stop_reason = replacement_stop_reason or _COMPACTION_STOP_REASON
+                delta_claimed = not shadow
+        except Exception:
+            logger.exception("stateful result delta failed; passing through tool result")
+
+    if policy.enabled("exec_compaction") and not range_claimed and not delta_claimed:
         shadow = policy.shadow_for("exec_compaction")
         try:
             transform_input = effective_text if replaced else tool_response
@@ -425,6 +481,16 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 transform_input,
             )
             if decision is not None:
+                if not shadow:
+                    decision, artifact_handle = context_memory.make_decision_recallable(
+                        session_id,
+                        transform_input,
+                        decision,
+                        provider="codex",
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        tool_use_id=tool_use_id,
+                    )
                 for event in tool_result_transform.analytics_events(
                     decision,
                     tool_use_id=payload.get("tool_use_id"),
@@ -440,7 +506,12 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
             logger.exception("tool-result compaction failed; passing through tool result")
 
     compression = _config.compression_config(cfg)
-    if policy.enabled("hash_dedupe") and compression["dedupe"] and not range_claimed:
+    if (
+        policy.enabled("hash_dedupe")
+        and compression["dedupe"]
+        and not range_claimed
+        and not delta_claimed
+    ):
         shadow = policy.shadow_for("hash_dedupe")
         try:
             state = session_store.read_dedupe_state(session_id)
@@ -490,6 +561,19 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             logger.exception("hash dedupe failed; passing through tool result")
 
+    try:
+        context_memory.observe_tool(
+            session_id,
+            tool_name,
+            tool_input,
+            captured_response,
+            tool_use_id=tool_use_id,
+            artifact_handle=artifact_handle,
+            cwd=cwd,
+        )
+    except Exception:
+        logger.exception("task ledger update failed; continuing without ledger state")
+
     if replaced:
         # Codex documents this pair as model-visible feedback replacement.
         # continue:false prevents normal processing of the original result and,
@@ -535,12 +619,12 @@ def _build_messages(events: list[dict], last_assistant_message: str) -> list[dic
 
 
 def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
-    """Pair PreToolUse + PostToolUse events by turn_id to build ToolCall list.
+    """Pair PreToolUse + PostToolUse by provider ID, with a turn fallback.
 
     Codex fires PreToolUse then PostToolUse for each tool invocation (Bash, or
     an MCP tool call when --image-lifecycle widens the hook matcher). They
-    share the same turn_id. Unmatched PreToolUse events (no PostToolUse) are
-    still recorded with tool_result=None.
+    A turn can contain multiple tool calls, so ``turn_id`` alone is not a
+    unique key. Unmatched PreToolUse events are retained with result=None.
 
     tool_name is read from the PostToolUse event, not the paired PreToolUse
     event: PostToolUse is guaranteed to carry it going forward, while
@@ -549,46 +633,145 @@ def _build_tool_calls(events: list[dict]) -> list[ToolCall]:
     event, hence the "Bash" fallback — every event recorded back when this
     pipeline was hardcoded Bash-only really was a Bash call.
     """
-    pre_events: dict[str | None, dict] = {}  # turn_id → event
+    pre_events: list[dict] = []
     tool_calls: list[ToolCall] = []
     counter = 0
+    emitted_ids: set[str] = set()
+
+    def _synthetic_id(turn_id: object) -> str:
+        nonlocal counter
+        base = f"codex-turn-{turn_id}" if turn_id is not None else "codex-tool"
+        candidate = base
+        while candidate in emitted_ids:
+            counter += 1
+            candidate = f"{base}-{counter}"
+        emitted_ids.add(candidate)
+        return candidate
 
     for ev in events:
         if ev.get("event_type") == "PreToolUse":
-            turn_id = ev.get("turn_id")
-            pre_events[turn_id] = ev
+            pre_events.append(ev)
         elif ev.get("event_type") == "PostToolUse":
             turn_id = ev.get("turn_id")
-            pre = pre_events.pop(turn_id, None)
+            tool_use_id = ev.get("tool_use_id")
+            match_index = next(
+                (
+                    index
+                    for index, pre_event in enumerate(pre_events)
+                    if tool_use_id and pre_event.get("tool_use_id") == tool_use_id
+                ),
+                None,
+            )
+            if match_index is None:
+                match_index = next(
+                    (
+                        index
+                        for index, pre_event in enumerate(pre_events)
+                        if pre_event.get("turn_id") == turn_id
+                    ),
+                    None,
+                )
+            pre = pre_events.pop(match_index) if match_index is not None else None
             tool_input = pre.get("tool_input", {}) if pre else {}
             timestamp = (
                 pre.get("timestamp", ev.get("timestamp", "")) if pre else ev.get("timestamp", "")
             )
+            call_id = tool_use_id or (pre or {}).get("tool_use_id")
+            if call_id:
+                call_id = str(call_id)
+                emitted_ids.add(call_id)
+            else:
+                call_id = _synthetic_id(turn_id)
             tool_calls.append(
                 ToolCall(
-                    tool_use_id=f"codex-turn-{turn_id}",
+                    tool_use_id=call_id,
                     tool_name=ev.get("tool_name") or "Bash",
                     tool_input=tool_input,
                     tool_result=ev.get("tool_response"),
                     timestamp=timestamp,
                 )
             )
-            counter += 1
 
     # Any PreToolUse events with no matching PostToolUse (e.g. session killed mid-tool)
-    for pre in pre_events.values():
+    for pre in pre_events:
+        call_id = pre.get("tool_use_id")
+        if call_id:
+            call_id = str(call_id)
+            emitted_ids.add(call_id)
+        else:
+            call_id = _synthetic_id(pre.get("turn_id"))
         tool_calls.append(
             ToolCall(
-                tool_use_id=f"codex-tool-{counter}",
+                tool_use_id=call_id,
                 tool_name=pre.get("tool_name") or "Bash",
                 tool_input=pre.get("tool_input", {}),
                 tool_result=None,
                 timestamp=pre.get("timestamp", ""),
             )
         )
-        counter += 1
 
     return tool_calls
+
+
+def _reconcile_messages(
+    transcript_messages: list[dict], fallback_messages: list[dict]
+) -> list[dict]:
+    """Keep transcript content primary and add only hook-only occurrences."""
+    if not transcript_messages:
+        return fallback_messages
+    merged = list(transcript_messages)
+    remaining = [(message.get("role"), message.get("content")) for message in transcript_messages]
+    remaining_roles = [message.get("role") for message in transcript_messages]
+    for message in fallback_messages:
+        fingerprint = (message.get("role"), message.get("content"))
+        if fingerprint in remaining:
+            remaining.remove(fingerprint)
+            remaining_roles.remove(message.get("role"))
+        elif message.get("role") in remaining_roles:
+            # The transcript is authoritative when both sources describe the
+            # same ordinal turn differently; adding both would be duplication.
+            remaining_roles.remove(message.get("role"))
+        else:
+            merged.append(message)
+    return sorted(merged, key=lambda message: message.get("timestamp") or "")
+
+
+def _tool_fingerprint(call: ToolCall) -> tuple[str, str]:
+    return call.tool_name, json.dumps(call.tool_input, sort_keys=True, separators=(",", ":"))
+
+
+def _reconcile_tool_calls(
+    transcript_calls: list[ToolCall], fallback_calls: list[ToolCall]
+) -> list[ToolCall]:
+    """Merge hook-only calls into the transcript without duplicating matched calls."""
+    if not transcript_calls:
+        return fallback_calls
+
+    merged = list(transcript_calls)
+    unmatched_indices = set(range(len(transcript_calls)))
+    by_id = {
+        call.tool_use_id: index for index, call in enumerate(transcript_calls) if call.tool_use_id
+    }
+    for fallback in fallback_calls:
+        match_index = by_id.get(fallback.tool_use_id)
+        if match_index not in unmatched_indices:
+            fingerprint = _tool_fingerprint(fallback)
+            match_index = next(
+                (
+                    index
+                    for index in sorted(unmatched_indices)
+                    if _tool_fingerprint(transcript_calls[index]) == fingerprint
+                ),
+                None,
+            )
+        if match_index is None:
+            merged.append(fallback)
+            continue
+        unmatched_indices.discard(match_index)
+        transcript_call = transcript_calls[match_index]
+        if transcript_call.tool_result is None and fallback.tool_result is not None:
+            transcript_call.tool_result = fallback.tool_result
+    return sorted(merged, key=lambda call: call.timestamp or "")
 
 
 _TRANSFORMATION_FIELDS = (
@@ -636,6 +819,15 @@ def _attach_transformations(
 
     cursor = 0
     for fallback in fallback_calls:
+        transformation = transformations.get(fallback.tool_use_id)
+        id_match = next(
+            (call for call in tool_calls if call.tool_use_id == fallback.tool_use_id),
+            None,
+        )
+        if id_match is not None:
+            if transformation:
+                _apply_transformation(id_match, transformation)
+            continue
         command = _tool_command(fallback)
         if command is None:
             continue
@@ -649,18 +841,17 @@ def _attach_transformations(
         )
         if match_index is None:
             continue
-        transformation = transformations.get(fallback.tool_use_id)
         if transformation:
             _apply_transformation(tool_calls[match_index], transformation)
         cursor = match_index + 1
 
 
-async def _upload_and_close(record: HookSessionRecord) -> None:
+async def _upload_and_close(record: HookSessionRecord) -> UploadOutcome:
     """upload_single, then close the module-level aiohttp session before this
     asyncio.run() call's event loop is torn down -- see claude_handler's
     identical helper for why (aiohttp session/loop binding)."""
     try:
-        await upload_single(record)
+        return await upload_single(record)
     finally:
         await close_session()
 
@@ -679,7 +870,7 @@ def _handle_stop(session_id: str, payload: dict) -> None:
             model = model or ev.get("model")
             break
 
-    ended_at = now
+    ended_at = payload.get("timestamp", now)
     try:
         duration_s = (
             datetime.fromisoformat(ended_at) - datetime.fromisoformat(started_at)
@@ -701,14 +892,21 @@ def _handle_stop(session_id: str, payload: dict) -> None:
 
     # The transcript is richer than the hook payloads, but the hook-event
     # reconstruction remains as a safety net for missing or unreadable transcripts.
-    messages = transcript_data.messages or fallback_messages
-    tool_calls = transcript_data.tool_calls or fallback_tool_calls
+    messages = _reconcile_messages(transcript_data.messages, fallback_messages)
+    tool_calls = _reconcile_tool_calls(transcript_data.tool_calls, fallback_tool_calls)
     _attach_transformations(tool_calls, fallback_tool_calls, events)
     if _config.dlp_enabled():
         dlp.reconcile_captured_tool_results(tool_calls, events)
     file_diffs = transcript_data.file_diffs
     model = transcript_data.model or model
     usage = transcript_data.usage
+    capture_warnings: list[str] = []
+    if not transcript_path:
+        capture_warnings.append("transcript_path_missing_hook_fallback")
+    elif not transcript_data.messages and not transcript_data.tool_calls:
+        capture_warnings.append("transcript_empty_or_unrecognized_hook_fallback")
+    if not messages and not tool_calls:
+        capture_warnings.append("empty_session_content")
 
     record = HookSessionRecord(
         session_id=session_id,
@@ -727,14 +925,33 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         usage_source="provider" if usage else None,
         mechanism_savings=aggregate_mechanism_savings(events),
         hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "codex"),
+        **native_metadata(
+            "codex",
+            adapter_name="codex_cli_hooks",
+            model=model,
+            provider="openai",
+            agent_client_version=(
+                payload.get("agent_client_version")
+                or payload.get("codex_version")
+                or payload.get("version")
+            ),
+            capabilities=dict(CODEX_CAPTURE_CAPABILITIES),
+            warnings=capture_warnings,
+            extra_fields={"client_session_id": session_id},
+        ),
     )
 
-    asyncio.run(_upload_and_close(record))
+    outcome = asyncio.run(_upload_and_close(record))
     schedule_session_end_update()
+    cleanup_safe = bool(getattr(outcome, "cleanup_safe", outcome is None))
+    if not cleanup_safe:
+        return
     for event in events:
         if event.get("event_type") == "DLPTempFile":
             with contextlib.suppress(OSError):
                 os.unlink(event["path"])
+    # Compatibility with callers that still monkeypatch the legacy
+    # None-returning uploader; production always returns UploadOutcome.
     session_store.cleanup(session_id)
 
 

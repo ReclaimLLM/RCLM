@@ -33,15 +33,34 @@ from typing import Literal
 
 from rclm.hooks import dedupe, image_lifecycle
 from rclm.hooks.read_cache import process_read
-from rclm.hooks.tool_result_transform import compact_tool_result, extract_text_envelope
-from rclm.replay.read_request import build_read_request
+from rclm.hooks.result_delta import process_delta
+from rclm.hooks.tool_result_transform import compact_tool_result, extract_tool_text_envelope
+from rclm.hooks.tool_semantics import supports_result_compaction
+from rclm.replay.read_request import build_antigravity_view_request, build_read_request
 from rclm.replay.tokenizer import count_tokens
 
-Mechanism = Literal["range_cache", "shell_compaction", "hash_dedupe"]
-ALL_MECHANISMS: tuple[Mechanism, ...] = ("range_cache", "shell_compaction", "hash_dedupe")
+Mechanism = Literal["range_cache", "shell_compaction", "stateful_delta", "hash_dedupe"]
+ALL_MECHANISMS: tuple[Mechanism, ...] = (
+    "range_cache",
+    "shell_compaction",
+    "stateful_delta",
+    "hash_dedupe",
+)
 
-_SHELL_TOOL_NAMES = frozenset({"bash", "exec", "exec_command", "shell"})
-_READ_ATTEMPT_TOOL_NAMES = frozenset({"read", "bash", "exec", "exec_command", "shell"})
+_READ_ATTEMPT_TOOL_NAMES = frozenset(
+    {
+        "read",
+        "read_file",
+        "read_text_file",
+        "view_file",
+        "bash",
+        "exec",
+        "exec_command",
+        "shell",
+        "run_command",
+        "run_shell_command",
+    }
+)
 _IMAGE_SNIFF_CHARS = 4096
 
 Classification = Literal["shaped", "uncovered", "unresolvable", "image"]
@@ -151,10 +170,6 @@ def _is_image(tool_response: object) -> bool:
     return False
 
 
-def _is_shell_family(tool_name: str) -> bool:
-    return tool_name.lower() in _SHELL_TOOL_NAMES
-
-
 def _try_range_cache(
     index: int,
     tool_name: str,
@@ -181,7 +196,7 @@ def _try_range_cache(
         # unresolvable — we cannot tell whether H1 would have reduced it.
         # A Bash call that isn't a recognizable file read is simply not
         # claimed by H1 and falls through to shell compaction / dedupe.
-        if tool_name.lower() == "read":
+        if tool_name.lower() in {"read", "read_file", "read_text_file", "view_file"}:
             return (
                 None,
                 ToolCallReplay(
@@ -198,12 +213,19 @@ def _try_range_cache(
         return None, None, read_state
 
     request, trailing = built
-    block = original_text[: len(original_text) - len(trailing)] if trailing else original_text
+    prefix = ""
+    if tool_name.lower() == "view_file":
+        antigravity = build_antigravity_view_request(tool_input, original_text)
+        if antigravity is None:
+            return None, None, read_state
+        request, block, prefix, trailing = antigravity
+    else:
+        block = original_text[: len(original_text) - len(trailing)] if trailing else original_text
     decision = process_read(request, block, read_state, turn=turn)
     read_state = decision.state
     original_tokens = count_tokens(original_text)
     if decision.cache_hit and decision.replacement is not None:
-        compressed_text = decision.replacement + trailing
+        compressed_text = prefix + decision.replacement + trailing
         return (
             ToolCallReplay(
                 index=index,
@@ -232,14 +254,14 @@ def _try_range_cache(
     )
 
 
-def _try_shell_compaction(
+def _try_tool_compaction(
     index: int,
     tool_name: str,
     tool_input: object,
     tool_response: object,
     original_text: str,
 ) -> ToolCallReplay | None:
-    if not _is_shell_family(tool_name):
+    if not supports_result_compaction(tool_name):
         return None
     decision = compact_tool_result(tool_name, tool_input, tool_response)
     original_tokens = count_tokens(original_text)
@@ -261,6 +283,31 @@ def _try_shell_compaction(
         original_tokens=original_tokens,
         compressed_tokens=original_tokens,
         is_reachable=True,
+    )
+
+
+def _try_stateful_delta(
+    index: int,
+    tool_name: str,
+    tool_input: object,
+    original_text: str,
+    delta_state: dict,
+) -> tuple[ToolCallReplay | None, dict]:
+    decision = process_delta(tool_name, tool_input, original_text, delta_state)
+    original_tokens = count_tokens(original_text)
+    if decision.replacement is None:
+        return None, decision.state
+    return (
+        ToolCallReplay(
+            index=index,
+            tool_name=tool_name,
+            classification="shaped",
+            mechanism="stateful_delta",
+            original_tokens=original_tokens,
+            compressed_tokens=count_tokens(decision.replacement),
+            is_reachable=True,
+        ),
+        decision.state,
     )
 
 
@@ -322,12 +369,13 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
     """Replay one session blob's tool_calls, in captured order.
 
     Deterministic and offline: no disk, no network, no wall-clock in the
-    accounting. `mechanisms` controls which of range_cache / shell_compaction
-    / hash_dedupe are attempted — pass ("shell_compaction",) alone to
+    accounting. `mechanisms` controls which of range_cache / shell_compaction /
+    stateful_delta / hash_dedupe are attempted — pass ("shell_compaction",) alone to
     reproduce Report 1, whose replay only covered that mechanism.
     """
     result = ReplayResult()
     read_state: dict = {}
+    delta_state: dict = {}
     dedupe_state: dict = {}
 
     for index, tool_call in enumerate(blob.get("tool_calls") or []):
@@ -354,7 +402,7 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
             )
             continue
 
-        envelope = extract_text_envelope(tool_response)
+        envelope = extract_tool_text_envelope(tool_name, tool_response)
         if envelope is None:
             result.calls.append(_uncovered_from_full_text(index, tool_name, tool_response))
             continue
@@ -373,8 +421,15 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
                 captured_read_request,
             )
 
+        if record is None and "stateful_delta" in mechanisms:
+            delta_record, delta_state = _try_stateful_delta(
+                index, tool_name, tool_input, original_text, delta_state
+            )
+            if delta_record is not None:
+                record = delta_record
+
         if record is None and "shell_compaction" in mechanisms:
-            shell_record = _try_shell_compaction(
+            shell_record = _try_tool_compaction(
                 index, tool_name, tool_input, tool_response, original_text
             )
             if shell_record is not None:

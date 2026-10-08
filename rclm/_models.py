@@ -100,6 +100,7 @@ class HookSessionRecord:
     )
     hook_policy_snapshot: dict | None = None
     is_sync: bool = False  # True for historical sync uploads; server skips if session exists
+    resync: bool = False  # True when force re-syncing; server overwrites existing session
     capture_schema_version: int = 1
     capture_source: str = "native_agent"
     agent_client: str | None = None

@@ -552,8 +552,6 @@ async def _upload_and_close(record: HookSessionRecord):
 
 
 def _handle_session_end(session_id: str, payload: dict) -> None:
-    if session_store.has_marker(session_id, "finalized"):
-        return
     now = _now()
     events = session_store.read_events(session_id)
 
@@ -604,11 +602,9 @@ def _handle_session_end(session_id: str, payload: dict) -> None:
     )
 
     outcome = asyncio.run(_upload_and_close(record))
-    if not getattr(outcome, "cleanup_safe", outcome is None):
-        return
-    schedule_session_end_update()
-    session_store.cleanup(session_id)
-    session_store.write_marker(session_id, "finalized")
+    if getattr(outcome, "cleanup_safe", outcome is None):
+        schedule_session_end_update()
+        session_store.cleanup_events(session_id)
 
 
 # ---------------------------------------------------------------------------

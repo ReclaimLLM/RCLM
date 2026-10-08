@@ -32,6 +32,13 @@ def _target(tool_name: str, tool_input: dict) -> str | None:
         return tool_input.get("file_path")
     if tool_name == "Bash":
         return tool_input.get("command")
+    normalized = tool_name.lower()
+    if normalized == "view_file":
+        return tool_input.get("AbsolutePath") or tool_input.get("file_path")
+    if normalized in {"write_to_file", "replace_file_content"}:
+        return tool_input.get("TargetFile") or tool_input.get("file_path")
+    if normalized == "run_command":
+        return tool_input.get("CommandLine") or tool_input.get("command")
     return None
 
 

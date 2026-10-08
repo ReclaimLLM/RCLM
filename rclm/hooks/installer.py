@@ -37,6 +37,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -183,13 +184,37 @@ _CURSOR_HOOKS_TO_INJECT: dict[str, list[dict]] = {
 _ANTIGRAVITY_HOOK_NAME = "rclm-antigravity-hooks"
 _ANTIGRAVITY_HOOKS_TO_INJECT: dict = {
     _ANTIGRAVITY_HOOK_NAME: {
+        "PreInvocation": [
+            {"type": "command", "command": "rclm-antigravity-hooks PreInvocation", "timeout": 30}
+        ],
+        "PostInvocation": [
+            {"type": "command", "command": "rclm-antigravity-hooks PostInvocation", "timeout": 30}
+        ],
         "PreToolUse": [
             {
                 "matcher": "",
-                "hooks": [{"type": "command", "command": "rclm-antigravity-hooks PreToolUse"}],
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "rclm-antigravity-hooks PreToolUse",
+                        "timeout": 30,
+                    }
+                ],
             }
         ],
-        "Stop": [{"type": "command", "command": "rclm-antigravity-hooks Stop"}],
+        "PostToolUse": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "rclm-antigravity-hooks PostToolUse",
+                        "timeout": 30,
+                    }
+                ],
+            }
+        ],
+        "Stop": [{"type": "command", "command": "rclm-antigravity-hooks Stop", "timeout": 30}],
     }
 }
 
@@ -355,9 +380,9 @@ Subsequent installs without --api-key reuse the saved config.""",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Claude Code statusline showing context usage, rate limits, peak/off-peak, model, "
-            "git branch, and lines changed. On by default; pass --no-statusline to disable. "
-            "An existing non-rclm statusLine is backed up and restored on uninstall"
+            "Claude Code and Codex statusline showing context usage, rate limits, model, "
+            "git branch, etc. On by default; pass --no-statusline to disable. "
+            "An existing statusLine is backed up and restored on uninstall"
         ),
     )
     parser.add_argument(
@@ -620,7 +645,9 @@ def _apply_statusline(settings: dict) -> None:
     }
 
 
-def _install_claude(use_global: bool, compress_enabled: bool, statusline_enabled: bool) -> None:
+def _install_claude(
+    use_global: bool, compress_enabled: bool, statusline_enabled: bool = True
+) -> None:
     path = (
         Path.home() / ".claude" / "settings.json"
         if use_global
@@ -658,7 +685,138 @@ def _install_gemini(use_global: bool) -> None:
     print(f"rclm hooks installed into {path}")
 
 
-def _install_codex(use_global: bool) -> None:
+_CODEX_DEFAULT_STATUSLINE: list[str] = [
+    "model-with-reasoning",
+    "current-dir",
+    "git-branch",
+    "context-used",
+    "context-remaining",
+    "five-hour-limit",
+    "weekly-limit",
+]
+
+
+def _apply_codex_statusline(config_path: Path) -> None:
+    """Configure or update Codex's native TUI status_line in config.toml."""
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+
+    lines = existing.splitlines(keepends=True)
+    tui_start = -1
+    for i, line in enumerate(lines):
+        if line.strip() == "[tui]":
+            tui_start = i
+            break
+
+    saved_config = _config.load()
+    existing_backup = saved_config.get("codex_statusline_backup")
+
+    if tui_start == -1:
+        if existing_backup is None:
+            _config.patch(
+                codex_statusline_backup={
+                    "status_line": None,
+                    "created_tui": True,
+                    "added_colors": True,
+                }
+            )
+        block = (
+            "\n[tui]\n"
+            f"status_line = {json.dumps(_CODEX_DEFAULT_STATUSLINE)}\n"
+            "status_line_use_colors = true\n"
+        )
+        if existing and not existing.endswith("\n"):
+            block = "\n" + block
+        config_path.write_text(existing + block, encoding="utf-8")
+        print(f"Codex statusline configured in {config_path}")
+        return
+
+    tui_end = len(lines)
+    for i in range(tui_start + 1, len(lines)):
+        if lines[i].strip().startswith("["):
+            tui_end = i
+            break
+
+    tui_lines = lines[tui_start:tui_end]
+    tui_text = "".join(tui_lines)
+
+    m = re.search(r"(status_line\s*=\s*(?:\[[^\]]*\]|null|false))", tui_text, re.DOTALL)
+    if m:
+        full_match = m.group(1)
+        raw_val = full_match.split("=", 1)[1].strip()
+        clean = "\n".join(item_line.split("#")[0].strip() for item_line in raw_val.splitlines())
+        clean = re.sub(r",\s*\]", "]", clean)
+        try:
+            current_items = json.loads(clean) if clean.startswith("[") else []
+        except Exception:
+            current_items = []
+
+        model_present = any(item in current_items for item in ("model", "model-with-reasoning"))
+        dir_present = any(item in current_items for item in ("current-dir", "project-root"))
+        git_present = "git-branch" in current_items
+        ctx_used_present = "context-used" in current_items
+        ctx_rem_present = "context-remaining" in current_items
+        five_hr_present = "five-hour-limit" in current_items
+        wk_present = "weekly-limit" in current_items
+
+        missing = []
+        if not model_present:
+            missing.append("model-with-reasoning")
+        if not dir_present:
+            missing.append("current-dir")
+        if not git_present:
+            missing.append("git-branch")
+        if not ctx_used_present:
+            missing.append("context-used")
+        if not ctx_rem_present:
+            missing.append("context-remaining")
+        if not five_hr_present:
+            missing.append("five-hour-limit")
+        if not wk_present:
+            missing.append("weekly-limit")
+
+        if not missing:
+            print(f"Codex statusline already configured in {config_path}")
+            return
+
+        added_colors = "status_line_use_colors" not in tui_text
+        new_items = list(current_items) + missing
+        new_status_line = f"status_line = {json.dumps(new_items)}"
+        new_tui_text = tui_text.replace(full_match, new_status_line, 1)
+        if added_colors:
+            new_tui_text = new_tui_text.rstrip() + "\nstatus_line_use_colors = true\n"
+
+        if existing_backup is None:
+            _config.patch(
+                codex_statusline_backup={
+                    "status_line": raw_val,
+                    "created_tui": False,
+                    "added_colors": added_colors,
+                }
+            )
+
+        new_content = "".join(lines[:tui_start]) + new_tui_text + "".join(lines[tui_end:])
+        config_path.write_text(new_content, encoding="utf-8")
+        print(f"Codex statusline updated in {config_path}")
+    else:
+        added_colors = "status_line_use_colors" not in tui_text
+        if existing_backup is None:
+            _config.patch(
+                codex_statusline_backup={
+                    "status_line": None,
+                    "created_tui": False,
+                    "added_colors": added_colors,
+                }
+            )
+        insertion = f"status_line = {json.dumps(_CODEX_DEFAULT_STATUSLINE)}\n"
+        if added_colors:
+            insertion += "status_line_use_colors = true\n"
+        lines.insert(tui_start + 1, insertion)
+        config_path.write_text("".join(lines), encoding="utf-8")
+        print(f"Codex statusline configured in {config_path}")
+
+
+def _install_codex(use_global: bool, statusline_enabled: bool = True) -> None:
     path = Path.home() / ".codex" / "hooks.json" if use_global else Path(".codex") / "hooks.json"
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -669,6 +827,12 @@ def _install_codex(use_global: bool) -> None:
     _merge_settings_hooks(data, hooks)
     _write_json(path, data)
     print(f"rclm hooks installed into {path}")
+
+    if statusline_enabled:
+        config_path = (
+            Path.home() / ".codex" / "config.toml" if use_global else Path(".codex") / "config.toml"
+        )
+        _apply_codex_statusline(config_path)
 
 
 def _install_cursor(use_global: bool) -> None:
@@ -922,12 +1086,7 @@ def main() -> None:
             elif provider == "gemini":
                 _install_gemini(use_global)
             elif provider == "codex":
-                _install_codex(use_global)
-                print(
-                    "Codex CLI already shows context and rate-limit usage natively — run "
-                    "`/statusline` inside codex and enable context-used, context-remaining, "
-                    "five-hour-limit, and weekly-limit."
-                )
+                _install_codex(use_global, statusline_enabled=statusline_enabled)
             elif provider == "cursor":
                 _install_cursor(use_global)
             elif provider == "openclaw":

@@ -191,3 +191,209 @@ def test_back_to_back_tool_call_steps_are_not_cross_paired(tmp_path):
     assert data.tool_calls[0].tool_result is None
     assert data.tool_calls[1].tool_result is None
     assert len(data.messages) == 2
+
+
+def test_tool_call_followed_by_user_input_is_not_swallowed(tmp_path):
+    """A tool-call entry followed directly by USER_INPUT (e.g. interruption or prompt)
+    must leave tool_result=None and preserve USER_INPUT as a user message."""
+    path = _write(
+        tmp_path,
+        [
+            {
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t0",
+                "tool_calls": [{"name": "run_command", "args": {"cmd": "sleep 10"}}],
+            },
+            {
+                "step_index": 1,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "t1",
+                "content": "<USER_REQUEST>stop that</USER_REQUEST>",
+            },
+        ],
+    )
+    data = parse_transcript(str(path))
+
+    assert len(data.tool_calls) == 1
+    assert data.tool_calls[0].tool_result is None
+    assert len(data.messages) == 2
+    assert data.messages[0]["role"] == "assistant"
+    assert data.messages[1]["role"] == "user"
+    assert data.messages[1]["content"] == "<USER_REQUEST>stop that</USER_REQUEST>"
+
+
+def test_tool_call_followed_by_planner_response_is_not_swallowed(tmp_path):
+    """A tool-call entry followed by a plain text PLANNER_RESPONSE must preserve
+    the text response as an assistant message rather than folding it into tool_result."""
+    path = _write(
+        tmp_path,
+        [
+            {
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t0",
+                "tool_calls": [{"name": "run_command", "args": {"cmd": "ls"}}],
+            },
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t1",
+                "content": "I finished the task.",
+            },
+        ],
+    )
+    data = parse_transcript(str(path))
+
+    assert len(data.tool_calls) == 1
+    assert data.tool_calls[0].tool_result is None
+    assert len(data.messages) == 2
+    assert data.messages[0]["role"] == "assistant"
+    assert data.messages[1]["role"] == "assistant"
+    assert data.messages[1]["content"] == "I finished the task."
+
+
+def test_extracts_cwd_and_model_metadata(tmp_path):
+    """CWD and model name should be extracted from directory tags and settings changes."""
+    path = _write(
+        tmp_path,
+        [
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "t0",
+                "content": (
+                    "<USER_REQUEST>help</USER_REQUEST>\n"
+                    "<ADDITIONAL_METADATA>\n@[proj] is a [Directory]:\n/my/workspace\n</ADDITIONAL_METADATA>\n"
+                    "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (High). No need to comment.\n</USER_SETTINGS_CHANGE>"
+                ),
+            },
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t1",
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": "ls", "Cwd": "/my/workspace"}}
+                ],
+            },
+        ],
+    )
+    data = parse_transcript(str(path))
+    assert data.cwd == "/my/workspace"
+    assert data.model == "Gemini 3.8 Flash (High)"
+
+
+def test_extracts_file_diffs_from_write_and_replace(tmp_path):
+    path = _write(
+        tmp_path,
+        [
+            {
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t0",
+                "tool_calls": [
+                    {
+                        "name": "write_to_file",
+                        "args": {
+                            "TargetFile": "/repo/hello.py",
+                            "CodeContent": "print('hello')\n",
+                        },
+                    }
+                ],
+            },
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t1",
+                "tool_calls": [
+                    {
+                        "name": "replace_file_content",
+                        "args": {
+                            "TargetFile": "/repo/hello.py",
+                            "TargetContent": "print('hello')\n",
+                            "ReplacementContent": "print('hello world')\n",
+                        },
+                    }
+                ],
+            },
+        ],
+    )
+    data = parse_transcript(str(path))
+    assert len(data.file_diffs) == 2
+
+    d0 = data.file_diffs[0]
+    assert d0.path == "/repo/hello.py"
+    assert d0.before is None
+    assert d0.after == "print('hello')\n"
+    assert "+print('hello')" in d0.unified_diff
+
+    d1 = data.file_diffs[1]
+    assert d1.path == "/repo/hello.py"
+    assert d1.before == "print('hello')\n"
+    assert d1.after == "print('hello world')\n"
+    assert "-print('hello')" in d1.unified_diff
+    assert "+print('hello world')" in d1.unified_diff
+
+
+def test_reads_transcript_full_when_present(tmp_path):
+    compact_path = tmp_path / "transcript.jsonl"
+    full_path = tmp_path / "transcript_full.jsonl"
+
+    compact_path.write_text(
+        json.dumps(
+            {
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t0",
+                "truncated_fields": ["tool_calls"],
+                "tool_calls": [
+                    {
+                        "name": "write_to_file",
+                        "args": {
+                            "TargetFile": '"/repo/app.py"',
+                            "CodeContent": '"truncated"',
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    full_path.write_text(
+        json.dumps(
+            {
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t0",
+                "tool_calls": [
+                    {
+                        "name": "write_to_file",
+                        "args": {
+                            "TargetFile": "/repo/app.py",
+                            "CodeContent": "def full_content(): pass\n",
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    data = parse_transcript(str(compact_path))
+    assert len(data.file_diffs) == 1
+    assert data.file_diffs[0].path == "/repo/app.py"
+    assert data.file_diffs[0].after == "def full_content(): pass\n"
+    assert "+def full_content(): pass" in data.file_diffs[0].unified_diff

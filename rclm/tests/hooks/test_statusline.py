@@ -325,3 +325,115 @@ def test_uninstall_restores_backed_up_statusline(tmp_path, monkeypatch):
     assert settings["statusLine"] == {"type": "command", "command": "my-custom-statusline"}
     config = json.loads((tmp_path / "config.json").read_text())
     assert not config.get("statusline_backup")
+
+
+# ---------------------------------------------------------------------------
+# Codex statusline wiring
+# ---------------------------------------------------------------------------
+
+
+def test_codex_statusline_installed_by_default(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-with-mcp")
+
+    config_path = tmp_path / ".codex" / "config.toml"
+    assert config_path.exists()
+    content = config_path.read_text(encoding="utf-8")
+    assert "[tui]" in content
+    assert "status_line =" in content
+    for item in installer._CODEX_DEFAULT_STATUSLINE:
+        assert item in content
+
+
+def test_codex_no_statusline_skips_install(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-statusline", "--no-with-mcp")
+
+    config_path = tmp_path / ".codex" / "config.toml"
+    assert not config_path.exists()
+
+
+def test_codex_statusline_merges_missing_items_and_preserves_existing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        '[tui]\nstatus_line = ["model-with-reasoning", "current-dir", "five-hour-limit", "weekly-limit"]\nstatus_line_use_colors = true\nscreen_reader = true\n',
+        encoding="utf-8",
+    )
+
+    _run_install(monkeypatch, tmp_path, "--no-with-mcp")
+
+    content = config_path.read_text(encoding="utf-8")
+    assert "screen_reader = true" in content
+    assert "git-branch" in content
+    assert "context-used" in content
+    assert "context-remaining" in content
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["codex_statusline_backup"]["status_line"] == (
+        '["model-with-reasoning", "current-dir", "five-hour-limit", "weekly-limit"]'
+    )
+
+
+def test_codex_statusline_already_configured_is_noop(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    initial_content = '[tui]\nstatus_line = ["model-with-reasoning", "current-dir", "git-branch", "context-used", "context-remaining", "five-hour-limit", "weekly-limit"]\nstatus_line_use_colors = true\n'
+    config_path.write_text(initial_content, encoding="utf-8")
+
+    _run_install(monkeypatch, tmp_path, "--no-with-mcp")
+
+    assert config_path.read_text(encoding="utf-8") == initial_content
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert "codex_statusline_backup" not in config
+
+
+def test_codex_uninstall_restores_backed_up_statusline(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    initial_content = '[tui]\nstatus_line = ["model-with-reasoning", "current-dir", "five-hour-limit", "weekly-limit"]\nstatus_line_use_colors = true\nscreen_reader = true\n'
+    config_path.write_text(initial_content, encoding="utf-8")
+
+    _run_install(monkeypatch, tmp_path, "--no-with-mcp")
+    _run_uninstall(monkeypatch)
+
+    restored = config_path.read_text(encoding="utf-8")
+    assert restored.strip() == initial_content.strip()
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert not config.get("codex_statusline_backup")
+
+
+def test_codex_uninstall_removes_statusline_if_created_by_rclm(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--no-with-mcp")
+
+    config_path = tmp_path / ".codex" / "config.toml"
+    assert config_path.exists()
+
+    _run_uninstall(monkeypatch)
+
+    assert not config_path.exists()
+
+
+def test_codex_statusline_coexists_with_mcp(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(installer, "_resolve_binary", lambda name: name)
+    monkeypatch.setattr("rclm.mcp_install._resolve_binary", lambda: "/bin/rclm-mcp")
+
+    _run_install(monkeypatch, tmp_path)  # with-mcp by default
+
+    config_path = tmp_path / ".codex" / "config.toml"
+    assert config_path.exists()
+    content = config_path.read_text(encoding="utf-8")
+    assert "[tui]" in content
+    assert "status_line =" in content
+    assert "[mcp_servers.reclaimllm]" in content
+
+    _run_uninstall(monkeypatch)
+
+    # Statusline [tui] is removed, but MCP server entry is preserved
+    content_after = config_path.read_text(encoding="utf-8")
+    assert "[tui]" not in content_after
+    assert "[mcp_servers.reclaimllm]" in content_after

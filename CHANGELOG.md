@@ -3,6 +3,33 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.31] — 2026-10-08
+
+### Added
+- Implemented full Antigravity lifecycle hooks: `PreInvocation` (context pack, signals nudge, brevity, handoff advisor), `PostInvocation` (turn tracking), `PreToolUse` (DLP, loop breaker, view bounding, shell compression), `PostToolUse` (tool result tracking, cache invalidation), and `Stop` cumulative session capture (`rclm/hooks/antigravity_handler.py`)
+- Added Antigravity unified file diff extraction from `write_to_file` and `replace_file_content` calls, reading untruncated content from `transcript_full.jsonl` and handling quoted argument strings (`rclm/hooks/antigravity_transcript.py`)
+- Extended historical sync to discover Antigravity transcripts across all brain locations (`~/.gemini/{antigravity-cli,antigravity,antigravity-ide}/brain`), extracting model, working directory, and file diffs (`rclm/hooks/historical_sync.py`)
+- Added `resync` flag to `HookSessionRecord` and `--resync` argument to `rclm-sync` and installer to force overwrite existing sessions in ReclaimLLM storage (`rclm/_models.py`, `rclm/hooks/historical_sync.py`, `rclm/hooks/installer.py`)
+- Added automatic Codex statusline configuration in `config.toml` (`[tui].status_line`) during hook install with automatic backup and restore (`rclm/hooks/installer.py`, `rclm/hooks/uninstaller.py`, `rclm/tests/hooks/test_statusline.py`)
+
+### Changed
+- Configured Antigravity hook registrations with 30-second timeouts across PreInvocation, PostInvocation, PreToolUse, PostToolUse, and Stop (`rclm/hooks/installer.py`, `rclm/hooks/uninstaller.py`)
+- Updated historical sync session index to use canonical `_sync_key` hashes instead of raw file paths (`rclm/hooks/historical_sync.py`)
+
+### Fixed
+- Fixed multi-turn Antigravity sessions dropping subsequent turns by removing the `finalized` stop guard and preserving session state across turns (`rclm/hooks/antigravity_handler.py`)
+- Fixed Antigravity transcript parsing swallowing user requests, planner responses, system messages, and checkpoints as tool results by enforcing strict `_is_tool_result_entry` pairing (`rclm/hooks/antigravity_transcript.py`)
+- Fixed Gemini multi-turn session persistence by cleaning only transient events rather than purging the session directory on intermediate ends (`rclm/hooks/gemini_handler.py`)
+- Fixed loop breaker tool target resolution for Antigravity tools (`view_file`, `write_to_file`, `replace_file_content`, `run_command`) (`rclm/hooks/loop_breaker.py`)
+
+### Security
+- Added DLP credential checks and denial responses to Antigravity `PreToolUse` to block secrets from being sent to external tools (`rclm/hooks/antigravity_handler.py`)
+
+### Performance
+- Bounded Antigravity `view_file` reads to line injection limits and compressed shell command invocations before execution in `PreToolUse` (`rclm/hooks/antigravity_handler.py`)
+
+---
+
 ## [v0.1.30] — 2026-09-21
 
 ### Added
@@ -40,6 +67,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Added automatic Codex statusline configuration in `config.toml` (`[tui].status_line`): `rclm-hooks-install` now configures native context and rate-limit footer items (`context-used`, `context-remaining`, `five-hour-limit`, `weekly-limit`, `git-branch`, etc.) without requiring manual `/statusline` execution, preserving existing items and restoring them on uninstall (`rclm/hooks/installer.py`, `rclm/hooks/uninstaller.py`).
 - Added a versioned native-agent capture contract with explicit client, model-provider, adapter, capability, and warning metadata across Claude Code, Codex CLI, Cursor, Antigravity, Gemini CLI, OpenClaw, and historical sync.
 - Added Antigravity historical transcript discovery and Cursor/Antigravity uninstall support.
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -185,9 +186,69 @@ def _uninstall_settings_provider(path: Path) -> None:
         print(f"Removed {count} rclm hook entr{'y' if count == 1 else 'ies'} from {path}.")
 
 
+def _uninstall_codex_statusline(config_path: Path) -> int:
+    """Restore or remove status_line in config.toml if modified by rclm."""
+    if not config_path.exists():
+        return 0
+    saved = _config.load()
+    backup = saved.get("codex_statusline_backup")
+    if not backup or not isinstance(backup, dict):
+        return 0
+
+    content = config_path.read_text(encoding="utf-8")
+    lines = content.splitlines(keepends=True)
+    tui_start = -1
+    for i, line in enumerate(lines):
+        if line.strip() == "[tui]":
+            tui_start = i
+            break
+
+    if tui_start == -1:
+        _config.patch(codex_statusline_backup=None)
+        return 0
+
+    tui_end = len(lines)
+    for i in range(tui_start + 1, len(lines)):
+        if lines[i].strip().startswith("["):
+            tui_end = i
+            break
+
+    if backup.get("created_tui"):
+        remaining = ("".join(lines[:tui_start]) + "".join(lines[tui_end:])).strip()
+        if not remaining:
+            config_path.unlink(missing_ok=True)
+        else:
+            config_path.write_text(remaining + "\n", encoding="utf-8")
+        _config.patch(codex_statusline_backup=None)
+        return 1
+
+    tui_lines = lines[tui_start:tui_end]
+    tui_text = "".join(tui_lines)
+
+    m = re.search(r"(status_line\s*=\s*(?:\[[^\]]*\]|null|false)\n?)", tui_text, re.DOTALL)
+    if m:
+        cur_match = m.group(1)
+        orig_sl = backup.get("status_line")
+        if orig_sl is None:
+            tui_text = tui_text.replace(cur_match, "", 1)
+        else:
+            tui_text = tui_text.replace(cur_match, f"status_line = {orig_sl}\n", 1)
+
+    if backup.get("added_colors"):
+        tui_text = re.sub(r"status_line_use_colors\s*=\s*true\n?", "", tui_text)
+
+    new_content = "".join(lines[:tui_start]) + tui_text + "".join(lines[tui_end:])
+    config_path.write_text(new_content, encoding="utf-8")
+    _config.patch(codex_statusline_backup=None)
+    return 1
+
+
 def _uninstall_codex(path: Path) -> None:
-    """Uninstall rclm hooks from a Codex hooks.json file (same nested format as Claude/Gemini)."""
+    """Uninstall rclm hooks from a Codex hooks.json file and restore statusline."""
     _uninstall_settings_provider(path)
+    config_path = path.parent / "config.toml"
+    if _uninstall_codex_statusline(config_path):
+        print(f"Restored original Codex statusline in {config_path}.")
 
 
 def _uninstall_cursor(path: Path) -> None:

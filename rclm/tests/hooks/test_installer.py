@@ -488,7 +488,10 @@ def test_antigravity_local_writes_expected_hook_shape(tmp_path, monkeypatch):
     data = _read_settings(hooks_path)
     assert data == installer._ANTIGRAVITY_HOOKS_TO_INJECT
     assert "Stop" in data["rclm-antigravity-hooks"]
-    assert "PostToolUse" not in data["rclm-antigravity-hooks"]
+    assert "PreInvocation" in data["rclm-antigravity-hooks"]
+    assert "PostInvocation" in data["rclm-antigravity-hooks"]
+    assert "PreToolUse" in data["rclm-antigravity-hooks"]
+    assert "PostToolUse" in data["rclm-antigravity-hooks"]
     assert not (tmp_path / ".gemini").exists()
 
 

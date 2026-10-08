@@ -184,14 +184,16 @@ def _iter_cursor_sessions() -> list[Path]:
 
 def _iter_antigravity_sessions() -> list[Path]:
     """Yield one canonical transcript per Antigravity conversation."""
-    base = Path.home() / ".gemini" / "antigravity-cli" / "brain"
-    if not base.exists():
-        return []
-    return [
-        path
-        for path in base.glob("*/.system_generated/logs/transcript.jsonl")
-        if path.is_file() and not path.is_symlink()
-    ]
+    paths: list[Path] = []
+    for dir_name in ("antigravity-cli", "antigravity", "antigravity-ide"):
+        base = Path.home() / ".gemini" / dir_name / "brain"
+        if base.exists():
+            paths.extend(
+                path
+                for path in base.glob("*/.system_generated/logs/transcript.jsonl")
+                if path.is_file() and not path.is_symlink()
+            )
+    return paths
 
 
 def _openclaw_canonical_path(path: Path) -> Path:
@@ -773,18 +775,19 @@ def _parse_antigravity_session(path: Path) -> HookSessionRecord | None:
     timestamps = [msg["timestamp"] for msg in transcript_data.messages if msg.get("timestamp")]
     started_at = min(timestamps) if timestamps else None
     ended_at = max(timestamps) if timestamps else None
-    analytics = compute_session_analytics(transcript_data.tool_calls, [])
+    analytics = compute_session_analytics(transcript_data.tool_calls, transcript_data.file_diffs)
+    model = transcript_data.model or "antigravity-unknown"
     return HookSessionRecord(
         session_id=path.parents[2].name,
-        cwd="",
+        cwd=transcript_data.cwd or "",
         started_at=started_at,
         ended_at=ended_at,
         duration_s=_timestamps_to_duration(started_at, ended_at),
         transcript_path=str(path),
-        model="antigravity-unknown",
+        model=model,
         messages=transcript_data.messages,
         tool_calls=transcript_data.tool_calls,
-        file_diffs=[],
+        file_diffs=transcript_data.file_diffs,
         tool_token_stats=analytics.get("tool_token_stats"),
         tool_call_count=analytics.get("tool_call_count"),
         unique_files_modified=analytics.get("unique_files_modified"),
@@ -793,8 +796,13 @@ def _parse_antigravity_session(path: Path) -> HookSessionRecord | None:
         **native_metadata(
             "antigravity",
             adapter_name="rclm-antigravity-historical",
-            model="antigravity-unknown",
-            capabilities={"transcript": True, "tool_calls": True, "file_diffs": False},
+            model=model,
+            provider="google",
+            capabilities={
+                "transcript": True,
+                "tool_calls": True,
+                "file_diffs": bool(transcript_data.file_diffs),
+            },
             warnings=transcript_data.warnings,
         ),
     )
@@ -1028,6 +1036,8 @@ def _parse_session(provider: str, path: Path) -> HookSessionRecord | None:
 async def _upload_all(
     by_provider: dict[str, list[Path]],
     already_synced: set[str],
+    *,
+    resync: bool = False,
 ) -> int:
     """Parse and upload all un-synced sessions. Returns count of uploaded records."""
     uploaded = 0
@@ -1042,6 +1052,8 @@ async def _upload_all(
             if record is None:
                 print(f"    ! {path.name}: empty or unreadable")
                 continue
+            if resync:
+                record.resync = True
             outcome = await upload_single(record)
             if getattr(outcome, "successful", outcome is None):
                 already_synced.add(sync_key)
@@ -1113,7 +1125,7 @@ def prompt_and_run_sync(
     already_synced: set[str] = set() if resync else _load_synced_index()
 
     new_count = sum(
-        1 for paths in by_provider.values() for p in paths if str(p) not in already_synced
+        1 for paths in by_provider.values() for p in paths if _sync_key(p) not in already_synced
     )
     if new_count == 0:
         if force_yes:
@@ -1121,9 +1133,9 @@ def prompt_and_run_sync(
         return
 
     provider_summary = ", ".join(
-        f"{len([p for p in paths if str(p) not in already_synced])} {name}"
+        f"{len([p for p in paths if _sync_key(p) not in already_synced])} {name}"
         for name, paths in by_provider.items()
-        if any(str(p) not in already_synced for p in paths)
+        if any(_sync_key(p) not in already_synced for p in paths)
     )
     if resync:
         print(f"\nResync: uploading all {new_count} session(s) ({provider_summary}).")
@@ -1143,7 +1155,7 @@ def prompt_and_run_sync(
 
     async def _run() -> int:
         try:
-            return await _upload_all(by_provider, already_synced)
+            return await _upload_all(by_provider, already_synced, resync=resync)
         finally:
             await close_session()
 

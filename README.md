@@ -23,7 +23,7 @@ pip install rclm
 
 ### 2. Setup Hooks
 ```bash
-# Integrates with Claude Code, Codex CLI, Cursor, Antigravity, and Gemini CLI
+# Integrates with Claude Code, Codex CLI, Cursor, Antigravity, Copilot CLI, and Gemini CLI
 rclm-hooks-install
 
 # Install only selected clients
@@ -41,7 +41,10 @@ rclm-sync
 
 # Or select one source
 rclm-sync --antigravity
+rclm-sync --copilot
 ```
+
+Copilot CLI history is read from `~/.copilot/session-state/**/events.jsonl`.
 
 Failed uploads—including rejected credentials and server errors—are saved after local redaction in `~/.reclaimllm/failed_uploads/`. Retry them with `rclm-sync --failed`. ReclaimLLM-owned config, session sidecars, sync indexes, and failed-upload files use owner-only permissions. Provider-owned transcript files remain under the provider's control and may contain unredacted content.
 

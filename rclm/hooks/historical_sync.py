@@ -3,7 +3,8 @@
 Called during install when the user opts in. Discovers existing session files from
 Claude Code (~/.claude/projects/**/*.jsonl), Gemini CLI (~/.gemini/tmp/**/chats/*.json),
 Codex CLI (~/.codex/sessions/**/*.jsonl), Antigravity
-(~/.gemini/antigravity-cli/brain/**/transcript.jsonl), and OpenClaw
+(~/.gemini/antigravity-cli/brain/**/transcript.jsonl), Copilot CLI
+(~/.copilot/session-state/**/events.jsonl), and OpenClaw
 (~/.openclaw/agents/main/sessions/*.jsonl*), parses them into
 HookSessionRecord objects, and uploads them via the same mechanism as live sessions.
 
@@ -41,6 +42,7 @@ from rclm._uploader import (
 from rclm.hooks import (
     antigravity_transcript,
     codex_transcript,
+    copilot_transcript,
     cursor_transcript,
     openclaw_transcript,
 )
@@ -63,6 +65,7 @@ _HISTORICAL_PROVIDERS = (
     "codex",
     "cursor",
     "antigravity",
+    "copilot",
     "openclaw",
 )
 CURSOR_MODEL_DEFAULT = "cursor-unknown"
@@ -194,6 +197,14 @@ def _iter_antigravity_sessions() -> list[Path]:
                 if path.is_file() and not path.is_symlink()
             )
     return paths
+
+
+def _iter_copilot_sessions() -> list[Path]:
+    """Yield Copilot CLI event logs from ~/.copilot/session-state/."""
+    base = Path.home() / ".copilot" / "session-state"
+    if not base.exists():
+        return []
+    return [path for path in base.rglob("events.jsonl") if path.is_file() and not path.is_symlink()]
 
 
 def _openclaw_canonical_path(path: Path) -> Path:
@@ -808,6 +819,46 @@ def _parse_antigravity_session(path: Path) -> HookSessionRecord | None:
     )
 
 
+def _parse_copilot_session(path: Path) -> HookSessionRecord | None:
+    """Parse a Copilot CLI events.jsonl file into a historical session record."""
+    transcript_data = copilot_transcript.parse_transcript(str(path))
+    if not transcript_data.messages and not transcript_data.tool_calls:
+        return None
+
+    started_at = transcript_data.started_at
+    ended_at = transcript_data.ended_at
+    model = transcript_data.model or "copilot-unknown"
+    analytics = compute_session_analytics(transcript_data.tool_calls, [])
+    return HookSessionRecord(
+        session_id=transcript_data.session_id or path.parent.name,
+        cwd=transcript_data.cwd,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_s=_timestamps_to_duration(started_at, ended_at),
+        transcript_path=str(path),
+        model=model,
+        messages=transcript_data.messages,
+        tool_calls=transcript_data.tool_calls,
+        tool_token_stats=analytics.get("tool_token_stats"),
+        tool_call_count=analytics.get("tool_call_count"),
+        unique_files_modified=analytics.get("unique_files_modified"),
+        dominant_tool=analytics.get("dominant_tool"),
+        is_sync=True,
+        **native_metadata(
+            "copilot",
+            adapter_name="rclm-copilot-historical",
+            model=model,
+            provider="github",
+            capabilities={
+                "transcript": True,
+                "tool_calls": bool(transcript_data.tool_calls),
+                "file_diffs": False,
+            },
+            warnings=transcript_data.warnings,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # OpenClaw parsing
 # ---------------------------------------------------------------------------
@@ -986,6 +1037,8 @@ def _discover_sessions(providers: list[str]) -> dict[str, list[Path]]:
         result["cursor"] = _iter_cursor_sessions()
     if "antigravity" in providers:
         result["antigravity"] = _iter_antigravity_sessions()
+    if "copilot" in providers:
+        result["copilot"] = _iter_copilot_sessions()
     if "openclaw" in providers:
         result["openclaw"] = _iter_openclaw_sessions()
     return result
@@ -1004,6 +1057,8 @@ def _parse_session(provider: str, path: Path) -> HookSessionRecord | None:
             record = _parse_cursor_session(path)
         elif provider == "antigravity":
             record = _parse_antigravity_session(path)
+        elif provider == "copilot":
+            record = _parse_copilot_session(path)
         elif provider == "openclaw":
             record = _parse_openclaw_session(path)
         if record is not None and not record.agent_client:
@@ -1012,6 +1067,7 @@ def _parse_session(provider: str, path: Path) -> HookSessionRecord | None:
                 "gemini": "gemini_cli",
                 "codex": "codex",
                 "cursor": "cursor",
+                "copilot": "copilot",
                 "openclaw": "openclaw",
             }.get(provider)
             if client:
@@ -1172,6 +1228,7 @@ def sync_main() -> None:
         rclm-sync --claude           # Claude only
         rclm-sync --gemini --codex   # Gemini + Codex
         rclm-sync --openclaw         # OpenClaw only
+        rclm-sync --copilot         # Copilot CLI only
         rclm-sync --yes              # skip confirmation prompt
         rclm-sync --resync           # re-upload everything, ignoring prior sync index
         rclm-sync --failed           # reprocess quarantined failed uploads
@@ -1187,6 +1244,7 @@ def sync_main() -> None:
   %(prog)s --claude          # Claude Code only
   %(prog)s --gemini --codex  # Gemini + Codex
   %(prog)s --antigravity     # Antigravity only
+  %(prog)s --copilot         # Copilot CLI only
   %(prog)s --openclaw        # OpenClaw only
   %(prog)s --yes             # upload without confirmation prompt
   %(prog)s --resync          # re-upload all sessions, ignoring prior sync index
@@ -1200,6 +1258,7 @@ def sync_main() -> None:
     parser.add_argument("--openclaw", action="store_true", help="Sync OpenClaw sessions")
     parser.add_argument("--cursor", action="store_true", help="Sync Cursor sessions")
     parser.add_argument("--antigravity", action="store_true", help="Sync Antigravity sessions")
+    parser.add_argument("--copilot", action="store_true", help="Sync Copilot CLI sessions")
     parser.add_argument(
         "--yes",
         "-y",

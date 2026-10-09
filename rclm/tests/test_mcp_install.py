@@ -85,3 +85,40 @@ def test_install_mcp_respects_providers_filter(tmp_path, monkeypatch):
     assert not (tmp_path / ".cursor" / "mcp.json").exists()
     assert not (tmp_path / ".codex" / "config.toml").exists()
     assert not (tmp_path / ".agents" / "mcp_config.json").exists()
+    assert not (tmp_path / ".vscode" / "mcp.json").exists()
+
+
+def test_install_mcp_adds_copilot_vscode_config_local(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mcp_install, "_resolve_binary", lambda: "/bin/rclm-mcp")
+
+    paths = mcp_install.install_mcp(use_global=False, providers=["copilot"])
+
+    assert len(paths) == 1
+    vscode_mcp = tmp_path / ".vscode" / "mcp.json"
+    assert paths[0].resolve() == vscode_mcp.resolve()
+    assert vscode_mcp.exists()
+    data = mcp_install._load_json(vscode_mcp)
+    assert data["servers"]["reclaimllm"] == {
+        "command": "/bin/rclm-mcp",
+        "args": [],
+        "timeout": 600_000,
+    }
+
+
+def test_install_mcp_adds_copilot_config_global(tmp_path, monkeypatch):
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(mcp_install, "_resolve_binary", lambda: "/bin/rclm-mcp")
+
+    paths = mcp_install.install_mcp(use_global=True, providers=["copilot"])
+
+    assert len(paths) == 1
+    copilot_mcp = tmp_path / ".copilot" / "mcp-config.json"
+    assert paths[0].resolve() == copilot_mcp.resolve()
+    assert copilot_mcp.exists()
+    data = mcp_install._load_json(copilot_mcp)
+    assert data["mcpServers"]["reclaimllm"] == {
+        "command": "/bin/rclm-mcp",
+        "args": [],
+        "timeout": 600_000,
+    }

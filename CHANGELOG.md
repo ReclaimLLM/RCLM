@@ -3,6 +3,25 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.32] — 2026-10-08
+
+### Added
+- Implemented full GitHub Copilot / VS Code agent lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`) with `rclm-copilot-hooks` and `rclm-vscode-hooks` entry points (`rclm/hooks/copilot_handler.py`, `pyproject.toml`)
+- Added Copilot CLI transcript parser for event logs in `~/.copilot/session-state/**/events.jsonl`, extracting conversation turns, tool calls, and model metadata (`rclm/hooks/copilot_transcript.py`)
+- Added GitHub Copilot hook installation (`~/.copilot/hooks/rclm.json` globally, `.github/hooks/rclm.json` locally) with `--copilot` and `--vscode` CLI flags, enabled by default in `rclm-hooks-install` (`rclm/hooks/installer.py`)
+- Added GitHub Copilot MCP server auto-configuration in `~/.copilot/mcp-config.json` globally and `.vscode/mcp.json` locally, enabled by default in `install_mcp` (`rclm/mcp_install.py`)
+- Added historical sync support for GitHub Copilot CLI via `rclm-sync --copilot` to backfill prior sessions (`rclm/hooks/historical_sync.py`)
+- Added test suites for Copilot hook handler, transcript parsing, installer, uninstaller, and MCP configuration (`rclm/tests/hooks/test_copilot_handler.py`, `rclm/tests/hooks/test_copilot_transcript.py`, `rclm/tests/hooks/test_installer.py`, `rclm/tests/hooks/test_uninstaller.py`, `rclm/tests/test_mcp_install.py`)
+
+### Changed
+- Included `copilot` in default provider lists for `rclm-hooks-install`, `rclm-hooks-uninstall`, and MCP server registration (`rclm/hooks/installer.py`, `rclm/hooks/uninstaller.py`, `rclm/mcp_install.py`)
+- Marked `copilot` under unsupported mechanisms for image downscaling in effective hook policy (`rclm/_config.py`)
+
+### Security
+- Added local DLP redaction and secret masking to Copilot `PreToolUse` and `PostToolUse` hooks before tool execution and session upload (`rclm/hooks/copilot_handler.py`)
+
+---
+
 ## [v0.1.31] — 2026-10-08
 
 ### Added

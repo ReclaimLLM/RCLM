@@ -80,6 +80,7 @@ def effective_hook_policy(
         "codex": {"image_downscale"},
         "cursor": {"image_downscale"},
         "gemini": {"exec_compaction", "test_filter", "image_downscale"},
+        "copilot": {"image_downscale"},
     }.get(provider or "", set())
     for name, enabled in local_enabled.items():
         supported = name not in unsupported

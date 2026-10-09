@@ -20,6 +20,7 @@ from rclm.hooks.historical_sync import (
     _parse_antigravity_session,
     _parse_claude_session,
     _parse_codex_session,
+    _parse_copilot_session,
     _parse_cursor_session,
     _parse_gemini_session,
     _parse_openclaw_session,
@@ -135,6 +136,54 @@ def test_iter_openclaw_sessions_selects_latest_reset(tmp_path):
         result = _iter_openclaw_sessions()
 
     assert result == [newer, other]
+
+
+def test_iter_copilot_sessions_finds_event_logs(tmp_path):
+    session_dir = tmp_path / ".copilot" / "session-state" / "copilot-session"
+    session_dir.mkdir(parents=True)
+    event_log = session_dir / "events.jsonl"
+    event_log.touch()
+
+    with patch("pathlib.Path.home", return_value=tmp_path):
+        from rclm.hooks.historical_sync import _iter_copilot_sessions
+
+        assert _iter_copilot_sessions() == [event_log]
+
+
+def test_parse_copilot_session_includes_assistant_response(tmp_path):
+    path = tmp_path / "copilot-session" / "events.jsonl"
+    path.parent.mkdir()
+    _write_jsonl(
+        path,
+        [
+            {
+                "type": "session.start",
+                "timestamp": "2026-10-08T18:00:00Z",
+                "data": {"sessionId": "copilot-session"},
+            },
+            {
+                "type": "user.message",
+                "timestamp": "2026-10-08T18:00:01Z",
+                "data": {"content": "What changed?"},
+            },
+            {
+                "type": "assistant.message",
+                "timestamp": "2026-10-08T18:00:02Z",
+                "data": {"content": "The handler now captures responses.", "model": "gpt-4.1"},
+            },
+        ],
+    )
+
+    record = _parse_copilot_session(path)
+
+    assert record is not None
+    assert record.session_id == "copilot-session"
+    assert record.model == "gpt-4.1"
+    assert record.is_sync is True
+    assert record.agent_client == "copilot"
+    assert record.model_provider == "github"
+    assert [message["role"] for message in record.messages] == ["user", "assistant"]
+    assert record.messages[1]["content"] == "The handler now captures responses."
 
 
 def test_iter_cursor_sessions(tmp_path):

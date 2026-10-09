@@ -847,3 +847,48 @@ def test_no_with_mcp_skips_install(tmp_path, monkeypatch):
     _run_install(monkeypatch, tmp_path, "--no-with-mcp")
 
     assert not (tmp_path / ".claude" / "mcp.json").exists()
+
+
+def test_copilot_hooks_installed_locally(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--copilot")
+
+    rclm_json = tmp_path / ".github" / "hooks" / "rclm.json"
+    assert rclm_json.exists()
+    data = json.loads(rclm_json.read_text())
+    assert "hooks" in data
+    for event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"):
+        assert event in data["hooks"]
+        assert len(data["hooks"][event]) == 1
+        assert "rclm-copilot-hooks" in data["hooks"][event][0]["command"]
+
+
+def test_copilot_install_offers_historical_sync(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    sync_calls = []
+    monkeypatch.setattr(
+        "rclm.hooks.historical_sync.prompt_and_run_sync",
+        lambda providers, **kwargs: sync_calls.append((providers, kwargs)),
+    )
+
+    _run_install(monkeypatch, tmp_path, "--copilot")
+
+    assert sync_calls == [(["copilot"], {"resync": True})]
+
+
+def test_vscode_alias_installs_copilot_hooks(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path, "--vscode")
+
+    rclm_json = tmp_path / ".github" / "hooks" / "rclm.json"
+    assert rclm_json.exists()
+    data = json.loads(rclm_json.read_text())
+    assert "PreToolUse" in data["hooks"]
+
+
+def test_copilot_installed_by_default_local(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run_install(monkeypatch, tmp_path)
+
+    rclm_json = tmp_path / ".github" / "hooks" / "rclm.json"
+    assert rclm_json.exists()

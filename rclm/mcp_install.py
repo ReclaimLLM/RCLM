@@ -64,6 +64,15 @@ def _install_json_mcp(path: Path, command: str) -> None:
     print(f"rclm MCP server installed into {path}")
 
 
+def _install_vscode_mcp(path: Path, command: str) -> None:
+    data = _load_json(path)
+    key = "servers" if "servers" in data or "mcpServers" not in data else "mcpServers"
+    servers = data.setdefault(key, {})
+    servers[_SERVER_NAME] = _mcp_json_entry(command)
+    _write_json(path, data)
+    print(f"rclm MCP server installed into {path}")
+
+
 def _toml_string(value: str) -> str:
     return json.dumps(value)
 
@@ -112,7 +121,7 @@ def install_mcp(use_global: bool = True, providers: list[str] | None = None) -> 
     command = _resolve_binary()
     root = Path.home() if use_global else Path(".")
     if providers is None:
-        providers = ["claude", "gemini", "cursor", "codex", "antigravity"]
+        providers = ["claude", "gemini", "cursor", "codex", "antigravity", "copilot"]
 
     installed: list[Path] = []
 
@@ -142,6 +151,15 @@ def install_mcp(use_global: bool = True, providers: list[str] | None = None) -> 
             else root / ".agents" / "mcp_config.json"
         )
         _install_json_mcp(path, command)
+        installed.append(path)
+    if "copilot" in providers or "vscode" in providers:
+        # Global: ~/.copilot/mcp-config.json; local: .vscode/mcp.json
+        if use_global:
+            path = Path.home() / ".copilot" / "mcp-config.json"
+            _install_json_mcp(path, command)
+        else:
+            path = root / ".vscode" / "mcp.json"
+            _install_vscode_mcp(path, command)
         installed.append(path)
 
     return installed

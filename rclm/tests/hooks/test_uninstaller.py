@@ -113,3 +113,44 @@ def test_uninstall_antigravity_removes_only_owned_namespace(tmp_path):
     uninstaller._uninstall_antigravity(path)
 
     assert json.loads(path.read_text()) == {"company-hook": {"Stop": [{"command": "audit"}]}}
+
+
+def test_uninstall_copilot_preserves_unrelated_hooks(tmp_path):
+    path = tmp_path / "rclm.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {"type": "command", "command": "rclm-copilot-hooks Stop"},
+                        {"type": "command", "command": "custom-script Stop"},
+                    ]
+                }
+            }
+        )
+    )
+
+    uninstaller._uninstall_copilot(path)
+
+    assert json.loads(path.read_text())["hooks"]["Stop"] == [
+        {"type": "command", "command": "custom-script Stop"}
+    ]
+
+
+def test_uninstall_copilot_removes_empty_rclm_json(tmp_path):
+    path = tmp_path / "rclm.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {"type": "command", "command": "rclm-copilot-hooks Stop"},
+                    ]
+                }
+            }
+        )
+    )
+
+    uninstaller._uninstall_copilot(path)
+
+    assert not path.exists()

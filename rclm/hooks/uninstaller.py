@@ -74,6 +74,8 @@ def _parse_flags() -> argparse.Namespace:
     )
     parser.add_argument("--cursor", action="store_true", help="Target Cursor hooks.json")
     parser.add_argument("--antigravity", action="store_true", help="Target Antigravity hooks.json")
+    parser.add_argument("--copilot", action="store_true", help="Target Copilot hooks (VS Code)")
+    parser.add_argument("--vscode", action="store_true", help="Alias for --copilot")
     parser.add_argument(
         "--local",
         action="store_true",
@@ -322,6 +324,48 @@ def _uninstall_openclaw(use_global: bool) -> None:
         print("No rclm OpenClaw plugin hooks found.")
 
 
+def _uninstall_copilot(path: Path) -> None:
+    """Remove rclm command entries from Copilot's hooks object."""
+    if not path.exists():
+        print(f"Nothing to do — {path} does not exist.")
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(f"Warning: {path} contains invalid JSON — cannot safely modify it.", file=sys.stderr)
+        return
+    hooks = data.get("hooks")
+    removed = 0
+    if isinstance(hooks, dict):
+        for event_name, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            kept = [
+                entry
+                for entry in entries
+                if not (
+                    isinstance(entry, dict)
+                    and _command_belongs_to_rclm(str(entry.get("command", "")))
+                )
+            ]
+            removed += len(entries) - len(kept)
+            if kept:
+                hooks[event_name] = kept
+            else:
+                del hooks[event_name]
+        if not hooks:
+            data.pop("hooks", None)
+    if removed:
+        if not data and path.name == "rclm.json":
+            path.unlink(missing_ok=True)
+            print(f"Removed {path}.")
+        else:
+            _write_json(path, data)
+            print(f"Removed {removed} rclm hook entr{'y' if removed == 1 else 'ies'} from {path}.")
+    else:
+        print(f"No rclm hooks found in {path}.")
+
+
 def _write_json(path: Path, data: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -342,12 +386,12 @@ def main() -> None:
 
     providers = [
         p
-        for p in ("claude", "gemini", "codex", "cursor", "antigravity", "openclaw")
-        if getattr(args, p)
+        for p in ("claude", "gemini", "codex", "cursor", "antigravity", "openclaw", "copilot")
+        if getattr(args, p) or (p == "copilot" and getattr(args, "vscode", False))
     ]
     if not providers:
         providers = (
-            ["claude", "gemini", "codex", "cursor", "antigravity"]
+            ["claude", "gemini", "codex", "cursor", "antigravity", "copilot"]
             if args.local
             else [
                 "claude",
@@ -356,6 +400,7 @@ def main() -> None:
                 "cursor",
                 "antigravity",
                 "openclaw",
+                "copilot",
             ]
         )
 
@@ -399,6 +444,21 @@ def main() -> None:
             _uninstall_antigravity(path)
         elif provider == "openclaw":
             _uninstall_openclaw(use_global)
+        elif provider == "copilot":
+            paths = (
+                [
+                    Path.home() / ".copilot" / "hooks" / "rclm.json",
+                    Path.home() / ".copilot" / "hooks" / "hooks.json",
+                ]
+                if use_global
+                else [
+                    Path(".github") / "hooks" / "rclm.json",
+                    Path(".github") / "hooks" / "hooks.json",
+                ]
+            )
+            for p in paths:
+                if p.exists():
+                    _uninstall_copilot(p)
 
     if args.purge_config:
         _purge_config()

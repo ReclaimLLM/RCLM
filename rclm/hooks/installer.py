@@ -1,17 +1,18 @@
 """Merge rclm hooks into Claude Code, Gemini CLI, Codex CLI, Cursor, OpenClaw,
-and/or Antigravity settings.
+Antigravity, and/or GitHub Copilot (VS Code) settings.
 
 Installs globally (home directory) by default. Pass --local to install into
 the current project directory instead.
 
 When no provider flag is given, Claude Code, Gemini CLI, Codex CLI, Cursor,
-and Antigravity are installed. OpenClaw is opt-in only — pass --openclaw
+Antigravity, and GitHub Copilot are installed. OpenClaw is opt-in only — pass --openclaw
 explicitly.
 
 Usage:
     rclm-hooks-install                            # default providers, global
     rclm-hooks-install --local                    # file-based providers, current dir
     rclm-hooks-install --claude                   # Claude Code only, global
+    rclm-hooks-install --copilot                  # GitHub Copilot (VS Code) only, global
     rclm-hooks-install --gemini                   # Gemini CLI only, global
     rclm-hooks-install --codex                    # Codex CLI only, global
     rclm-hooks-install --openclaw                 # OpenClaw only, global (opt-in)
@@ -218,6 +219,21 @@ _ANTIGRAVITY_HOOKS_TO_INJECT: dict = {
     }
 }
 
+# VS Code / GitHub Copilot hooks format: {"hooks": {"EventName": [{"type": "command", "command": "...", "timeout": 30}]}}
+_COPILOT_HOOKS_TO_INJECT: dict[str, list[dict]] = {
+    "SessionStart": [
+        {"type": "command", "command": "rclm-copilot-hooks SessionStart", "timeout": 30}
+    ],
+    "UserPromptSubmit": [
+        {"type": "command", "command": "rclm-copilot-hooks UserPromptSubmit", "timeout": 30}
+    ],
+    "PreToolUse": [{"type": "command", "command": "rclm-copilot-hooks PreToolUse", "timeout": 30}],
+    "PostToolUse": [
+        {"type": "command", "command": "rclm-copilot-hooks PostToolUse", "timeout": 30}
+    ],
+    "Stop": [{"type": "command", "command": "rclm-copilot-hooks Stop", "timeout": 30}],
+}
+
 
 # ---------------------------------------------------------------------------
 # Flag parsing
@@ -278,6 +294,16 @@ Subsequent installs without --api-key reuse the saved config.""",
         "--antigravity",
         action="store_true",
         help="Install hooks for Antigravity (capture-only)",
+    )
+    parser.add_argument(
+        "--copilot",
+        action="store_true",
+        help="Install hooks for GitHub Copilot in VS Code",
+    )
+    parser.add_argument(
+        "--vscode",
+        action="store_true",
+        help="Alias for --copilot",
     )
     parser.add_argument(
         "--local",
@@ -450,14 +476,18 @@ def _resolve_binary(name: str) -> str:
 
 
 def _with_absolute_binary(
-    hooks_to_inject: dict, binary_name: str, resolved: str, is_cursor: bool = False
+    hooks_to_inject: dict,
+    binary_name: str,
+    resolved: str,
+    is_cursor: bool = False,
+    is_copilot: bool = False,
 ) -> dict:
     """Return a deep copy of hooks_to_inject with bare binary name replaced by absolute path."""
     if resolved == binary_name:
         return hooks_to_inject
     resolved_command = shlex.quote(resolved)
     result = copy.deepcopy(hooks_to_inject)
-    if is_cursor:
+    if is_cursor or is_copilot:
         for entries in result.values():
             for hook in entries:
                 cmd = hook.get("command", "")
@@ -484,6 +514,8 @@ def _is_rclm_command(command: str) -> bool:
         "rclm-codex-hooks",
         "rclm-cursor-hooks",
         "rclm-antigravity-hooks",
+        "rclm-copilot-hooks",
+        "rclm-vscode-hooks",
     ]:
         if name in command:
             return True
@@ -601,6 +633,25 @@ def _merge_cursor_hooks(data: dict, hooks_to_inject: dict) -> dict:
                 # Update the first one
                 existing_entries[rclm_indices[0]]["command"] = new_command
                 # Remove any duplicates
+                for idx in reversed(rclm_indices[1:]):
+                    existing_entries.pop(idx)
+            else:
+                existing_entries.append(new_hook)
+    return data
+
+
+def _merge_copilot_hooks(data: dict, hooks_to_inject: dict) -> dict:
+    """Merge hooks into a VS Code Copilot hooks JSON dict (native format), replacing ALL existing rclm hooks for an event."""
+    hooks_section: dict = data.setdefault("hooks", {})
+    for event_name, new_entries in hooks_to_inject.items():
+        existing_entries: list[dict] = hooks_section.setdefault(event_name, [])
+        for new_hook in new_entries:
+            new_command = new_hook.get("command", "")
+            rclm_indices = [
+                i for i, h in enumerate(existing_entries) if _is_rclm_command(h.get("command", ""))
+            ]
+            if rclm_indices:
+                existing_entries[rclm_indices[0]]["command"] = new_command
                 for idx in reversed(rclm_indices[1:]):
                     existing_entries.pop(idx)
             else:
@@ -897,6 +948,25 @@ def _install_openclaw(use_global: bool) -> None:
     print(f"rclm OpenClaw plugin installed into {path}")
 
 
+def _install_copilot(use_global: bool) -> None:
+    path = (
+        Path.home() / ".copilot" / "hooks" / "rclm.json"
+        if use_global
+        else Path(".github") / "hooks" / "rclm.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    binary = _resolve_binary("rclm-copilot-hooks")
+    hooks = _with_absolute_binary(
+        _COPILOT_HOOKS_TO_INJECT, "rclm-copilot-hooks", binary, is_copilot=True
+    )
+
+    data = _load_json(path)
+    _merge_copilot_hooks(data, hooks)
+    _write_json(path, data)
+    print(f"rclm hooks installed into {path}")
+
+
 # ---------------------------------------------------------------------------
 # JSON I/O helpers
 # ---------------------------------------------------------------------------
@@ -981,11 +1051,11 @@ def main() -> None:
     # (--openclaw) for both --local and global default installs.
     providers = [
         p
-        for p in ("claude", "gemini", "codex", "cursor", "openclaw", "antigravity")
-        if getattr(args, p)
+        for p in ("claude", "gemini", "codex", "cursor", "openclaw", "antigravity", "copilot")
+        if getattr(args, p) or (p == "copilot" and getattr(args, "vscode", False))
     ]
     if not providers:
-        providers = ["claude", "gemini", "codex", "cursor", "antigravity"]
+        providers = ["claude", "gemini", "codex", "cursor", "antigravity", "copilot"]
 
     use_global = not args.local
 
@@ -1093,6 +1163,8 @@ def main() -> None:
                 _install_openclaw(use_global)
             elif provider == "antigravity":
                 _install_antigravity(use_global)
+            elif provider == "copilot":
+                _install_copilot(use_global)
         except Exception as exc:
             print(f"Warning: {provider} hook installation failed: {exc}", file=sys.stderr)
 

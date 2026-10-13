@@ -3,6 +3,28 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.33] — 2026-10-13
+
+### Added
+- Stable per-machine device identity in `~/.reclaimllm/device.json` with hashed hostname and durable/ephemeral classification (`rclm/_device.py`)
+- Device coverage check-in client posting integrity, DLP posture, and routing class to `/api/devices/checkin` (`rclm/hooks/checkin.py`)
+- Per-client hook integrity collector for Claude, Cursor, Codex, Gemini, Copilot, and Antigravity (`rclm/hooks/integrity.py`)
+- Gateway-vs-direct routing probe that reports classification only, never URLs or keys (`rclm/hooks/routing.py`)
+- `rclm-heartbeat` CLI plus macOS LaunchAgent / systemd user timer install (`rclm/heartbeat.py`, `pyproject.toml`)
+- Installer flags `--repair` and `--heartbeat` for coverage re-enroll and optional OS timer (`rclm/hooks/installer.py`)
+- Uninstall best-effort check-in with `event: uninstall` before config deletion (`rclm/hooks/uninstaller.py`)
+- Tests for device identity, integrity, DLP-required resolution, heartbeat install, routing probe, policy snapshot v2, and uninstall ping (`rclm/tests/`)
+
+### Changed
+- Policy snapshot schema bumped to v2 with `dlp_enabled`, `device_id`, `integrity_hash`, and `routing` (`rclm/hooks/bootstrap.py`)
+- SessionStart / bootstrap and `rclm-update` trigger throttled coverage check-in and device enrollment (`rclm/hooks/bootstrap.py`, `rclm/update.py`)
+- Uploader and MCP bootstrap send `X-RCLM-Device` header (`rclm/_uploader.py`, `rclm/mcp_server.py`)
+
+### Security
+- Org `dlp_required` overrides local `--no-dlp` unless an unexpired DLP exception applies (`rclm/_config.py`)
+
+---
+
 ## [v0.1.32] — 2026-10-08
 
 ### Added

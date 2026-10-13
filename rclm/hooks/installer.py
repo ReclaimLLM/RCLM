@@ -311,6 +311,19 @@ Subsequent installs without --api-key reuse the saved config.""",
         help="Install into the current project directory instead of the home directory",
     )
     parser.add_argument(
+        "--repair",
+        action="store_true",
+        help="Reinstall hooks and re-enroll device check-in (coverage repair path)",
+    )
+    parser.add_argument(
+        "--heartbeat",
+        action="store_true",
+        help=(
+            "Install the OS heartbeat timer (LaunchAgent / systemd user timer). "
+            "Also installed automatically when the org requires heartbeat"
+        ),
+    )
+    parser.add_argument(
         "--api-key",
         help="API key for ReclaimLLM server authentication",
     )
@@ -1046,6 +1059,8 @@ def _redaction_config_with_folder_filters(
 
 def main() -> None:
     args = _parse_flags()
+    if args.repair:
+        print("Repairing ReclaimLLM hooks and device enrollment…")
 
     # Determine which providers to install. openclaw is opt-in only
     # (--openclaw) for both --local and global default installs.
@@ -1074,7 +1089,15 @@ def main() -> None:
 
     saved_compression = _config.compression_config(saved)
     compress_enabled = args.compress if args.compress is not None else saved_compression["enabled"]
-    dlp_enabled = args.dlp if args.dlp is not None else _config.dlp_enabled(saved)
+    previous_local_dlp = bool(saved["dlp"]) if "dlp" in saved else _config.DEFAULT_DLP_ENABLED
+    dlp_enabled = args.dlp if args.dlp is not None else previous_local_dlp
+    # Org dlp_required may override local; still persist the local choice.
+    if (
+        isinstance(saved.get("org_hook_policy"), dict)
+        and saved["org_hook_policy"].get("dlp_required")
+        and args.dlp is False
+    ):
+        print("DLP is required by your organization (local --no-dlp overridden at runtime).")
     brevity_enabled = args.brevity or saved.get("brevity", False)
     loop_breaker_enabled = (
         args.loop_breaker if args.loop_breaker is not None else saved.get("loop_breaker", True)
@@ -1135,11 +1158,33 @@ def main() -> None:
     }
     if redaction_config is not None:
         config_extra["redaction"] = redaction_config
+    if args.dlp is not None and bool(args.dlp) != previous_local_dlp:
+        from datetime import datetime, timezone
+
+        pending = list(saved.get("pending_events") or [])
+        pending.append(
+            {
+                "type": "dlp_toggled",
+                "from": previous_local_dlp,
+                "to": bool(args.dlp),
+                "at": datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        )
+        config_extra["pending_events"] = pending
     _config.save(
         server_url,
         api_key,
         **config_extra,
     )
+    try:
+        from rclm import _device
+
+        _device.ensure_device_id()
+    except Exception:
+        pass
 
     try:
         from rclm.hooks.redaction import sync_remote_settings
@@ -1178,6 +1223,28 @@ def main() -> None:
                 f"Warning: MCP install failed ({exc}). Hooks were installed.",
                 file=sys.stderr,
             )
+
+    # Best-effort coverage check-in (always on --repair; otherwise when device exists).
+    try:
+        from rclm.hooks import checkin
+
+        checkin.maybe_checkin(force=bool(args.repair))
+        if args.repair:
+            print("Device check-in sent (or skipped if offline).")
+    except Exception:
+        pass
+
+    # Heartbeat timer: --heartbeat or org_hook_policy.heartbeat_required.
+    try:
+        policy = _config.load().get("org_hook_policy")
+        org_requires = isinstance(policy, dict) and bool(policy.get("heartbeat_required"))
+        if args.heartbeat or org_requires:
+            from rclm import heartbeat as heartbeat_mod
+
+            heartbeat_mod.install_timer()
+            print("Coverage heartbeat timer installed.")
+    except Exception as exc:
+        print(f"Warning: heartbeat timer install failed: {exc}", file=sys.stderr)
 
     # Offer to sync existing sessions from all installed providers.
     try:

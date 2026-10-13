@@ -289,12 +289,15 @@ def _require_session_record(session: dict[str, Any], session_id: str) -> None:
 
 class ReclaimLLMClient:
     def __init__(self) -> None:
+        from rclm import _device
+
         creds = _load_credentials()
         self.server_url = creds.server_url
         self.headers = {
             "X-API-Key": creds.api_key,
             "Content-Type": "application/json",
             "X-ReclaimLLM-Client": "mcp",
+            "X-RCLM-Device": _device.device_id(),
         }
 
     async def _request(

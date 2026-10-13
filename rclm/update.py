@@ -84,6 +84,19 @@ def _install_mcp_config() -> None:
         print(f"MCP install failed: {exc}", file=sys.stderr)
 
 
+def _ensure_device_enrollment(*, force_checkin: bool = False) -> None:
+    """Create device.json and best-effort check-in (never fails the update)."""
+    try:
+        from rclm import _device
+        from rclm.hooks import checkin
+
+        device_id = _device.ensure_device_id()
+        print(f"Device id: {device_id[:8]}…")
+        checkin.maybe_checkin(force=force_checkin)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Device enrollment skipped: {exc}", file=sys.stderr)
+
+
 def main() -> None:
     args = _parse_flags()
     current = installed_version()
@@ -92,6 +105,7 @@ def main() -> None:
     latest = check_for_update(force=True)
     _sync_redaction_settings()
     _sync_org_hook_policy()
+    _ensure_device_enrollment(force_checkin=True)
 
     if latest is None:
         print(f"rclm is up to date ({current}).")
@@ -148,6 +162,25 @@ def main() -> None:
             "Run rclm-hooks-install to refresh hook configs manually.",
             file=sys.stderr,
         )
+
+    # Enroll with the newly installed package (in-process imports may be stale).
+    try:
+        import subprocess
+
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from rclm import _device; from rclm.hooks import checkin; "
+                    "_device.ensure_device_id(); checkin.maybe_checkin(force=True)"
+                ),
+            ],
+            check=False,
+            timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Post-upgrade device enrollment skipped: {exc}", file=sys.stderr)
 
     if args.with_mcp:
         _install_mcp_config()

@@ -8,7 +8,7 @@ from rclm import _config
 from rclm.hooks.updater import installed_version
 from rclm.mcp_server import ReclaimLLMClient, ReclaimLLMError
 
-POLICY_SNAPSHOT_SCHEMA_VERSION = 1
+POLICY_SNAPSHOT_SCHEMA_VERSION = 2
 
 
 async def fetch(cwd: str, *, include_context: bool) -> dict:
@@ -21,6 +21,13 @@ async def fetch(cwd: str, *, include_context: bool) -> dict:
     if "org_hook_policy" in result:
         policy = result.get("org_hook_policy")
         _config.patch(org_hook_policy=policy if isinstance(policy, dict) else None)
+    # Enroll / refresh coverage after bootstrap (throttled inside checkin).
+    try:
+        from rclm.hooks import checkin
+
+        await checkin.async_checkin(cwd=cwd or None)
+    except Exception:
+        pass
     return result
 
 
@@ -55,15 +62,32 @@ def signal_nudge_text(result: dict, cfg: dict) -> str | None:
 
 
 def policy_snapshot(provider: str) -> dict:
-    snapshot = _config.effective_hook_policy(_config.load(), provider=provider).snapshot()
+    from rclm import _device
+    from rclm.hooks import integrity
+
+    cfg = _config.load()
+    snapshot = _config.effective_hook_policy(cfg, provider=provider).snapshot()
+    clients = integrity.collect_client_status()
     snapshot.update(
         {
             "snapshot_schema_version": POLICY_SNAPSHOT_SCHEMA_VERSION,
             "capture_client_version": installed_version(),
             "capture_provider": provider,
+            "dlp_enabled": _config.dlp_enabled(cfg),
+            "dlp_local_setting": _config.dlp_local_setting(cfg),
+            "redaction_enabled": bool(cfg.get("redaction_enabled", True)),
+            "device_id": _device.device_id(),
+            "integrity_hash": integrity.integrity_hash(clients),
+            "routing": _routing_snapshot(cfg),
         }
     )
     return snapshot
+
+
+def _routing_snapshot(cfg: dict) -> dict:
+    from rclm.hooks import routing
+
+    return routing.classify_routing(cfg=cfg)
 
 
 def policy_snapshot_from_events(events: list[dict], provider: str) -> dict:

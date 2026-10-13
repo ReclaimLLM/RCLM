@@ -135,9 +135,43 @@ def resolved_api_key(cfg: dict | None = None) -> str:
 
 
 def dlp_enabled(cfg: dict | None = None) -> bool:
-    """Return the persisted DLP choice, defaulting fresh/legacy configs on."""
+    """Resolve DLP: org dlp_required wins unless an unexpired exception applies."""
+    cfg = cfg if cfg is not None else load()
+    local = bool(cfg.get("dlp", DEFAULT_DLP_ENABLED))
+    remote = cfg.get("org_hook_policy")
+    remote = remote if isinstance(remote, dict) else {}
+    if not remote.get("dlp_required"):
+        return local
+    return not _has_active_dlp_exception(remote)
+
+
+def dlp_local_setting(cfg: dict | None = None) -> bool:
     cfg = cfg if cfg is not None else load()
     return bool(cfg.get("dlp", DEFAULT_DLP_ENABLED))
+
+
+def _has_active_dlp_exception(remote: dict) -> bool:
+    from datetime import datetime, timezone
+
+    exceptions = remote.get("dlp_exceptions")
+    if not isinstance(exceptions, list):
+        return False
+    now = datetime.now(timezone.utc)
+    for item in exceptions:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("expires_at")
+        if not raw:
+            continue
+        try:
+            exp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp > now:
+            return True
+    return False
 
 
 @dataclass(frozen=True)

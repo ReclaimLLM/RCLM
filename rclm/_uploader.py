@@ -118,7 +118,13 @@ async def upload(
     # if len(record.messages) == 0:
     #     logger.warning("Record has empty messages; skipping upload")
     #     return
-    headers = {"Content-Type": "application/json", "X-API-Key": creds.api_key}
+    from rclm import _device
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": creds.api_key,
+        "X-RCLM-Device": _device.device_id(),
+    }
 
     delays = _RETRY_DELAYS[:max_retries]
     for attempt, delay in enumerate(delays, start=1):

@@ -406,6 +406,14 @@ def main() -> None:
 
     use_global = not args.local
 
+    # Best-effort uninstall ping before local config is removed (2s timeout).
+    try:
+        from rclm.hooks import checkin
+
+        checkin.maybe_checkin(event="uninstall", force=True, timeout_s=2.0)
+    except Exception:
+        pass
+
     for provider in providers:
         if provider == "claude":
             path = (

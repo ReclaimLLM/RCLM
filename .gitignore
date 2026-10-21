@@ -11,3 +11,4 @@ htmlcov/
 node_modules/
 build.sh
 diff.txt
+.playwright-cli/

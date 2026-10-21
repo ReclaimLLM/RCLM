@@ -895,7 +895,10 @@ def _handle_stop(session_id: str, payload: dict) -> None:
     messages = _reconcile_messages(transcript_data.messages, fallback_messages)
     tool_calls = _reconcile_tool_calls(transcript_data.tool_calls, fallback_tool_calls)
     _attach_transformations(tool_calls, fallback_tool_calls, events)
-    if _config.dlp_enabled():
+    dlp_on = _config.dlp_enabled()
+    for call in tool_calls:
+        call.extra_fields["dlp_enabled"] = dlp_on
+    if dlp_on:
         dlp.reconcile_captured_tool_results(tool_calls, events)
     file_diffs = transcript_data.file_diffs
     model = transcript_data.model or model

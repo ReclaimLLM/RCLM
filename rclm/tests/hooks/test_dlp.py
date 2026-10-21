@@ -149,6 +149,10 @@ class TestFindEnvFiles:
 
         assert _find_env_files(str(workspace)) == []
 
+    def test_ignores_relative_slug_hint_and_missing_directory(self, tmp_path):
+        assert _find_env_files("Users-maziz-Desktop-ReclaimLLM") == []
+        assert _find_env_files(str(tmp_path / "deleted-workspace")) == []
+
 
 # ---------------------------------------------------------------------------
 # _build_scrub_set

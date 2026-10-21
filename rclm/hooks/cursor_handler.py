@@ -428,14 +428,35 @@ def _merge_file_diffs(primary: list[FileDiff], secondary: list[FileDiff]) -> lis
 def _build_messages_from_events(events: list[dict]) -> list[dict]:
     messages = []
     for ev in events:
-        if ev.get("event_type") == "UserPromptSubmit":
-            messages.append(
-                {
-                    "role": "user",
-                    "content": ev.get("prompt", ""),
-                    "timestamp": ev.get("timestamp", ""),
-                }
+        ev_type = ev.get("event_type")
+        if ev_type == "UserPromptSubmit":
+            prompt = ev.get("prompt", "")
+            if prompt:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "timestamp": ev.get("timestamp", ""),
+                    }
+                )
+        elif ev_type == "afterAgentResponse":
+            raw_payload = ev.get("payload")
+            payload = raw_payload if isinstance(raw_payload, dict) else ev
+            text = (
+                payload.get("text")
+                or payload.get("response")
+                or payload.get("content")
+                or payload.get("message")
+                or ""
             )
+            if isinstance(text, str) and text.strip():
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": text,
+                        "timestamp": ev.get("timestamp", ""),
+                    }
+                )
     return messages
 
 
@@ -450,8 +471,6 @@ async def _upload_and_close(record: HookSessionRecord):
 
 
 def _handle_stop(session_id: str, payload: dict) -> None:
-    if session_store.has_marker(session_id, "finalized"):
-        return
     now = _now()
     events = session_store.read_events(session_id)
     cwd = _resolve_cwd(session_id, payload)
@@ -465,14 +484,23 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         transcript_data = cursor_transcript.parse_transcript(transcript_path)
     if transcript_data and transcript_data.cwd:
         cwd = cwd or transcript_data.cwd
-    if transcript_data and _config.dlp_enabled():
-        dlp.reconcile_captured_tool_results(transcript_data.tool_calls, events)
+    if transcript_data:
+        dlp_on = _config.dlp_enabled()
+        for tc in transcript_data.tool_calls:
+            tc.extra_fields["dlp_enabled"] = dlp_on
+        if dlp_on:
+            dlp.reconcile_captured_tool_results(transcript_data.tool_calls, events)
     event_file_diffs = _extract_file_diffs_from_events(events)
     mechanism_savings = aggregate_mechanism_savings(events)
     hook_policy_snapshot = bootstrap.policy_snapshot_from_events(events, "cursor")
 
     # Reconstruct the session record.
-    started_at = events[0].get("timestamp", now) if events else now
+    started_at = now
+    for ev in events:
+        ts = ev.get("timestamp")
+        if isinstance(ts, str) and ts:
+            started_at = ts
+            break
     ended_at = payload.get("timestamp", now)
 
     try:
@@ -539,14 +567,35 @@ def _handle_stop(session_id: str, payload: dict) -> None:
         )
 
     outcome = asyncio.run(_upload_and_close(record))
-    if not getattr(outcome, "cleanup_safe", outcome is None):
-        return
+    cleanup_safe = bool(getattr(outcome, "cleanup_safe", outcome is None))
+    session_store.append_event(
+        session_id,
+        {"event_type": "NativeUploadOutcome", "cleanup_safe": cleanup_safe, "timestamp": now},
+    )
     for event in events:
         if event.get("event_type") == "DLPTempFile":
             with contextlib.suppress(OSError):
                 os.unlink(event["path"])
-    session_store.cleanup(session_id)
-    session_store.write_marker(session_id, "finalized")
+
+
+def _handle_session_end(session_id: str, payload: dict) -> None:
+    """Finalize and clean up session state when the Cursor session ends."""
+    events = session_store.read_events(session_id)
+    if not events or events[-1].get("event_type") != "NativeUploadOutcome":
+        _handle_stop(session_id, payload)
+        events = session_store.read_events(session_id)
+
+    for event in events:
+        if event.get("event_type") == "DLPTempFile":
+            with contextlib.suppress(OSError):
+                os.unlink(event["path"])
+
+    last_outcome = next(
+        (event for event in reversed(events) if event.get("event_type") == "NativeUploadOutcome"),
+        None,
+    )
+    if last_outcome and last_outcome.get("cleanup_safe") is True:
+        session_store.cleanup(session_id)
 
 
 _HANDLERS = {
@@ -568,7 +617,7 @@ _HANDLERS = {
     "afterAgentThought": _handle_generic_event("afterAgentThought"),
     "stop": _handle_stop,
     "sessionStart": _handle_session_start,
-    "sessionEnd": _handle_stop,
+    "sessionEnd": _handle_session_end,
     "preCompact": _handle_generic_event("preCompact"),
 }
 

@@ -6,6 +6,7 @@ filesystem error, or malformed state always passes the original result through.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import io
 import os
@@ -223,6 +224,43 @@ def inspect_file(path: str, *, cwd: str) -> FileMetadata | None:
         return FileMetadata(str(resolved), display, digest.hexdigest(), line_count, size)
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def hash_file_raw_bytes(
+    path: str,
+    *,
+    cwd: str = "",
+    max_bytes: int = 5_242_880,
+) -> str | None:
+    """Return raw-bytes SHA-256 hash if file exists, is regular, non-binary, and <= max_bytes."""
+    meta = inspect_file(path, cwd=cwd or os.getcwd())
+    if not meta or meta.size > max_bytes:
+        return None
+    return meta.content_hash
+
+
+def build_file_relative_unified_diff(
+    path: str,
+    before_content: str | None,
+    after_content: str | None,
+) -> tuple[str, str]:
+    """Build unified diff against full file content so hunk headers carry real line numbers.
+
+    Returns (unified_diff_str, line_basis) where line_basis is 'file' if successfully computed.
+    """
+    if before_content is None and after_content is None:
+        return "", "unknown"
+    before_lines = before_content.splitlines(keepends=True) if before_content is not None else []
+    after_lines = after_content.splitlines(keepends=True) if after_content is not None else []
+    diff_lines = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+    return "".join(diff_lines), "file"
 
 
 def process_read(request: ReadRequest, content: str, state: dict, *, turn: int) -> CacheDecision:

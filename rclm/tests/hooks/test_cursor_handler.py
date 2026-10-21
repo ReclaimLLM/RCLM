@@ -234,8 +234,93 @@ def test_stop_uploads_record(mock_upload, monkeypatch, tmp_path):
     assert len(record.tool_calls) == 1
     assert record.tool_calls[0].tool_name == "shell"
 
-    # Store should be cleaned up
+    # Stop retains events across turns; sessionEnd cleans up the store
+    events = session_store.read_events(session_id)
+    assert events[-1]["event_type"] == "NativeUploadOutcome"
+    assert events[-1]["cleanup_safe"] is True
+
+    _run_handler("sessionEnd", {"conversation_id": session_id}, monkeypatch)
+    assert mock_upload.call_count == 1
     assert len(session_store.read_events(session_id)) == 0
+
+
+@patch("rclm.hooks.cursor_handler.upload_single")
+def test_multi_turn_stop_uploads_each_turn_and_includes_agent_responses(
+    mock_upload, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_id = "conv-multi-turn"
+    mock_upload.return_value = MagicMock()
+
+    _run_handler(
+        "beforeSubmitPrompt",
+        {
+            "conversation_id": session_id,
+            "prompt": "Turn 1 prompt",
+            "timestamp": "2024-01-01T00:00:00Z",
+        },
+        monkeypatch,
+    )
+    _run_handler(
+        "afterAgentResponse",
+        {
+            "conversation_id": session_id,
+            "text": "Turn 1 assistant reply",
+            "timestamp": "2024-01-01T00:00:05Z",
+        },
+        monkeypatch,
+    )
+    _run_handler(
+        "stop",
+        {
+            "conversation_id": session_id,
+            "workspace_roots": ["/test/dir"],
+            "timestamp": "2024-01-01T00:00:06Z",
+        },
+        monkeypatch,
+    )
+    assert mock_upload.call_count == 1
+    first_record = mock_upload.call_args[0][0]
+    assert [m["role"] for m in first_record.messages] == ["user", "assistant"]
+
+    _run_handler(
+        "beforeSubmitPrompt",
+        {
+            "conversation_id": session_id,
+            "prompt": "Turn 2 prompt",
+            "timestamp": "2024-01-01T00:01:00Z",
+        },
+        monkeypatch,
+    )
+    _run_handler(
+        "afterAgentResponse",
+        {
+            "conversation_id": session_id,
+            "text": "Turn 2 assistant reply",
+            "timestamp": "2024-01-01T00:01:05Z",
+        },
+        monkeypatch,
+    )
+    _run_handler(
+        "stop",
+        {
+            "conversation_id": session_id,
+            "workspace_roots": ["/test/dir"],
+            "timestamp": "2024-01-01T00:01:10Z",
+        },
+        monkeypatch,
+    )
+    assert mock_upload.call_count == 2
+    second_record = mock_upload.call_args[0][0]
+    assert second_record.started_at == "2024-01-01T00:00:00Z"
+    assert second_record.ended_at == "2024-01-01T00:01:10Z"
+    assert second_record.duration_s == 70.0
+    assert [(m["role"], m["content"]) for m in second_record.messages] == [
+        ("user", "Turn 1 prompt"),
+        ("assistant", "Turn 1 assistant reply"),
+        ("user", "Turn 2 prompt"),
+        ("assistant", "Turn 2 assistant reply"),
+    ]
 
 
 def test_resolve_cwd_prefers_event_cwd_over_workspace_roots(monkeypatch, tmp_path):

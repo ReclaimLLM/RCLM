@@ -134,7 +134,12 @@ def _find_env_files(cwd: str) -> list[Path]:
     is an error rather than a silent coverage gap.
     """
     try:
-        base = Path(cwd).expanduser().resolve()
+        expanded = Path(cwd).expanduser()
+        if not expanded.is_absolute():
+            return []
+        base = expanded.resolve()
+        if not base.exists():
+            return []
         if not base.is_dir():
             raise DLPRedactionError(f"DLP workspace is not an accessible directory: {base}")
         found: list[Path] = []

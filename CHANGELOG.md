@@ -3,6 +3,31 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.34] — 2026-10-21
+
+### Added
+- FileDiff lineage fields `before_sha256`, `after_sha256`, `hash_source`, `line_basis`, `tool_call_id`, and `edit_seq` (`rclm/_models.py`)
+- Claude Edit reverse-applies the on-disk file to hash full before/after content and emit file-relative unified diffs (`rclm/hooks/claude_handler.py`, `rclm/hooks/read_cache.py`)
+- Codex patch apply records SHA-256 hashes and a file line basis when a unified diff exists (`rclm/hooks/codex_transcript.py`)
+- Cursor Write and coalesced edits record content hashes and lineage fields (`rclm/hooks/cursor_transcript.py`)
+- Historical Cursor sync resolves the workspace from `.workspace-trusted` or the project-directory slug (`rclm/hooks/historical_sync.py`)
+- Cursor `sessionEnd` uploads if stop has not, then deletes session state only after a cleanup-safe upload (`rclm/hooks/cursor_handler.py`)
+
+### Changed
+- Claude subagent sessions use a deterministic UUID5 and keep the original `parent:subagent` id in `original_conversation_id` (`rclm/hooks/claude_handler.py`)
+- Codex file-diff dedupe includes the edit timestamp so later edits of the same content stay distinct (`rclm/hooks/codex_transcript.py`)
+- Cursor stop keeps session events across turns, includes `afterAgentResponse` text, and sets `started_at` from the first event (`rclm/hooks/cursor_handler.py`)
+
+### Fixed
+- `rclm-claude-hooks` ignores Cursor payloads so third-party Claude hook compatibility cannot overwrite a Cursor session (`rclm/hooks/claude_handler.py`)
+- DLP env discovery skips relative path hints and missing directories (`rclm/hooks/dlp.py`)
+- Cursor stop no longer finalizes the session on the first turn, so later turns still upload (`rclm/hooks/cursor_handler.py`)
+
+### Security
+- Claude, Codex, and Cursor uploads stamp `dlp_enabled` on each tool call (`rclm/hooks/claude_handler.py`, `rclm/hooks/codex_handler.py`, `rclm/hooks/cursor_handler.py`)
+
+---
+
 ## [v0.1.33] — 2026-10-13
 
 ### Added

@@ -10,12 +10,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import hashlib
 import json
 import logging
 import os
 import shlex
 import sys
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from rclm import _config
 from rclm._models import FileDiff, HookSessionRecord, ToolCall
@@ -726,16 +729,23 @@ def _handle_user_prompt_submit(session_id: str, payload: dict) -> None:
 
 def _extract_file_diffs_from_tool_calls(
     tool_calls: list[ToolCall],
+    cwd: str = "",
 ) -> list[FileDiff]:
-    """Extract FileDiff objects from Write/Edit/MultiEdit tool inputs."""
+    """Extract FileDiff objects from Write/Edit/MultiEdit tool inputs with per-edit hashes."""
     diffs: list[FileDiff] = []
+    edit_seq_by_path: dict[str, int] = {}
 
     for tc in tool_calls:
         name = tc.tool_name
         inp = tc.tool_input
+        file_path = inp.get("file_path", "")
+        if not file_path:
+            continue
+
+        seq = edit_seq_by_path.get(file_path, 0)
+        edit_seq_by_path[file_path] = seq + 1
 
         if name == "Write":
-            file_path = inp.get("file_path", "")
             content = inp.get("content", "")
             unified = "".join(
                 difflib.unified_diff(
@@ -745,6 +755,9 @@ def _extract_file_diffs_from_tool_calls(
                     tofile=f"b/{file_path}",
                 )
             )
+            after_sha = (
+                hashlib.sha256(content.encode("utf-8")).hexdigest() if content is not None else None
+            )
             diffs.append(
                 FileDiff(
                     path=file_path,
@@ -752,14 +765,19 @@ def _extract_file_diffs_from_tool_calls(
                     after=content,
                     unified_diff=unified,
                     timestamp=tc.timestamp,
+                    before_sha256=None,
+                    after_sha256=after_sha,
+                    hash_source="write_content",
+                    line_basis="file",
+                    tool_call_id=tc.tool_use_id,
+                    edit_seq=seq,
                 )
             )
 
         elif name == "Edit":
-            file_path = inp.get("file_path", "")
             old_string = inp.get("old_string", "")
             new_string = inp.get("new_string", "")
-            unified = "".join(
+            snippet_diff = "".join(
                 difflib.unified_diff(
                     old_string.splitlines(keepends=True),
                     new_string.splitlines(keepends=True),
@@ -767,6 +785,34 @@ def _extract_file_diffs_from_tool_calls(
                     tofile=f"b/{file_path}",
                 )
             )
+            before_sha: str | None = None
+            after_sha: str | None = None
+            hash_source: str | None = None
+            line_basis = "snippet"
+            unified = snippet_diff
+
+            # Try to read file at cwd and reverse-apply to get full file diff
+            try:
+                base = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+                candidate = Path(file_path).expanduser()
+                target_file = (candidate if candidate.is_absolute() else base / candidate).resolve()
+                if target_file.is_file() and target_file.stat().st_size <= 5_242_880:
+                    with open(target_file, encoding="utf-8", errors="replace") as f:
+                        curr = f.read()
+                    after_sha = hashlib.sha256(curr.encode("utf-8")).hexdigest()
+                    if new_string and curr.count(new_string) == 1:
+                        prev = curr.replace(new_string, old_string, 1)
+                        before_sha = hashlib.sha256(prev.encode("utf-8")).hexdigest()
+                        full_diff, basis = read_cache.build_file_relative_unified_diff(
+                            file_path, prev, curr
+                        )
+                        if full_diff:
+                            unified = full_diff
+                            line_basis = basis
+                            hash_source = "reverse_applied"
+            except Exception:
+                pass
+
             diffs.append(
                 FileDiff(
                     path=file_path,
@@ -774,12 +820,18 @@ def _extract_file_diffs_from_tool_calls(
                     after=new_string,
                     unified_diff=unified,
                     timestamp=tc.timestamp,
+                    before_sha256=before_sha,
+                    after_sha256=after_sha,
+                    hash_source=hash_source,
+                    line_basis=line_basis,
+                    tool_call_id=tc.tool_use_id,
+                    edit_seq=seq,
                 )
             )
 
         elif name == "MultiEdit":
-            file_path = inp.get("file_path", "")
-            for edit in inp.get("edits", []):
+            edits = inp.get("edits", [])
+            for sub_idx, edit in enumerate(edits):
                 old_string = edit.get("old_string", "")
                 new_string = edit.get("new_string", "")
                 unified = "".join(
@@ -797,8 +849,16 @@ def _extract_file_diffs_from_tool_calls(
                         after=new_string,
                         unified_diff=unified,
                         timestamp=tc.timestamp,
+                        before_sha256=None,
+                        after_sha256=None,
+                        hash_source=None,
+                        line_basis="snippet",
+                        tool_call_id=tc.tool_use_id,
+                        edit_seq=seq + sub_idx,
                     )
                 )
+            if edits:
+                edit_seq_by_path[file_path] = seq + len(edits)
 
     return diffs
 
@@ -1071,10 +1131,11 @@ def _handle_stop(
                 call.extra_fields["measurement_kind"] = transformation["measurement_kind"]
             if transformation.get("file_path"):
                 call.extra_fields["compression_file_path"] = transformation["file_path"]
+        call.extra_fields["dlp_enabled"] = _config.dlp_enabled(cfg)
     if _config.dlp_enabled(cfg):
         dlp.reconcile_captured_tool_results(tool_calls, events)
         dlp.reconcile_captured_tool_inputs(tool_calls, events)
-    file_diffs = _extract_file_diffs_from_tool_calls(tool_calls)
+    file_diffs = _extract_file_diffs_from_tool_calls(tool_calls, cwd=cwd)
 
     # Compute analytics from tool calls and file diffs.
     analytics = compute_session_analytics(tool_calls, file_diffs)
@@ -1128,6 +1189,7 @@ def _handle_stop(
             capabilities=dict(CLAUDE_CAPTURE_CAPABILITIES),
             warnings=capture_warnings,
             extra_fields={
+                **(payload.get("extra_fields") or {}),
                 "client_session_id": client_session_id or session_id,
                 **(
                     {"parent_session_id": parent_session_id}
@@ -1237,9 +1299,17 @@ def _handle_subagent_stop(parent_session_id: str, payload: dict) -> None:
     if not agent_transcript_path:
         return
 
-    child_session_id = f"{parent_session_id}:subagent:{agent_id}"
+    # AT-04: Derive deterministic uuid5 for subagents so child_session_id is a valid UUID
+    _SUBAGENT_NAMESPACE = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+    child_session_id = str(
+        uuid.uuid5(_SUBAGENT_NAMESPACE, f"urn:reclaimllm:{parent_session_id}:subagent:{agent_id}")
+    )
     child_payload = dict(payload)
     child_payload["transcript_path"] = agent_transcript_path
+    child_payload["extra_fields"] = {
+        **(child_payload.get("extra_fields") or {}),
+        "original_conversation_id": f"{parent_session_id}:subagent:{agent_id}",
+    }
     _handle_stop(
         child_session_id,
         child_payload,
@@ -1264,6 +1334,19 @@ _HANDLERS = {
 }
 
 
+def _is_cursor_payload(payload: dict) -> bool:
+    """Return True when Cursor invokes Claude hooks via third-party hook compatibility."""
+    if payload.get("cursor_version") or "workspace_roots" in payload:
+        return True
+    for key in ("transcript_path", "agent_transcript_path"):
+        path = payload.get(key)
+        if isinstance(path, str):
+            normalized = path.replace("\\", "/")
+            if "/.cursor/projects/" in normalized or "/agent-transcripts/" in normalized:
+                return True
+    return False
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: rclm-claude-hooks <EventName>", file=sys.stderr)
@@ -1283,6 +1366,9 @@ def main() -> None:
             "rclm-claude-hooks: could not parse stdin JSON for event %s",
             event_name,
         )
+        sys.exit(0)
+
+    if isinstance(payload, dict) and _is_cursor_payload(payload):
         sys.exit(0)
 
     session_id = payload.get("session_id", "unknown")

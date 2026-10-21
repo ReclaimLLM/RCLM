@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -175,12 +176,19 @@ def coalesce_file_diffs(diffs: list[FileDiff]) -> list[FileDiff]:
         ):
             # Apply a later replacement to content captured by an earlier Write.
             final_content = previous.after.replace(diff.before, diff.after, 1)
+            after_sha = hashlib.sha256(final_content.encode("utf-8")).hexdigest()
             by_path[diff.path] = FileDiff(
                 path=diff.path,
                 before=None,
                 after=final_content,
                 unified_diff=build_unified_diff(diff.path, None, final_content),
                 timestamp=diff.timestamp or previous.timestamp,
+                before_sha256=previous.before_sha256,
+                after_sha256=after_sha,
+                hash_source="write_content",
+                line_basis="file",
+                tool_call_id=diff.tool_call_id or previous.tool_call_id,
+                edit_seq=diff.edit_seq,
             )
             continue
 
@@ -190,6 +198,12 @@ def coalesce_file_diffs(diffs: list[FileDiff]) -> list[FileDiff]:
             after=_join_fragments(previous.after, diff.after),
             unified_diff=_join_diff_chunks(previous.unified_diff, diff.unified_diff),
             timestamp=diff.timestamp or previous.timestamp,
+            before_sha256=previous.before_sha256,
+            after_sha256=diff.after_sha256,
+            hash_source=diff.hash_source or previous.hash_source,
+            line_basis=previous.line_basis if previous.line_basis == diff.line_basis else "snippet",
+            tool_call_id=diff.tool_call_id or previous.tool_call_id,
+            edit_seq=diff.edit_seq,
         )
 
     return list(by_path.values())
@@ -250,6 +264,7 @@ def _process_tool_use(block: dict, data: CursorTranscriptData, timestamp: str | 
     if tool_name == "Write":
         content = _string_input(tool_input, "contents", "content", "text")
         if path and content is not None:
+            after_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
             data.file_diffs.append(
                 FileDiff(
                     path=path,
@@ -257,6 +272,12 @@ def _process_tool_use(block: dict, data: CursorTranscriptData, timestamp: str | 
                     after=content,
                     unified_diff=build_unified_diff(path, None, content),
                     timestamp=timestamp or "",
+                    before_sha256=None,
+                    after_sha256=after_sha,
+                    hash_source="write_content",
+                    line_basis="file",
+                    tool_call_id=call_id,
+                    edit_seq=len(data.file_diffs),
                 )
             )
     elif tool_name in {"StrReplace", "Edit"}:
@@ -270,5 +291,11 @@ def _process_tool_use(block: dict, data: CursorTranscriptData, timestamp: str | 
                     after=after,
                     unified_diff=build_unified_diff(path, before, after),
                     timestamp=timestamp or "",
+                    before_sha256=None,
+                    after_sha256=None,
+                    hash_source=None,
+                    line_basis="snippet",
+                    tool_call_id=call_id,
+                    edit_seq=len(data.file_diffs),
                 )
             )

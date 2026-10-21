@@ -1851,7 +1851,16 @@ def test_subagent_stop_uses_distinct_session_identity(monkeypatch, tmp_path):
         monkeypatch,
     )
 
-    assert uploaded[0].session_id == "parent:subagent:child-1"
+    import uuid
+
+    expected_child_session_id = str(
+        uuid.uuid5(
+            uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8"),
+            "urn:reclaimllm:parent:subagent:child-1",
+        )
+    )
+    assert uploaded[0].session_id == expected_child_session_id
+    assert uploaded[0].extra_fields["original_conversation_id"] == "parent:subagent:child-1"
     assert uploaded[0].transcript_path == "/tmp/child.jsonl"
     assert uploaded[0].extra_fields["client_session_id"] == "child-1"
     assert uploaded[0].extra_fields["parent_session_id"] == "parent"
@@ -2065,3 +2074,35 @@ def test_image_branch_skips_dlp_and_dedupe(monkeypatch, tmp_path, capsys):
 
     # Dedupe state should never have been touched for an image-shaped result.
     assert session_store.read_dedupe_state("sid-img-nodlp") == {}
+
+
+def test_claude_handler_ignores_cursor_payloads(monkeypatch, tmp_path):
+    """Cursor's third-party Claude hook compatibility must not let rclm-claude-hooks
+    contaminate or overwrite Cursor sessions with claude-unknown fallback records."""
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    uploaded = []
+
+    async def fake_upload_single(record):
+        uploaded.append(record)
+        return UploadOutcome(status=UploadStatus.UPLOADED, cleanup_safe=True)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+
+    cursor_stop_payload = {
+        "session_id": "d65f319d-6bfa-4640-a7e8-dade7f02572e",
+        "conversation_id": "d65f319d-6bfa-4640-a7e8-dade7f02572e",
+        "cursor_version": "2.0.0",
+        "workspace_roots": ["/Users/maziz/Desktop/CVFormatter"],
+        "transcript_path": (
+            "/Users/maziz/.cursor/projects/Users-maziz-Desktop-CVFormatter/"
+            "agent-transcripts/d65f319d-6bfa-4640-a7e8-dade7f02572e/"
+            "d65f319d-6bfa-4640-a7e8-dade7f02572e.jsonl"
+        ),
+    }
+    _run_handler("SessionStart", cursor_stop_payload, monkeypatch)
+    _run_handler("Stop", cursor_stop_payload, monkeypatch)
+
+    assert uploaded == []
+    assert session_store.read_events("d65f319d-6bfa-4640-a7e8-dade7f02572e") == []

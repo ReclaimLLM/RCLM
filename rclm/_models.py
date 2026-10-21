@@ -39,6 +39,12 @@ class FileDiff:
     after: str | None  # None if file deleted
     unified_diff: str  # output of difflib.unified_diff
     timestamp: str = ""  # ISO-8601 timestamp for the edit/tool event
+    before_sha256: str | None = None
+    after_sha256: str | None = None
+    hash_source: str | None = None
+    line_basis: str = "unknown"
+    tool_call_id: str | None = None
+    edit_seq: int = 0
 
 
 @dataclass

@@ -740,6 +740,61 @@ def _parse_codex_session(path: Path) -> HookSessionRecord | None:
     )
 
 
+def _decode_cursor_project_slug(slug: str) -> str:
+    """Resolve a Cursor project slug (e.g. Users-maziz-Desktop-Foo) to a path when possible."""
+    if not slug or slug == "empty-window":
+        return ""
+    parts = [p for p in slug.split("-") if p]
+    if not parts:
+        return ""
+
+    current = Path("/")
+    idx = 0
+    while idx < len(parts) and current.is_dir():
+        matched: tuple[Path, int] | None = None
+        for end in range(len(parts), idx, -1):
+            segment = "-".join(parts[idx:end])
+            for candidate_name in (
+                segment,
+                segment.replace("-", "_"),
+                segment.replace("-", "."),
+            ):
+                candidate = current / candidate_name
+                if candidate.exists():
+                    matched = (candidate, end)
+                    break
+            if matched is not None:
+                break
+        if matched is None:
+            if len(current.parts) >= 3 and current.parts[1] in ("Users", "home", "var", "tmp"):
+                return str(current / "-".join(parts[idx:]))
+            break
+        current, idx = matched
+    if idx == len(parts) and str(current) != "/":
+        return str(current)
+    return ""
+
+
+def _resolve_cursor_project_cwd(path: Path, transcript_cwd: str = "") -> str:
+    """Resolve the workspace path for a Cursor transcript file."""
+    if transcript_cwd:
+        return transcript_cwd
+    if path.parent.parent.name != "agent-transcripts":
+        return ""
+    project_dir = path.parent.parent.parent
+    trusted_file = project_dir / ".workspace-trusted"
+    if trusted_file.is_file():
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            trusted_data = json.loads(trusted_file.read_text(encoding="utf-8"))
+            workspace_path = trusted_data.get("workspacePath")
+            if isinstance(workspace_path, str) and workspace_path.strip():
+                return workspace_path.strip()
+    decoded = _decode_cursor_project_slug(project_dir.name)
+    if decoded:
+        return decoded
+    return "" if project_dir.name == "empty-window" else project_dir.name
+
+
 def _parse_cursor_session(path: Path) -> HookSessionRecord | None:
     """Parse a Cursor JSONL transcript file into a HookSessionRecord."""
     transcript_data = cursor_transcript.parse_transcript(str(path))
@@ -758,8 +813,7 @@ def _parse_cursor_session(path: Path) -> HookSessionRecord | None:
 
     return HookSessionRecord(
         session_id=session_id,
-        cwd=transcript_data.cwd
-        or path.parent.parent.parent.name,  # ~/.cursor/projects/<project>/agent-transcripts/id/id.jsonl
+        cwd=_resolve_cursor_project_cwd(path, transcript_data.cwd),
         started_at=started_at,
         ended_at=ended_at,
         duration_s=duration_s,

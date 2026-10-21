@@ -693,6 +693,31 @@ def test_parse_cursor_session_uses_cursor_unknown_fallback_model(tmp_path):
     assert record.model == "cursor-unknown"
 
 
+def test_parse_cursor_session_resolves_workspace_trusted_cwd(tmp_path):
+    project_dir = tmp_path / ".cursor" / "projects" / "Users-maziz-Desktop-ReclaimLLM"
+    session_dir = project_dir / "agent-transcripts" / "550e8400-e29b-41d4-a716-446655440000"
+    session_dir.mkdir(parents=True)
+    (project_dir / ".workspace-trusted").write_text(
+        json.dumps({"workspacePath": "/Users/maziz/Desktop/ReclaimLLM"}),
+        encoding="utf-8",
+    )
+    transcript = session_dir / "550e8400-e29b-41d4-a716-446655440000.jsonl"
+    _write_jsonl(
+        transcript,
+        [
+            {
+                "role": "user",
+                "message": {"content": [{"type": "text", "text": "hello"}]},
+            }
+        ],
+    )
+
+    record = _parse_cursor_session(transcript)
+
+    assert record is not None
+    assert record.cwd == "/Users/maziz/Desktop/ReclaimLLM"
+
+
 # ---------------------------------------------------------------------------
 # OpenClaw session parsing
 # ---------------------------------------------------------------------------

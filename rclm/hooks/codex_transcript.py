@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Iterable
@@ -167,9 +168,9 @@ def _extract(entries: Iterable[dict]) -> CodexTranscriptData:
 def _dedupe_file_diffs(file_diffs: list[FileDiff]) -> list[FileDiff]:
     """Deduplicate the same edit reported by tool and lifecycle records."""
     deduped: list[FileDiff] = []
-    seen: set[tuple[str, str | None, str | None]] = set()
+    seen: set[tuple[str, str, str | None, str | None]] = set()
     for file_diff in file_diffs:
-        fingerprint = (file_diff.path, file_diff.before, file_diff.after)
+        fingerprint = (file_diff.path, file_diff.timestamp, file_diff.before, file_diff.after)
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
@@ -432,6 +433,14 @@ def _parse_patch_apply_end(payload: dict, timestamp: str = "") -> list[FileDiff]
 
         move_path = raw_change.get("move_path")
         path = move_path if isinstance(move_path, str) and move_path else source_path
+
+        before_sha256: str | None = (
+            hashlib.sha256(before.encode("utf-8")).hexdigest() if before is not None else None
+        )
+        after_sha256: str | None = (
+            hashlib.sha256(after.encode("utf-8")).hexdigest() if after is not None else None
+        )
+        hash_src = "write_content" if operation == "add" else "reverse_applied"
         diffs.append(
             FileDiff(
                 path=path,
@@ -439,6 +448,10 @@ def _parse_patch_apply_end(payload: dict, timestamp: str = "") -> list[FileDiff]
                 after=after,
                 unified_diff=unified_diff,
                 timestamp=timestamp,
+                before_sha256=before_sha256,
+                after_sha256=after_sha256,
+                hash_source=hash_src,
+                line_basis="file" if unified_diff else "unknown",
             )
         )
 

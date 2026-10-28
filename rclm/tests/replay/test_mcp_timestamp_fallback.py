@@ -5,6 +5,8 @@ null (the claude_handler.py Stop-hook bug affecting historical sessions).
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from rclm import mcp_server
@@ -154,7 +156,7 @@ class _CorpusClient:
         self.fetch_count = 0
 
     async def enumerate_corpus(self, **kwargs):
-        return self.candidates
+        return self.candidates, "team"
 
     async def fetch_blob(self, session_id: str):
         self.fetch_count += 1
@@ -170,7 +172,7 @@ async def test_corpus_limit_counts_fully_eligible_sessions(monkeypatch):
         lambda index: EligibilityResult(index >= 10, "text_result_tokens", 0),
     )
 
-    pairs, funnel = await _replay_corpus_pairs(
+    pairs, funnel, corpus_scope = await _replay_corpus_pairs(
         client,
         days=30,
         source="all",
@@ -188,4 +190,44 @@ async def test_corpus_limit_counts_fully_eligible_sessions(monkeypatch):
         "eligible": 50,
         "excluded": {"text_result_tokens": 10},
     }
+    assert corpus_scope == "team"
     assert client.fetch_count == 60
+
+
+async def test_corpus_fetches_blobs_with_bounded_concurrency(monkeypatch):
+    class _ConcurrentCorpusClient(_CorpusClient):
+        def __init__(self, count: int):
+            super().__init__(count)
+            self.active_fetches = 0
+            self.max_active_fetches = 0
+
+        async def fetch_blob(self, session_id: str):
+            self.fetch_count += 1
+            self.active_fetches += 1
+            self.max_active_fetches = max(self.max_active_fetches, self.active_fetches)
+            await asyncio.sleep(0.01)
+            self.active_fetches -= 1
+            return {"index": int(session_id.rsplit("-", 1)[1])}
+
+    client = _ConcurrentCorpusClient(20)
+    monkeypatch.setattr(mcp_server, "replay_blob", lambda blob, mechanisms: blob["index"])
+    monkeypatch.setattr(
+        mcp_server.replay_eligibility_mod,
+        "blob_eligibility",
+        lambda index: EligibilityResult(True, None, None),
+    )
+
+    pairs, _funnel, _scope = await _replay_corpus_pairs(
+        client,
+        days=30,
+        source="all",
+        model_family=None,
+        project=None,
+        session_category=None,
+        limit=20,
+        min_turns=10,
+        min_tool_calls=10,
+    )
+
+    assert len(pairs) == 20
+    assert client.max_active_fetches == mcp_server._REPLAY_BLOB_FETCH_CONCURRENCY

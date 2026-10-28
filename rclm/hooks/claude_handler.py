@@ -16,6 +16,7 @@ import logging
 import os
 import shlex
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from rclm.hooks import (
     context_memory,
     dedupe,
     dlp,
+    egress_guard,
     image_eviction,
     image_lifecycle,
     read_cache,
@@ -193,6 +195,19 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     changed = False
     hook_output: dict = {"hookEventName": "PreToolUse"}
     cwd = _resolve_cwd(session_id, payload)
+
+    if isinstance(tool_input, dict):
+        verdict = egress_guard.check_tool_egress(tool_name, tool_input, cfg=cfg)
+        if verdict.allowed == 0:
+            hook_output.update(
+                {
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": verdict.reason
+                    or "ReclaimLLM Egress Policy blocked this external network request.",
+                }
+            )
+            print(json.dumps({"hookSpecificOutput": hook_output}))
+            return
 
     if _config.dlp_enabled(cfg):
         try:
@@ -1017,6 +1032,7 @@ def _handle_stop(
     schedule_update: bool = False,
     parent_session_id: str | None = None,
     client_session_id: str | None = None,
+    title: str | None = None,
 ) -> None:
     now = _now()
     events = session_store.read_events(session_id)
@@ -1044,6 +1060,15 @@ def _handle_stop(
         started_at = None
         ended_at = None
     transcript_path = payload.get("transcript_path")
+    if transcript_path:
+        session_store.append_event(
+            session_id,
+            {
+                "event_type": "TranscriptPath",
+                "transcript_path": transcript_path,
+                "timestamp": payload.get("timestamp", now),
+            },
+        )
     transcript_data = transcript.parse_transcript(transcript_path)
     cfg = _config.load()
     fallback_messages = _build_fallback_messages(
@@ -1176,6 +1201,7 @@ def _handle_stop(
         dominant_tool=analytics.get("dominant_tool"),
         mechanism_savings=mechanism_savings,
         hook_policy_snapshot=bootstrap.policy_snapshot_from_events(events, "claude"),
+        title=title,
         **native_metadata(
             "claude_code",
             adapter_name="claude_code_hooks",
@@ -1266,8 +1292,162 @@ def _handle_stop(
     # _handle_session_end, on the host's actual final session-end event.
 
 
+_SUBAGENT_NAMESPACE = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+_SUBAGENT_TRANSCRIPT_RETRY_ATTEMPTS = 5
+_SUBAGENT_TRANSCRIPT_RETRY_DELAY_S = 0.15
+
+
+def _child_session_id(parent_session_id: str, agent_id: str) -> str:
+    return str(
+        uuid.uuid5(
+            _SUBAGENT_NAMESPACE,
+            f"urn:reclaimllm:{parent_session_id}:subagent:{agent_id}",
+        )
+    )
+
+
+def _subagents_dir_from_transcript(transcript_path: str | None) -> Path | None:
+    """Claude stores agent JSONL under `{session_stem}/subagents/` next to the parent transcript."""
+    if not transcript_path:
+        return None
+    parent_transcript = Path(transcript_path).expanduser()
+    candidate = parent_transcript.with_suffix("") / "subagents"
+    return candidate if candidate.is_dir() else None
+
+
+def _read_agent_meta(agent_transcript_path: Path) -> dict:
+    meta_path = agent_transcript_path.with_suffix(".meta.json")
+    if not meta_path.is_file():
+        # Claude names these `agent-<id>.jsonl` with sidecar `agent-<id>.meta.json`.
+        meta_path = agent_transcript_path.parent / f"{agent_transcript_path.stem}.meta.json"
+    if not meta_path.is_file():
+        return {}
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _parse_agent_transcript_with_retry(transcript_path: str) -> transcript.TranscriptData:
+    """Read a subagent transcript, retrying briefly while Claude flushes the JSONL."""
+    path = str(Path(transcript_path).expanduser())
+    data = transcript.TranscriptData()
+    for attempt in range(_SUBAGENT_TRANSCRIPT_RETRY_ATTEMPTS):
+        data = transcript.parse_transcript(path)
+        if data.messages or data.tool_calls:
+            return data
+        if attempt + 1 < _SUBAGENT_TRANSCRIPT_RETRY_ATTEMPTS:
+            time.sleep(_SUBAGENT_TRANSCRIPT_RETRY_DELAY_S)
+    return data
+
+
+def _upload_subagent_session(
+    parent_session_id: str,
+    agent_id: str,
+    agent_transcript_path: str,
+    *,
+    payload: dict | None = None,
+    agent_type: str | None = None,
+) -> bool:
+    """Upload one child session when the agent transcript has real content.
+
+    Returns True when an upload was attempted. Skips Claude's internal /
+    progress-only SubagentStop events that have no parseable transcript
+    (those previously created empty ReclaimLLM sessions).
+    """
+    path = Path(agent_transcript_path).expanduser()
+    if not path.is_file():
+        return False
+
+    data = _parse_agent_transcript_with_retry(str(path))
+    if not data.messages and not data.tool_calls:
+        return False
+
+    meta = _read_agent_meta(path)
+    resolved_agent_type = (
+        agent_type
+        or (payload or {}).get("agent_type")
+        or meta.get("agentType")
+        or meta.get("agent_type")
+    )
+    description = meta.get("description")
+    child_session_id = _child_session_id(parent_session_id, agent_id)
+    child_payload = dict(payload or {})
+    # Prefer the flushed agent transcript over last_assistant_message-only fallback.
+    child_payload.pop("last_assistant_message", None)
+    child_payload["transcript_path"] = str(path)
+    child_payload["extra_fields"] = {
+        **(child_payload.get("extra_fields") or {}),
+        "original_conversation_id": f"{parent_session_id}:subagent:{agent_id}",
+        "agent_type": resolved_agent_type,
+        **(
+            {"agent_description": description}
+            if isinstance(description, str) and description
+            else {}
+        ),
+        **({"is_fork": True} if meta.get("isFork") else {}),
+    }
+    _handle_stop(
+        child_session_id,
+        child_payload,
+        parent_session_id=parent_session_id,
+        client_session_id=str(agent_id),
+        title=description if isinstance(description, str) else None,
+    )
+    return True
+
+
+def _resolve_transcript_path(session_id: str, payload: dict) -> str | None:
+    path = payload.get("transcript_path")
+    if isinstance(path, str) and path:
+        return path
+    for event in reversed(session_store.read_events(session_id)):
+        if event.get("event_type") == "TranscriptPath" and event.get("transcript_path"):
+            return str(event["transcript_path"])
+    return None
+
+
+def _backfill_subagent_transcripts(parent_session_id: str, payload: dict) -> None:
+    """Re-upload any on-disk agent transcripts after the parent session ends.
+
+    SubagentStop often fires before Claude finishes flushing agent JSONL, and
+    some internal agents fire SubagentStop with no durable transcript at all.
+    SessionEnd is the last chance to capture real fork/agent work.
+    """
+    subagents_dir = _subagents_dir_from_transcript(
+        _resolve_transcript_path(parent_session_id, payload)
+    )
+    if subagents_dir is None:
+        return
+    for agent_path in sorted(subagents_dir.glob("agent-*.jsonl")):
+        if agent_path.name.endswith(".meta.json"):
+            continue
+        agent_id = agent_path.stem.removeprefix("agent-")
+        if not agent_id:
+            continue
+        try:
+            _upload_subagent_session(
+                parent_session_id,
+                agent_id,
+                str(agent_path),
+                payload=payload,
+            )
+        except Exception:
+            logger.exception(
+                "failed to backfill subagent transcript %s for parent %s",
+                agent_path,
+                parent_session_id,
+            )
+
+
 def _handle_session_end(session_id: str, payload: dict) -> None:
-    """Clean state only after upload or durable quarantine was confirmed."""
+    """Backfill subagents, then clean state after upload/quarantine was confirmed."""
+    try:
+        _backfill_subagent_transcripts(session_id, payload)
+    except Exception:
+        logger.exception("subagent backfill failed for session %s", session_id)
+
     events = session_store.read_events(session_id)
     for event in events:
         if event.get("event_type") == "DLPTempFile":
@@ -1298,23 +1478,12 @@ def _handle_subagent_stop(parent_session_id: str, payload: dict) -> None:
     agent_transcript_path = payload.get("agent_transcript_path")
     if not agent_transcript_path:
         return
-
-    # AT-04: Derive deterministic uuid5 for subagents so child_session_id is a valid UUID
-    _SUBAGENT_NAMESPACE = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
-    child_session_id = str(
-        uuid.uuid5(_SUBAGENT_NAMESPACE, f"urn:reclaimllm:{parent_session_id}:subagent:{agent_id}")
-    )
-    child_payload = dict(payload)
-    child_payload["transcript_path"] = agent_transcript_path
-    child_payload["extra_fields"] = {
-        **(child_payload.get("extra_fields") or {}),
-        "original_conversation_id": f"{parent_session_id}:subagent:{agent_id}",
-    }
-    _handle_stop(
-        child_session_id,
-        child_payload,
-        parent_session_id=parent_session_id,
-        client_session_id=str(agent_id),
+    _upload_subagent_session(
+        parent_session_id,
+        str(agent_id),
+        agent_transcript_path,
+        payload=payload,
+        agent_type=payload.get("agent_type"),
     )
 
 

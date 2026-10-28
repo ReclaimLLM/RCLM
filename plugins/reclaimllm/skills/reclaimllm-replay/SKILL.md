@@ -2,7 +2,7 @@
 name: reclaimllm-replay
 description: >
   Read-only verification of ReclaimLLM's published tool-result token-reduction
-  claim (25.08%) against the user's own captured sessions. TRIGGER when the
+  claim (25.08%) against the user's authorized captured sessions. TRIGGER when the
   user asks: "would compression have helped here", "verify the token savings
   claim on my sessions", "does compression actually help me", "replay this
   session", "check if the 25% number holds for my data", "is compression
@@ -25,8 +25,8 @@ compatibility: Requires Python 3.10+, pip install rclm, authenticated ReclaimLLM
 
 # ReclaimLLM Replay
 
-Replay reproduces RCLM's compression claim against the user's own captured
-sessions, on their machine, in the same units the claim was published in:
+Replay reproduces RCLM's compression claim against sessions the user is
+authorized to read, on their machine, in the same units the claim was published in:
 **text tool-result tokens removed**. It is strictly read-only — it never
 writes to the database, never re-executes a historical command, and never
 calls a model. The claim being verified is narrow and must be stated exactly
@@ -59,7 +59,9 @@ this way when relaying results:
   `hash_dedupe`); pass a subset only if the user wants to isolate one
   mechanism.
 - `replay_corpus(days=30, source="all", model_family?, project?, session_category?, mechanisms?, limit?, min_turns?, min_tool_calls?)` —
-  a filtered set of the caller's own sessions. `days` is an exact rolling
+  a filtered set from the caller's widest authorized scope: team leads include
+  their teams, admins include their organization, and other callers follow org
+  sharing settings. `days` is an exact rolling
   ingestion window measured on `ingested_at`. For `source="codex"`, stored
   models must start with `gpt-` or `codex-`. `limit` is the
   target fully eligible session count. Replay fetches up to four times that
@@ -145,6 +147,8 @@ back to `RECLAIMLLM_SERVER_URL` and `RECLAIMLLM_API_KEY`.
 - Do not lower the eligibility bar or keep re-querying with looser filters
   to force a number into existence. If nothing is eligible, that is the
   answer.
+- Always state the effective `scope` returned for a corpus replay so team or
+  organization results are not described as personal-only data.
 - Do not treat Replay as proof of live savings. It is a deterministic
   counterfactual over already-captured tool results, not an observation of
   the agent's actual behavior under compression.

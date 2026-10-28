@@ -1830,6 +1830,12 @@ def test_subagent_stop_uses_distinct_session_identity(monkeypatch, tmp_path):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     session_store.append_event("parent", {"event_type": "SessionStart"})
     uploaded = []
+    child_transcript = tmp_path / "child.jsonl"
+    child_transcript.write_text("{}\n", encoding="utf-8")
+    (tmp_path / "child.meta.json").write_text(
+        json.dumps({"agentType": "fork", "isFork": True, "description": "Build pages"}),
+        encoding="utf-8",
+    )
 
     async def fake_upload_single(record):
         uploaded.append(record)
@@ -1846,7 +1852,8 @@ def test_subagent_stop_uses_distinct_session_identity(monkeypatch, tmp_path):
         {
             "session_id": "parent",
             "agent_id": "child-1",
-            "agent_transcript_path": "/tmp/child.jsonl",
+            "agent_type": "fork",
+            "agent_transcript_path": str(child_transcript),
         },
         monkeypatch,
     )
@@ -1861,12 +1868,98 @@ def test_subagent_stop_uses_distinct_session_identity(monkeypatch, tmp_path):
     )
     assert uploaded[0].session_id == expected_child_session_id
     assert uploaded[0].extra_fields["original_conversation_id"] == "parent:subagent:child-1"
-    assert uploaded[0].transcript_path == "/tmp/child.jsonl"
+    assert uploaded[0].transcript_path == str(child_transcript)
     assert uploaded[0].extra_fields["client_session_id"] == "child-1"
     assert uploaded[0].extra_fields["parent_session_id"] == "parent"
+    assert uploaded[0].extra_fields["agent_type"] == "fork"
+    assert uploaded[0].title == "Build pages"
     assert any(
         event["event_type"] == "SubagentStop" for event in session_store.read_events("parent")
     )
+
+
+def test_subagent_stop_skips_empty_transcript(monkeypatch, tmp_path):
+    """Internal/progress SubagentStop events must not create empty sessions."""
+    from rclm.hooks import session_store
+    from rclm.hooks.transcript import TranscriptData
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_store.append_event("parent", {"event_type": "SessionStart"})
+    uploaded = []
+    empty_transcript = tmp_path / "empty-agent.jsonl"
+    empty_transcript.write_text("", encoding="utf-8")
+
+    async def fake_upload_single(record):
+        uploaded.append(record)
+        return UploadOutcome(UploadStatus.UPLOADED)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda path: TranscriptData(),
+    )
+    monkeypatch.setattr("rclm.hooks.claude_handler.time.sleep", lambda _s: None)
+
+    _run_handler(
+        "SubagentStop",
+        {
+            "session_id": "parent",
+            "agent_id": "internal-1",
+            "agent_transcript_path": str(empty_transcript),
+            "last_assistant_message": "Writing page.tsx",
+        },
+        monkeypatch,
+    )
+
+    assert uploaded == []
+    assert any(
+        event["event_type"] == "SubagentStop" for event in session_store.read_events("parent")
+    )
+
+
+def test_session_end_backfills_subagent_transcripts(monkeypatch, tmp_path):
+    from rclm.hooks import session_store
+    from rclm.hooks.transcript import TranscriptData
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    session_store.append_event("parent", {"event_type": "SessionStart"})
+    uploaded = []
+
+    parent_transcript = tmp_path / "parent.jsonl"
+    parent_transcript.write_text("{}\n", encoding="utf-8")
+    subagents = tmp_path / "parent" / "subagents"
+    subagents.mkdir(parents=True)
+    agent_transcript = subagents / "agent-late-1.jsonl"
+    agent_transcript.write_text("{}\n", encoding="utf-8")
+    (subagents / "agent-late-1.meta.json").write_text(
+        json.dumps({"agentType": "fork", "description": "Late flush"}),
+        encoding="utf-8",
+    )
+
+    async def fake_upload_single(record):
+        uploaded.append(record)
+        return UploadOutcome(UploadStatus.UPLOADED)
+
+    monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", fake_upload_single)
+    monkeypatch.setattr(
+        "rclm.hooks.claude_handler.transcript.parse_transcript",
+        lambda path: TranscriptData(
+            messages=[{"role": "assistant", "content": f"from:{path}"}],
+            tool_calls=[],
+        ),
+    )
+    monkeypatch.setattr("rclm.hooks.claude_handler.time.sleep", lambda _s: None)
+
+    _run_handler(
+        "SessionEnd",
+        {"session_id": "parent", "transcript_path": str(parent_transcript)},
+        monkeypatch,
+    )
+
+    assert len(uploaded) == 1
+    assert uploaded[0].extra_fields["client_session_id"] == "late-1"
+    assert uploaded[0].extra_fields["parent_session_id"] == "parent"
+    assert uploaded[0].title == "Late flush"
 
 
 # ---------------------------------------------------------------------------

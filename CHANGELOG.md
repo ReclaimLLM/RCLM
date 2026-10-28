@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.35] — 2026-10-28
+
+### Added
+- Synchronous external network egress policy guard intercepting shell HTTP, file transfers, script runners, and native fetch tools before execution (`rclm/hooks/egress_guard.py`)
+- Comprehensive test suite for pre-tool egress evaluation and policy denial verdicts (`rclm/tests/test_egress_guard.py`)
+- Effective `scope` field reporting in `replay_corpus`, `replay_compare`, and `replay_eligibility` MCP responses (`rclm/mcp_server.py`, `rclm/tests/replay/test_window_selection.py`)
+
+### Changed
+- Replay corpus enumeration removes hardcoded `"mine"` scope, delegating to the backend caller's widest authorized sharing scope (`rclm/mcp_server.py`, `README.md`, `plugins/reclaimllm/skills/reclaimllm-replay/SKILL.md`)
+
+### Security
+- Integrated pre-tool egress guard into Claude, Antigravity, Codex, Cursor, and Copilot hooks to deny unauthorized outbound connections before subprocess execution (`rclm/hooks/claude_handler.py`, `rclm/hooks/antigravity_handler.py`, `rclm/hooks/codex_handler.py`, `rclm/hooks/cursor_handler.py`, `rclm/hooks/copilot_handler.py`)
+
+### Performance
+- Parallelized candidate session blob fetching in `_replay_corpus_pairs` using `asyncio.gather` with bounded concurrency of 8 (`rclm/mcp_server.py`, `rclm/tests/replay/test_mcp_timestamp_fallback.py`)
+
+---
+
 ## [v0.1.34] — 2026-10-21
 
 ### Added

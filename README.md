@@ -117,7 +117,7 @@ Start a new agent thread and confirm the `reclaimllm` plugin and MCP server are 
 | `signals` | Up to 5 open workflow-efficiency signals (evidence + prescribed fix) for the current project. |
 | `replay_eligibility` | Cheap, metadata-only check of whether replaying compression mechanisms is worth doing. |
 | `replay_session` | Reproduce shipped compression mechanisms over one captured session and report the real tool-result token reduction. |
-| `replay_corpus` | Same as `replay_session`, aggregated across a filtered window of sessions. |
+| `replay_corpus` | Same as `replay_session`, aggregated across a filtered window in the caller's authorized scope (team for team leads, organization for admins). |
 | `replay_compare` | Replay the same corpus under multiple mechanism configurations in one call. |
 
 All tools are read-only: none re-execute historical commands, call a model, or modify captured data.
@@ -135,7 +135,7 @@ When you need the complete captured session instead of a summary, ask the target
 - "What's the aggregate savings across my Codex sessions this month?" → `replay_corpus`
 - "Compare shell compaction alone vs. combined with range cache" → `replay_compare`
 
-Every result states sessions considered vs. eligible vs. excluded; a session or corpus below the turn/tool-call thresholds is refused with the specific failing constraint rather than given an unstable number.
+Every corpus result states its effective scope plus sessions considered vs. eligible vs. excluded; a session or corpus below the turn/tool-call thresholds is refused with the specific failing constraint rather than given an unstable number.
 
 ---
 

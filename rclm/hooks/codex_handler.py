@@ -183,6 +183,26 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     changed = False
     dlp_tool = "Bash" if tool_name in {"Bash", "exec", "exec_command", "shell"} else tool_name
 
+    from rclm.hooks import egress_guard
+
+    verdict = egress_guard.check_tool_egress(dlp_tool, effective_input, cfg=cfg)
+    if verdict.allowed == 0:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            verdict.reason
+                            or "ReclaimLLM Egress Policy blocked this external network request."
+                        ),
+                    }
+                }
+            )
+        )
+        return
+
     if _config.dlp_enabled(cfg):
         try:
 

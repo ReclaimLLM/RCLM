@@ -187,6 +187,22 @@ def _handle_pre_tool_use(payload: dict) -> None:
     cfg = _config.load()
     normalized = tool_name.lower()
 
+    # 0. External Network Egress Policy Check (URL / IP / Country)
+    from rclm.hooks import egress_guard
+
+    verdict = egress_guard.check_tool_egress(normalized, tool_input, cfg=cfg)
+    if verdict.allowed == 0:
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": verdict.reason
+                    or "[rclm egress] Blocked: outbound connection denied by organization policy.",
+                }
+            )
+        )
+        return
+
     # 1. DLP Protection
     if _config.dlp_enabled(cfg):
         if normalized == "view_file":

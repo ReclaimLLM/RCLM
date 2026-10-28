@@ -1,4 +1,4 @@
-"""Tests for caller-owned, ingested-at-based replay corpus selection."""
+"""Tests for authorized-scope, ingested-at-based replay corpus selection."""
 
 from __future__ import annotations
 
@@ -66,6 +66,7 @@ async def test_corpus_enumeration_scans_four_times_target_and_returns_candidates
     async def fake_request(method, path, *, params=None):
         captured.update({"method": method, "path": path, "params": params})
         return {
+            "scope": "team",
             "sessions": [
                 {
                     "session_id": f"session-{index}",
@@ -73,12 +74,12 @@ async def test_corpus_enumeration_scans_four_times_target_and_returns_candidates
                     "ingested_at": now,
                 }
                 for index in range(75)
-            ]
+            ],
         }
 
     monkeypatch.setattr(client, "_request", fake_request)
 
-    sessions = await client.enumerate_corpus(
+    sessions, corpus_scope = await client.enumerate_corpus(
         days=30,
         source=None,
         model_family=None,
@@ -93,9 +94,10 @@ async def test_corpus_enumeration_scans_four_times_target_and_returns_candidates
     assert "record_type" not in captured["params"]
     assert captured["params"]["include_changed_files"] == "false"
     assert captured["params"]["limit"] == 100
-    assert captured["params"]["scope"] == "mine"
+    assert "scope" not in captured["params"]
     assert captured["params"]["min_turns"] == 5
     assert captured["params"]["min_tool_calls"] == 5
     assert [session["session_id"] for session in sessions] == [
         f"session-{index}" for index in range(75)
     ]
+    assert corpus_scope == "team"

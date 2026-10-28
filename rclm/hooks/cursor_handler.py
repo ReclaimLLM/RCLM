@@ -155,15 +155,30 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
 
 
 def _handle_before_shell_execution(session_id: str, payload: dict) -> None:
+    cmd = payload.get("command", "")
     session_store.append_event(
         session_id,
         {
             "event_type": "PreToolUse",
             "tool_name": "shell",
-            "tool_input": {"command": payload.get("command", "")},
+            "tool_input": {"command": cmd},
             "timestamp": payload.get("timestamp", _now()),
         },
     )
+    from rclm.hooks import egress_guard
+
+    verdict = egress_guard.check_tool_egress("Bash", {"command": cmd})
+    if verdict.allowed == 0:
+        reason = verdict.reason or "ReclaimLLM Egress Policy blocked this external network request."
+        print(
+            json.dumps(
+                {
+                    "permission": "deny",
+                    "user_message": reason,
+                    "agent_message": reason,
+                }
+            )
+        )
 
 
 def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
@@ -175,6 +190,24 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
     effective_input = dict(tool_input)
     changed = False
     dlp_tool = "Bash" if tool_name.lower() in {"shell", "bash"} else tool_name
+
+    from rclm.hooks import egress_guard
+
+    verdict = egress_guard.check_tool_egress(dlp_tool, effective_input, cfg=cfg)
+    if verdict.allowed == 0:
+        reason = verdict.reason or "ReclaimLLM Egress Policy blocked this external network request."
+        print(
+            json.dumps(
+                {
+                    "decision": "deny",
+                    "reason": reason,
+                    "permission": "deny",
+                    "user_message": reason,
+                    "agent_message": reason,
+                }
+            )
+        )
+        return
 
     if _config.dlp_enabled(cfg):
         try:

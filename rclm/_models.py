@@ -116,4 +116,5 @@ class HookSessionRecord:
     model_provider: str | None = None
     capture_capabilities: dict = field(default_factory=dict)
     capture_warnings: list[str] = field(default_factory=list)
+    title: str | None = None
     extra_fields: dict = field(default_factory=dict)

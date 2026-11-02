@@ -61,55 +61,91 @@ def _coerce_str(val: object) -> str:
     return val
 
 
+def _write_args(inp: dict) -> tuple[str, str] | None:
+    """Resolve create/overwrite args across Antigravity tool renames.
+
+    Legacy: write_to_file(TargetFile, CodeContent)
+    Current: write_file(Path, Content)
+    """
+    file_path = _coerce_str(inp.get("Path") or inp.get("TargetFile") or "")
+    content = _coerce_str(inp.get("Content") if "Content" in inp else inp.get("CodeContent", ""))
+    if not file_path:
+        return None
+    return file_path, content
+
+
+def _edit_args(inp: dict) -> tuple[str, str, str] | None:
+    """Resolve search/replace args across Antigravity tool renames.
+
+    Legacy: replace_file_content(TargetFile, TargetContent, ReplacementContent)
+    Current: edit_file(Path, Target, Replacement)
+    """
+    file_path = _coerce_str(inp.get("Path") or inp.get("TargetFile") or "")
+    if not file_path:
+        return None
+    if "Target" in inp or "Replacement" in inp:
+        old = _coerce_str(inp.get("Target", ""))
+        new = _coerce_str(inp.get("Replacement", ""))
+    else:
+        old = _coerce_str(inp.get("TargetContent", ""))
+        new = _coerce_str(inp.get("ReplacementContent", ""))
+    return file_path, old, new
+
+
 def extract_antigravity_file_diffs(tool_calls: list[ToolCall]) -> list[FileDiff]:
-    """Extract FileDiff objects from write_to_file and replace_file_content tool calls."""
+    """Extract FileDiff objects from Antigravity write/edit tool calls.
+
+    Supports both the legacy write_to_file / replace_file_content names and the
+    current write_file / edit_file names observed in live Antigravity sessions.
+    """
     diffs: list[FileDiff] = []
     for tc in tool_calls:
-        name = tc.tool_name
+        name = (tc.tool_name or "").lower()
         inp = tc.tool_input if isinstance(tc.tool_input, dict) else {}
-        if name == "write_to_file":
-            file_path = _coerce_str(inp.get("TargetFile", ""))
-            content = _coerce_str(inp.get("CodeContent", ""))
-            if file_path:
-                unified = "".join(
-                    difflib.unified_diff(
-                        [],
-                        content.splitlines(keepends=True),
-                        fromfile=f"a/{file_path}",
-                        tofile=f"b/{file_path}",
-                    )
+        if name in {"write_to_file", "write_file"}:
+            parsed = _write_args(inp)
+            if not parsed:
+                continue
+            file_path, content = parsed
+            unified = "".join(
+                difflib.unified_diff(
+                    [],
+                    content.splitlines(keepends=True),
+                    fromfile=f"a/{file_path}",
+                    tofile=f"b/{file_path}",
                 )
-                diffs.append(
-                    FileDiff(
-                        path=file_path,
-                        before=None,
-                        after=content,
-                        unified_diff=unified,
-                        timestamp=tc.timestamp,
-                    )
+            )
+            diffs.append(
+                FileDiff(
+                    path=file_path,
+                    before=None,
+                    after=content,
+                    unified_diff=unified,
+                    timestamp=tc.timestamp,
                 )
-        elif name == "replace_file_content":
-            file_path = _coerce_str(inp.get("TargetFile", ""))
-            old = _coerce_str(inp.get("TargetContent", ""))
-            new = _coerce_str(inp.get("ReplacementContent", ""))
-            if file_path:
-                unified = "".join(
-                    difflib.unified_diff(
-                        old.splitlines(keepends=True),
-                        new.splitlines(keepends=True),
-                        fromfile=f"a/{file_path}",
-                        tofile=f"b/{file_path}",
-                    )
+            )
+        elif name in {"replace_file_content", "edit_file"}:
+            parsed = _edit_args(inp)
+            if not parsed:
+                continue
+            file_path, old, new = parsed
+            unified = "".join(
+                difflib.unified_diff(
+                    old.splitlines(keepends=True),
+                    new.splitlines(keepends=True),
+                    fromfile=f"a/{file_path}",
+                    tofile=f"b/{file_path}",
                 )
-                diffs.append(
-                    FileDiff(
-                        path=file_path,
-                        before=old,
-                        after=new,
-                        unified_diff=unified,
-                        timestamp=tc.timestamp,
-                    )
+            )
+            diffs.append(
+                FileDiff(
+                    path=file_path,
+                    before=old,
+                    after=new,
+                    unified_diff=unified,
+                    timestamp=tc.timestamp,
                 )
+            )
     return diffs
 
 

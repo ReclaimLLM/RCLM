@@ -825,7 +825,7 @@ def test_handoff_advisor_on_by_default(tmp_path, monkeypatch):
 
     config = json.loads((tmp_path / "config.json").read_text())
     assert config["handoff_advisor"] is True
-    assert config["handoff_advisor_token_threshold"] == 160_000
+    assert config["handoff_advisor_token_threshold"] == 640_000
     assert config["handoff_advisor_tool_call_threshold"] == 120
 
 

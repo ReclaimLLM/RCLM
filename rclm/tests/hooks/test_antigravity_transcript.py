@@ -343,6 +343,62 @@ def test_extracts_file_diffs_from_write_and_replace(tmp_path):
     assert "+print('hello world')" in d1.unified_diff
 
 
+def test_extracts_file_diffs_from_current_write_file_and_edit_file(tmp_path):
+    """Live Antigravity renamed tools to write_file/edit_file with Path args."""
+    path = _write(
+        tmp_path,
+        [
+            {
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t0",
+                "tool_calls": [
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "Path": "/repo/hello.py",
+                            "Content": "print('hello')\n",
+                            "Overwrite": True,
+                        },
+                    }
+                ],
+            },
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "t1",
+                "tool_calls": [
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "Path": "/repo/hello.py",
+                            "Target": "print('hello')\n",
+                            "Replacement": "print('hello world')\n",
+                        },
+                    }
+                ],
+            },
+        ],
+    )
+    data = parse_transcript(str(path))
+    assert len(data.file_diffs) == 2
+
+    d0 = data.file_diffs[0]
+    assert d0.path == "/repo/hello.py"
+    assert d0.before is None
+    assert d0.after == "print('hello')\n"
+    assert "+print('hello')" in d0.unified_diff
+
+    d1 = data.file_diffs[1]
+    assert d1.path == "/repo/hello.py"
+    assert d1.before == "print('hello')\n"
+    assert d1.after == "print('hello world')\n"
+    assert "-print('hello')" in d1.unified_diff
+    assert "+print('hello world')" in d1.unified_diff
+
+
 def test_reads_transcript_full_when_present(tmp_path):
     compact_path = tmp_path / "transcript.jsonl"
     full_path = tmp_path / "transcript_full.jsonl"

@@ -56,6 +56,8 @@ from rclm._models import HookSessionRecord, ToolCall
 from rclm._uploader import UploadOutcome, close_session, upload_single
 from rclm.hooks import (
     bootstrap,
+    brief_cache,
+    brief_rank,
     codex_transcript,
     context_memory,
     dedupe,
@@ -65,6 +67,7 @@ from rclm.hooks import (
     read_cache,
     result_delta,
     session_store,
+    start_brief,
     tool_result_transform,
 )
 from rclm.hooks._analytics import (
@@ -105,6 +108,16 @@ _COMPACTION_STOP_REASON = (
 )
 _DEDUPE_STOP_REASON = "ReclaimLLM replaced this repeated tool result with a deduplication notice."
 
+# Codex's UserPromptSubmit additionalContext arrives as a developer message
+# *after* the user's own prompt in the turn (unlike SessionStart, which has no
+# prior turn to compete with), and has been reported to sometimes be
+# over-weighted or hijack the turn (openai/codex#40680). Prepend this
+# annotation only on that injection path so the model treats the user's
+# request as authoritative over the injected prior-work context.
+_CODEX_UPS_ANNOTATION = (
+    "[rclm] Context from prior sessions below; the user's request above is authoritative.\n\n"
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -120,11 +133,12 @@ def _resolve_cwd(session_id: str, payload: dict) -> str:
 
 
 def _handle_session_start(session_id: str, payload: dict) -> None:
+    cwd = payload.get("cwd", "")
     session_store.append_event(
         session_id,
         {
             "event_type": "SessionStart",
-            "cwd": payload.get("cwd", ""),
+            "cwd": cwd,
             "model": payload.get("model"),
             "timestamp": payload.get("timestamp", _now()),
         },
@@ -132,7 +146,7 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
     with contextlib.suppress(Exception):
         asyncio.run(
             asyncio.wait_for(
-                bootstrap.fetch(payload.get("cwd", ""), include_context=False),
+                bootstrap.fetch(cwd, include_context=False),
                 3.0,
             )
         )
@@ -141,17 +155,69 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
         {"event_type": "HookPolicySnapshot", "policy": bootstrap.policy_snapshot("codex")},
     )
 
+    cfg = _config.load()
+    try:
+        start_brief_result = start_brief.build_session_start_context(cwd, cfg)
+    except Exception:
+        start_brief_result = None  # Never let the layout card disrupt Codex CLI startup.
+    if start_brief_result:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": start_brief_result["text"],
+                    }
+                }
+            )
+        )
+        session_store.append_event(
+            session_id,
+            {
+                "event_type": "StartBriefInjected",
+                "card_hash": start_brief_result["card_hash"],
+                "card_tokens": start_brief_result["card_tokens"],
+            },
+        )
+
+    if cfg.get("start_brief", False):
+        with contextlib.suppress(Exception):
+            brief_cache.schedule_sync(cwd)
+
 
 def _handle_user_prompt_submit(session_id: str, payload: dict) -> None:
+    prior_events = session_store.read_events(session_id)
+    prompt = payload.get("prompt", "")
+
     session_store.append_event(
         session_id,
         {
             "event_type": "UserPromptSubmit",
-            "prompt": payload.get("prompt", ""),
+            "prompt": prompt,
             "turn_id": payload.get("turn_id"),
             "timestamp": payload.get("timestamp", _now()),
         },
     )
+
+    cfg = _config.load()
+    cwd = _resolve_cwd(session_id, payload)
+    try:
+        rank_result = brief_rank.build_prompt_context(
+            cwd, session_id, prompt, cfg, prior_events=prior_events
+        )
+    except Exception:
+        rank_result = None  # Never let a ranking failure or timeout block the prompt.
+    if rank_result:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": _CODEX_UPS_ANNOTATION + rank_result["text"],
+                    }
+                }
+            )
+        )
 
 
 def _handle_pre_tool_use(session_id: str, payload: dict) -> None:

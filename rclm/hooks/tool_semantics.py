@@ -19,6 +19,7 @@ _SEARCH_NAMES = frozenset({"grep", "grep_search", "search_files"})
 _EDIT_NAMES = frozenset(
     {
         "edit",
+        "edit_file",
         "replace",
         "replace_file_content",
         "multi_replace_file_content",
@@ -65,7 +66,7 @@ def file_path(tool_input: object) -> str | None:
     """Return a file target from the supported native provider shapes."""
     if not isinstance(tool_input, dict):
         return None
-    for key in ("file_path", "AbsolutePath", "TargetFile"):
+    for key in ("file_path", "AbsolutePath", "TargetFile", "Path"):
         value = tool_input.get(key)
         if isinstance(value, str) and value:
             return value

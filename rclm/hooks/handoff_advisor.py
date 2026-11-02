@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-DEFAULT_TOKEN_THRESHOLD = 160_000
+DEFAULT_TOKEN_THRESHOLD = 640_000
 DEFAULT_TOOL_CALL_THRESHOLD = 120
 TOKEN_THRESHOLD_KEY = "handoff_advisor_token_threshold"
 TOOL_CALL_THRESHOLD_KEY = "handoff_advisor_tool_call_threshold"

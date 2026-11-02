@@ -27,6 +27,8 @@ from rclm._uploader import UploadOutcome, close_session, upload_single
 from rclm.hooks import (
     bootstrap,
     brevity,
+    brief_cache,
+    brief_rank,
     context_memory,
     dedupe,
     dlp,
@@ -36,6 +38,7 @@ from rclm.hooks import (
     read_cache,
     result_delta,
     session_store,
+    start_brief,
     tool_result_transform,
     transcript,  # noqa: E402
 )
@@ -148,6 +151,25 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
                 "instruction_tokens": brevity_result["instruction_tokens"],
             },
         )
+
+    try:
+        start_brief_result = start_brief.build_session_start_context(cwd, cfg)
+    except Exception:
+        start_brief_result = None  # Never let the layout card disrupt Claude Code startup.
+    if start_brief_result:
+        context_blocks.append(start_brief_result["text"])
+        session_store.append_event(
+            session_id,
+            {
+                "event_type": "StartBriefInjected",
+                "card_hash": start_brief_result["card_hash"],
+                "card_tokens": start_brief_result["card_tokens"],
+            },
+        )
+
+    if cfg.get("start_brief", False):
+        with contextlib.suppress(Exception):
+            brief_cache.schedule_sync(cwd)
 
     if context_blocks:
         print(
@@ -732,14 +754,37 @@ def _handle_post_tool_use_failure(session_id: str, payload: dict) -> None:
 
 
 def _handle_user_prompt_submit(session_id: str, payload: dict) -> None:
+    prior_events = session_store.read_events(session_id)
+    prompt = payload.get("prompt", "")
+
     session_store.append_event(
         session_id,
         {
             "event_type": "UserPromptSubmit",
-            "prompt": payload.get("prompt", ""),
+            "prompt": prompt,
             "timestamp": payload.get("timestamp", _now()),
         },
     )
+
+    cfg = _config.load()
+    cwd = _resolve_cwd(session_id, payload)
+    try:
+        rank_result = brief_rank.build_prompt_context(
+            cwd, session_id, prompt, cfg, prior_events=prior_events
+        )
+    except Exception:
+        rank_result = None  # Never let a ranking failure or timeout block the prompt.
+    if rank_result:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": rank_result["text"],
+                    }
+                }
+            )
+        )
 
 
 def _extract_file_diffs_from_tool_calls(
@@ -1005,11 +1050,8 @@ def _handoff_advisory(transcript_data, cfg: dict) -> str | None:
         return None
 
     return (
-        "[rclm] This session has grown large "
-        f"(~{total_tokens:,} tokens, {tool_call_count} tool calls so far). Every tool result gets "
-        "re-sent on every future turn, so cost grows faster than it looks. Ask the user to compact "
-        "with a focused message, for example `/compact focus on the login bug`, then call the "
-        "ReclaimLLM `handoff` MCP tool if they want to continue in a fresh session."
+        f"[rclm] Session is large (~{total_tokens:,} tokens, {tool_call_count} tool calls). "
+        "Suggest `/compact focus on <topic>`, or the ReclaimLLM `handoff` tool for a fresh session."
     )
 
 

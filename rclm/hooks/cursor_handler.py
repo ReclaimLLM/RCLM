@@ -23,10 +23,13 @@ from rclm._models import FileDiff, HookSessionRecord, ToolCall
 from rclm._uploader import close_session, upload_single
 from rclm.hooks import (
     bootstrap,
+    brief_cache,
+    brief_rank,
     cursor_transcript,
     dedupe,
     dlp,
     session_store,
+    start_brief,
     tool_result_transform,
 )
 from rclm.hooks._analytics import aggregate_mechanism_savings
@@ -121,14 +124,21 @@ def _transcript_path_from_payload(payload: dict) -> str | None:
 
 
 def _handle_before_submit_prompt(session_id: str, payload: dict) -> None:
+    prompt = _clean_user_text(payload.get("prompt", ""))
     session_store.append_event(
         session_id,
         {
             "event_type": "UserPromptSubmit",
-            "prompt": _clean_user_text(payload.get("prompt", "")),
+            "prompt": prompt,
             "timestamp": payload.get("timestamp", _now()),
         },
     )
+    # beforeSubmitPrompt's output schema has no additional_context field
+    # (confirmed against https://cursor.com/docs/hooks: it only returns
+    # {"continue", "user_message"}) -- stash the prompt so the first
+    # postToolUse of this turn can inject the ranked brief instead.
+    with contextlib.suppress(Exception):
+        session_store.write_cursor_turn_state(session_id, {"prompt": prompt, "pending": True})
 
 
 def _handle_session_start(session_id: str, payload: dict) -> None:
@@ -152,6 +162,30 @@ def _handle_session_start(session_id: str, payload: dict) -> None:
         session_id,
         {"event_type": "HookPolicySnapshot", "policy": bootstrap.policy_snapshot("cursor")},
     )
+
+    cfg = _config.load()
+    output: dict = {}
+    try:
+        start_brief_result = start_brief.build_session_start_context(cwd, cfg)
+    except Exception:
+        start_brief_result = None  # Never let the layout card disrupt Cursor startup.
+    if start_brief_result:
+        output["additional_context"] = start_brief_result["text"]
+        session_store.append_event(
+            session_id,
+            {
+                "event_type": "StartBriefInjected",
+                "card_hash": start_brief_result["card_hash"],
+                "card_tokens": start_brief_result["card_tokens"],
+            },
+        )
+    if cfg.get("start_brief", False):
+        with contextlib.suppress(Exception):
+            brief_cache.schedule_sync(cwd)
+    if output:
+        # Cursor's sessionStart output is {"env", "additional_context"} at the
+        # top level -- no hookSpecificOutput envelope like Claude/Codex.
+        print(json.dumps(output))
 
 
 def _handle_before_shell_execution(session_id: str, payload: dict) -> None:
@@ -257,8 +291,35 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         print(json.dumps({"updated_input": effective_input}))
 
 
+def _maybe_inject_ranked_brief(
+    session_id: str, cwd: str, cfg: dict, prior_events: list[dict], output: dict
+) -> None:
+    """Consume a prompt stashed at beforeSubmitPrompt and inject the ranked brief
+    on the first postToolUse of that turn. beforeSubmitPrompt cannot inject
+    additional_context itself (see _handle_before_submit_prompt), so this is the
+    only channel available on Cursor. Marks the turn consumed before attempting
+    the rank so a confidence-gate miss or exception doesn't retry on the next
+    postToolUse call in the same turn."""
+    if not cfg.get("start_brief", False):
+        return
+    turn_state = session_store.read_cursor_turn_state(session_id)
+    prompt = turn_state.get("prompt")
+    if not turn_state.get("pending") or not prompt:
+        return
+    session_store.write_cursor_turn_state(session_id, {"prompt": prompt, "pending": False})
+    try:
+        rank_result = brief_rank.build_prompt_context(
+            cwd, session_id, prompt, cfg, prior_events=prior_events
+        )
+    except Exception:
+        rank_result = None  # Never let a ranking failure or timeout block the tool result.
+    if rank_result:
+        output["additional_context"] = rank_result["text"]
+
+
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
-    """Record a result and deduplicate MCP text through Cursor's replacement field."""
+    """Record a result, deduplicate MCP text, and inject the ranked brief on the
+    first postToolUse of a turn."""
     tool_name = payload.get("tool_name") or ""
     tool_input = payload.get("tool_input")
     tool_input = tool_input if isinstance(tool_input, dict) else {}
@@ -295,57 +356,67 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         },
     )
 
+    output: dict = {}
+    with contextlib.suppress(Exception):
+        _maybe_inject_ranked_brief(session_id, cwd, cfg, prior_events, output)
+
     # Cursor documents updated_mcp_tool_output for MCP tools only. Shell and
     # native-tool compaction therefore happens in PreToolUse, not by assuming
     # the contradictory Shell example supports post-result replacement.
     is_mcp = tool_name.startswith("MCP:") or tool_name.startswith("mcp__")
-    if not is_mcp:
-        return
+    if is_mcp:
+        if isinstance(redacted_output, dict):
+            output["updated_mcp_tool_output"] = redacted_output
+        else:
+            policy = _config.effective_hook_policy(cfg, provider="cursor")
+            compression = _config.compression_config(cfg)
+            if policy.enabled("hash_dedupe") and compression["dedupe"]:
+                envelope = tool_result_transform.extract_text_envelope(captured_output)
+                if envelope is not None:
+                    try:
+                        state = session_store.read_dedupe_state(session_id)
+                        turn = (
+                            sum(
+                                1
+                                for event in prior_events
+                                if event.get("event_type") == "PostToolUse"
+                            )
+                            + 1
+                        )
+                        replacement, state, match = dedupe.maybe_dedupe(
+                            envelope.text,
+                            state,
+                            tool_name=tool_name,
+                            turn=turn,
+                            cwd=cwd,
+                            min_chars=int(compression["min_dedupe_chars"]),
+                        )
+                        session_store.write_dedupe_state(session_id, state)
+                        if replacement and match is not None:
+                            decision = tool_result_transform.decision_from_replacement(
+                                envelope,
+                                replacement,
+                                mechanism="hash_dedupe",
+                            )
+                            if decision is not None and isinstance(
+                                decision.structured_replacement, dict
+                            ):
+                                shadow = policy.shadow_for("hash_dedupe")
+                                for event in tool_result_transform.analytics_events(
+                                    decision,
+                                    tool_use_id=payload.get("tool_use_id"),
+                                    applied=not shadow,
+                                ):
+                                    session_store.append_event(session_id, event)
+                                if not shadow:
+                                    output["updated_mcp_tool_output"] = (
+                                        decision.structured_replacement
+                                    )
+                    except Exception:
+                        logger.exception("Cursor MCP dedupe failed; passing through tool output")
 
-    if isinstance(redacted_output, dict):
-        print(json.dumps({"updated_mcp_tool_output": redacted_output}))
-        return
-
-    policy = _config.effective_hook_policy(cfg, provider="cursor")
-    compression = _config.compression_config(cfg)
-    if not policy.enabled("hash_dedupe") or not compression["dedupe"]:
-        return
-
-    envelope = tool_result_transform.extract_text_envelope(captured_output)
-    if envelope is None:
-        return
-    try:
-        state = session_store.read_dedupe_state(session_id)
-        turn = sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
-        replacement, state, match = dedupe.maybe_dedupe(
-            envelope.text,
-            state,
-            tool_name=tool_name,
-            turn=turn,
-            cwd=_resolve_cwd(session_id, payload),
-            min_chars=int(compression["min_dedupe_chars"]),
-        )
-        session_store.write_dedupe_state(session_id, state)
-        if not replacement or match is None:
-            return
-        decision = tool_result_transform.decision_from_replacement(
-            envelope,
-            replacement,
-            mechanism="hash_dedupe",
-        )
-        if decision is None or not isinstance(decision.structured_replacement, dict):
-            return
-        shadow = policy.shadow_for("hash_dedupe")
-        for event in tool_result_transform.analytics_events(
-            decision,
-            tool_use_id=payload.get("tool_use_id"),
-            applied=not shadow,
-        ):
-            session_store.append_event(session_id, event)
-        if not shadow:
-            print(json.dumps({"updated_mcp_tool_output": decision.structured_replacement}))
-    except Exception:
-        logger.exception("Cursor MCP dedupe failed; passing through tool output")
+    if output:
+        print(json.dumps(output))
 
 
 def _extract_file_diffs_from_payload(payload: dict) -> list[FileDiff]:
@@ -503,6 +574,43 @@ async def _upload_and_close(record: HookSessionRecord):
         await close_session()
 
 
+_LAYOUT_CARD_MARKER = "[rclm] Layout"
+_RANKED_BRIEF_MARKER = "[rclm] Similar past work"
+
+
+def _check_start_brief_delivery(events: list[dict], messages: list[dict]) -> dict | None:
+    """Best-effort check of whether an injected Start Brief block actually reached
+    the model, since Cursor's hook payloads give no delivery confirmation and the
+    documented channels (sessionStart/postToolUse additional_context) were
+    reported dropped in IDE 3.1.15 with no confirmed fix (PRD §7/§13 capability
+    probe). card_hash/brief_hash are hashes OF the injected text for
+    change-tracking, not substrings of it, so this instead looks for each
+    mechanism's fixed leading marker text in the transcript's recorded messages.
+
+    This is a real signal, not a fabricated one, but a weak one in one direction:
+    a marker found is reasonably strong evidence of delivery; not found is not
+    proof of non-delivery, since Cursor's transcript may not reflect
+    additional_context even when it successfully reached the model. Never raises
+    and never blocks -- callers wrap this in contextlib.suppress regardless."""
+    expected = {
+        "layout_card": any(ev.get("event_type") == "StartBriefInjected" for ev in events),
+        "ranked_brief": any(ev.get("event_type") == "StartBriefRankInjected" for ev in events),
+    }
+    if not any(expected.values()):
+        return None
+    haystack = "\n".join(str(m.get("content") or "") for m in messages)
+    confirmed = {
+        "layout_card": expected["layout_card"] and _LAYOUT_CARD_MARKER in haystack,
+        "ranked_brief": expected["ranked_brief"] and _RANKED_BRIEF_MARKER in haystack,
+    }
+    return {
+        "event_type": "StartBriefDeliveryCheck",
+        "expected": expected,
+        "confirmed": confirmed,
+        "likely_delivered": any(confirmed.values()),
+    }
+
+
 def _handle_stop(session_id: str, payload: dict) -> None:
     now = _now()
     events = session_store.read_events(session_id)
@@ -523,6 +631,11 @@ def _handle_stop(session_id: str, payload: dict) -> None:
             tc.extra_fields["dlp_enabled"] = dlp_on
         if dlp_on:
             dlp.reconcile_captured_tool_results(transcript_data.tool_calls, events)
+    if transcript_data is not None:
+        with contextlib.suppress(Exception):
+            delivery = _check_start_brief_delivery(events, transcript_data.messages)
+            if delivery is not None:
+                session_store.append_event(session_id, delivery)
     event_file_diffs = _extract_file_diffs_from_events(events)
     mechanism_savings = aggregate_mechanism_savings(events)
     hook_policy_snapshot = bootstrap.policy_snapshot_from_events(events, "cursor")

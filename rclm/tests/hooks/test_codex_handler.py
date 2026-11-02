@@ -1347,3 +1347,142 @@ def test_codex_build_tool_calls_preserves_real_tool_name(monkeypatch, tmp_path):
     assert by_turn["codex-turn-t1"] == "mcp__playwright__browser_take_screenshot"
     assert by_turn["codex-turn-t2"] == "Bash"
     assert by_turn["codex-turn-t3"] == "Bash"
+
+
+# ---------------------------------------------------------------------------
+# Start Brief: SessionStart layout card + UserPromptSubmit ranked brief
+# ---------------------------------------------------------------------------
+
+
+def test_codex_session_start_injects_layout_card(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    (tmp_path / "server").mkdir()
+
+    _run_handler(
+        "SessionStart",
+        {"session_id": "sid-codex-brief", "cwd": str(tmp_path), "model": "codex-mini"},
+        monkeypatch,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    specific = output["hookSpecificOutput"]
+    assert specific["hookEventName"] == "SessionStart"
+    assert "server" in specific["additionalContext"]
+
+
+def test_codex_session_start_no_injection_when_disabled(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": False})
+    (tmp_path / "server").mkdir()
+
+    _run_handler(
+        "SessionStart",
+        {"session_id": "sid-codex-brief-off", "cwd": str(tmp_path), "model": "codex-mini"},
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_codex_session_start_layout_card_failure_fails_open(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.start_brief.build_session_start_context",
+        lambda cwd, cfg: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    _run_handler(
+        "SessionStart",
+        {"session_id": "sid-codex-brief-fail", "cwd": str(tmp_path), "model": "codex-mini"},
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_codex_user_prompt_submit_injects_ranked_brief_with_annotation(
+    monkeypatch, tmp_path, capsys
+):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.brief_rank.build_prompt_context",
+        lambda cwd, session_id, prompt, cfg, *, prior_events: {
+            "text": "[rclm] Similar past work in this project (verify before editing):\n- stub"
+        },
+    )
+
+    _run_handler(
+        "UserPromptSubmit",
+        {
+            "session_id": "sid-codex-ups-brief",
+            "cwd": str(tmp_path),
+            "prompt": "add a weekly digest email",
+            "turn_id": "turn-1",
+        },
+        monkeypatch,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    specific = output["hookSpecificOutput"]
+    assert specific["hookEventName"] == "UserPromptSubmit"
+    assert specific["additionalContext"].startswith(
+        "[rclm] Context from prior sessions below; the user's request above is authoritative."
+    )
+    assert "Similar past work" in specific["additionalContext"]
+
+
+def test_codex_user_prompt_submit_no_injection_when_disabled(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": False})
+
+    _run_handler(
+        "UserPromptSubmit",
+        {
+            "session_id": "sid-codex-ups-off",
+            "cwd": str(tmp_path),
+            "prompt": "add a weekly digest email",
+            "turn_id": "turn-1",
+        },
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_codex_user_prompt_submit_ranking_failure_fails_open(monkeypatch, tmp_path, capsys):
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        "rclm.hooks.codex_handler.brief_rank.build_prompt_context",
+        lambda cwd, session_id, prompt, cfg, *, prior_events: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        ),
+    )
+
+    _run_handler(
+        "UserPromptSubmit",
+        {
+            "session_id": "sid-codex-ups-fail",
+            "cwd": str(tmp_path),
+            "prompt": "add a weekly digest email",
+            "turn_id": "turn-1",
+        },
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""

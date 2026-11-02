@@ -472,3 +472,219 @@ def test_stop_uses_payload_transcript_path_and_derives_session_id(
     assert record.transcript_path == transcript_path
     assert record.messages[0]["content"] == "from payload transcript"
     assert transcript_path not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# sessionStart — layout card
+# ---------------------------------------------------------------------------
+
+
+def test_session_start_injects_layout_card(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    (tmp_path / "server").mkdir()
+
+    _run_handler(
+        "sessionStart",
+        {"session_id": "conv-brief", "cwd": str(tmp_path), "composer_mode": "agent"},
+        monkeypatch,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert "server" in output["additional_context"]
+    assert "hookSpecificOutput" not in output  # Cursor's envelope is flat, unlike Claude/Codex.
+
+
+def test_session_start_no_layout_card_when_disabled(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": False})
+    (tmp_path / "server").mkdir()
+
+    _run_handler(
+        "sessionStart",
+        {"session_id": "conv-brief-off", "cwd": str(tmp_path), "composer_mode": "agent"},
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_session_start_layout_card_failure_fails_open(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        "rclm.hooks.cursor_handler.start_brief.build_session_start_context",
+        lambda cwd, cfg: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    _run_handler(
+        "sessionStart",
+        {"session_id": "conv-brief-fail", "cwd": str(tmp_path), "composer_mode": "agent"},
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# beforeSubmitPrompt / postToolUse — ranked brief
+#
+# Cursor's beforeSubmitPrompt schema has no additional_context field (only
+# {"continue", "user_message"}), so the ranked brief can only be injected at
+# the first postToolUse of the turn, using the prompt stashed here.
+# ---------------------------------------------------------------------------
+
+
+def test_before_submit_prompt_never_injects_context(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+
+    _run_handler(
+        "beforeSubmitPrompt",
+        {"conversation_id": "conv-ups", "prompt": "add a weekly digest email"},
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+    turn_state = session_store.read_cursor_turn_state("conv-ups")
+    assert turn_state == {"prompt": "add a weekly digest email", "pending": True}
+
+
+def test_post_tool_use_injects_ranked_brief_on_first_call_after_prompt(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        "rclm.hooks.cursor_handler.brief_rank.build_prompt_context",
+        lambda cwd, session_id, prompt, cfg, *, prior_events: {
+            "text": "[rclm] Similar past work in this project (verify before editing):\n- stub"
+        },
+    )
+    session_store.write_cursor_turn_state(
+        "conv-turn", {"prompt": "add a weekly digest email", "pending": True}
+    )
+
+    _run_handler(
+        "postToolUse",
+        {
+            "conversation_id": "conv-turn",
+            "tool_name": "read_file",
+            "tool_input": {"path": "a.py"},
+            "tool_output": "contents",
+            "tool_use_id": "call-1",
+        },
+        monkeypatch,
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert "Similar past work" in output["additional_context"]
+    assert session_store.read_cursor_turn_state("conv-turn")["pending"] is False
+
+
+def test_post_tool_use_does_not_reinject_on_second_call_same_turn(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        "rclm.hooks.cursor_handler.brief_rank.build_prompt_context",
+        lambda cwd, session_id, prompt, cfg, *, prior_events: {
+            "text": "[rclm] Similar past work in this project (verify before editing):\n- stub"
+        },
+    )
+    session_store.write_cursor_turn_state(
+        "conv-turn2", {"prompt": "add a weekly digest email", "pending": True}
+    )
+
+    first_payload = {
+        "conversation_id": "conv-turn2",
+        "tool_name": "read_file",
+        "tool_input": {"path": "a.py"},
+        "tool_output": "contents",
+        "tool_use_id": "call-1",
+    }
+    _run_handler("postToolUse", first_payload, monkeypatch)
+    assert "Similar past work" in capsys.readouterr().out
+
+    _run_handler("postToolUse", {**first_payload, "tool_use_id": "call-2"}, monkeypatch)
+    assert capsys.readouterr().out == ""
+
+
+def test_post_tool_use_ranking_failure_fails_open(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        "rclm.hooks.cursor_handler.brief_rank.build_prompt_context",
+        lambda cwd, session_id, prompt, cfg, *, prior_events: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        ),
+    )
+    session_store.write_cursor_turn_state(
+        "conv-fail", {"prompt": "add a weekly digest email", "pending": True}
+    )
+
+    _run_handler(
+        "postToolUse",
+        {
+            "conversation_id": "conv-fail",
+            "tool_name": "read_file",
+            "tool_input": {"path": "a.py"},
+            "tool_output": "contents",
+            "tool_use_id": "call-1",
+        },
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+def test_post_tool_use_no_injection_when_disabled(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"start_brief": False})
+    session_store.write_cursor_turn_state(
+        "conv-off", {"prompt": "add a weekly digest email", "pending": True}
+    )
+
+    _run_handler(
+        "postToolUse",
+        {
+            "conversation_id": "conv-off",
+            "tool_name": "read_file",
+            "tool_input": {"path": "a.py"},
+            "tool_output": "contents",
+            "tool_use_id": "call-1",
+        },
+        monkeypatch,
+    )
+
+    assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# stop — Start Brief delivery probe
+# ---------------------------------------------------------------------------
+
+
+def test_check_start_brief_delivery_finds_marker_in_transcript():
+    events = [{"event_type": "StartBriefInjected", "card_hash": "abc123"}]
+    messages = [{"role": "assistant", "content": "[rclm] Layout (from your local filesystem"}]
+
+    result = cursor_handler._check_start_brief_delivery(events, messages)
+
+    assert result["expected"] == {"layout_card": True, "ranked_brief": False}
+    assert result["confirmed"] == {"layout_card": True, "ranked_brief": False}
+    assert result["likely_delivered"] is True
+
+
+def test_check_start_brief_delivery_not_found_is_not_crash(monkeypatch, tmp_path, capsys):
+    events = [{"event_type": "StartBriefRankInjected", "brief_hash": "abc123"}]
+    messages = [{"role": "user", "content": "unrelated message"}]
+
+    result = cursor_handler._check_start_brief_delivery(events, messages)
+
+    assert result["expected"] == {"layout_card": False, "ranked_brief": True}
+    assert result["confirmed"] == {"layout_card": False, "ranked_brief": False}
+    assert result["likely_delivered"] is False
+
+
+def test_check_start_brief_delivery_returns_none_when_nothing_injected():
+    assert cursor_handler._check_start_brief_delivery([], [{"content": "hi"}]) is None

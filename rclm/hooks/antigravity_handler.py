@@ -27,10 +27,13 @@ from rclm._uploader import close_session, upload_single
 from rclm.hooks import (
     bootstrap,
     brevity,
+    brief_cache,
+    brief_rank,
     dlp,
     loop_breaker,
     read_cache,
     session_store,
+    start_brief,
 )
 from rclm.hooks._analytics import compute_session_analytics
 from rclm.hooks.antigravity_transcript import parse_transcript
@@ -71,10 +74,24 @@ async def _upload_and_close(record: HookSessionRecord):
         await close_session()
 
 
+def _resolve_real_cwd(workspace_paths: object) -> str:
+    """workspacePaths can report a sandbox-aliased path (e.g. /home-dir/... for
+    the real /Users/.../ReclaimLLM) that this hook process's own filesystem
+    doesn't recognize. Trust the payload path when it exists on disk (the
+    common case); only then fall back to the hook process's own cwd, which
+    Antigravity sets to the real workspace root when invoking the hook
+    command -- no alias-rewriting table exists or is needed as long as that
+    holds. No existing normalization for this in the codebase, so this is new."""
+    candidate = workspace_paths[0] if isinstance(workspace_paths, list) and workspace_paths else ""
+    if candidate and os.path.isdir(candidate):
+        return candidate
+    real_cwd = os.getcwd()
+    return real_cwd if real_cwd and os.path.isdir(real_cwd) else candidate
+
+
 def _handle_pre_invocation(payload: dict) -> None:
     session_id = str(payload.get("conversationId") or "")
-    workspace_paths = payload.get("workspacePaths") or []
-    cwd = workspace_paths[0] if isinstance(workspace_paths, list) and workspace_paths else ""
+    cwd = _resolve_real_cwd(payload.get("workspacePaths"))
     model = payload.get("modelName") or "antigravity-unknown"
     now = _now()
 
@@ -134,6 +151,49 @@ def _handle_pre_invocation(payload: dict) -> None:
                                 "instruction_tokens": brevity_result["instruction_tokens"],
                             },
                         )
+
+            # Layout card: local-only, zero-network, same mechanism as every other
+            # client. Injected once per session (invocation_num<=1) via ephemeralMessage
+            # -- matching this file's existing precedent for session-start content
+            # (context pack / brevity above both use ephemeralMessage here too, not
+            # systemMessage; there is no established use of systemMessage anywhere in
+            # this handler, so introducing it for one mechanism would be new, untested
+            # behavior rather than following what already works in this codebase).
+            if cfg.get("start_brief", False):
+                with contextlib.suppress(Exception):
+                    start_brief_result = start_brief.build_session_start_context(cwd, cfg)
+                    if start_brief_result:
+                        inject_steps.append({"ephemeralMessage": start_brief_result["text"]})
+                        session_store.append_event(
+                            session_id,
+                            {
+                                "event_type": "StartBriefInjected",
+                                "card_hash": start_brief_result["card_hash"],
+                                "card_tokens": start_brief_result["card_tokens"],
+                            },
+                        )
+                with contextlib.suppress(Exception):
+                    brief_cache.schedule_sync(cwd)
+
+        # Ranked "similar past work" brief: unlike the layout card above, this runs on
+        # every invocation (not just invocation_num<=1) since lastUserInput carries a
+        # new prompt each turn -- the same role Claude's per-turn UserPromptSubmit
+        # hook plays, just folded into this one PreInvocation hook here. Record the
+        # prompt as a UserPromptSubmit event, read prior events first so the current
+        # prompt doesn't count itself as "prior" (same ordering claude_handler.py uses).
+        last_user_input = payload.get("lastUserInput")
+        if cfg.get("start_brief", False) and isinstance(last_user_input, str) and last_user_input:
+            prior_events = session_store.read_events(session_id)
+            session_store.append_event(
+                session_id,
+                {"event_type": "UserPromptSubmit", "prompt": last_user_input, "timestamp": now},
+            )
+            with contextlib.suppress(Exception):
+                rank_result = brief_rank.build_prompt_context(
+                    cwd, session_id, last_user_input, cfg, prior_events=prior_events
+                )
+                if rank_result:
+                    inject_steps.append({"ephemeralMessage": rank_result["text"]})
 
         if cfg.get("handoff_advisor", True):
             _, tool_call_thresh = thresholds_from_config(cfg)
@@ -217,8 +277,13 @@ def _handle_pre_tool_use(payload: dict) -> None:
                     )
                 )
                 return
-        elif normalized in {"write_to_file", "replace_file_content"}:
-            target = tool_input.get("TargetFile") or ""
+        elif normalized in {
+            "write_to_file",
+            "replace_file_content",
+            "write_file",
+            "edit_file",
+        }:
+            target = tool_input.get("Path") or tool_input.get("TargetFile") or ""
             if isinstance(target, str) and target and dlp._is_env_file(os.path.basename(target)):
                 print(
                     json.dumps(
@@ -340,7 +405,12 @@ def _handle_post_tool_use(payload: dict) -> None:
                 },
             )
             # Invalidate read cache if an edit/write tool succeeded
-            if tool_name and tool_name.lower() in {"write_to_file", "replace_file_content"}:
+            if tool_name and tool_name.lower() in {
+                "write_to_file",
+                "replace_file_content",
+                "write_file",
+                "edit_file",
+            }:
                 with contextlib.suppress(Exception):
                     cfg = _config.load()
                     policy = _config.effective_hook_policy(cfg, provider="antigravity")
@@ -352,7 +422,7 @@ def _handle_post_tool_use(payload: dict) -> None:
                             else ""
                         )
                         state = session_store.read_read_cache_state(session_id)
-                        target = tool_input.get("TargetFile")
+                        target = tool_input.get("Path") or tool_input.get("TargetFile")
                         if target:
                             state = read_cache.invalidate_tool_path(
                                 state, "Write", {"file_path": target}, cwd=cwd

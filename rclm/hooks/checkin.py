@@ -49,8 +49,8 @@ async def async_checkin(
     if creds is None:
         return None
 
-    clients = integrity.collect_client_status(cwd=cwd)
     cfg = _config.load()
+    clients = integrity.collect_client_status(cwd=cwd, cfg=cfg)
     local_dlp = bool(cfg.get("dlp", _config.DEFAULT_DLP_ENABLED))
     enabled = _config.dlp_enabled(cfg)
     pending = list(cfg.get("pending_events") or [])

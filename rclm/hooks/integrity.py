@@ -19,9 +19,29 @@ from rclm.hooks.installer import (
 
 ClientStatus = str  # installed|partial|missing|disabled|modified|not_present
 
+# Not a coding-agent client like the others below -- a savings mechanism
+# reported through the same per-(device, client) coverage row because
+# device_client_status already supports a free-form client key with no
+# schema change. Must never be folded into a security coverage percentage
+# (see server/enterprise/routes/coverage.py's informational-client carve-out).
+START_BRIEF_CLIENT_KEY = "start_brief"
 
-def collect_client_status(*, cwd: str | Path | None = None) -> dict[str, dict[str, Any]]:
-    """Return per-client integrity status for check-in."""
+
+def collect_client_status(
+    *, cwd: str | Path | None = None, cfg: dict[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Return per-client integrity status for check-in.
+
+    cfg is optional and defaults to a fresh _config.load() -- callers that
+    already loaded it this tick (e.g. checkin.async_checkin) should pass it
+    through instead of forcing a second read, and tests should always pass it
+    explicitly rather than relying on this function to read the real
+    ~/.reclaimllm/config.json (see _start_brief_status).
+    """
+    if cfg is None:
+        from rclm import _config
+
+        cfg = _config.load()
     root = Path(cwd) if cwd else Path.cwd()
     return {
         "claude": _claude_status(root),
@@ -30,7 +50,21 @@ def collect_client_status(*, cwd: str | Path | None = None) -> dict[str, dict[st
         "gemini": _gemini_status(root),
         "copilot": _copilot_status(root),
         "antigravity": _antigravity_status(root),
+        START_BRIEF_CLIENT_KEY: _start_brief_status(cfg),
     }
+
+
+def _start_brief_status(cfg: dict[str, Any]) -> dict[str, Any]:
+    """installed/disabled only -- the start_brief hook is always present once
+    Claude Code hooks are installed, so there is no not_present case distinct
+    from Claude's own hook presence (tracked separately under "claude").
+
+    Takes cfg as a parameter rather than calling _config.load() itself --
+    _config.CONFIG_PATH is bound to Path.home() at import time, so a function
+    that loads it internally is not test-isolatable via monkeypatch.setattr
+    (Path, "home", ...), the pattern collect_client_status's own tests use."""
+    status: ClientStatus = "installed" if cfg.get("start_brief", False) else "disabled"
+    return _result(status, scope="global", hint=str(Path.home() / ".reclaimllm" / "config.json"))
 
 
 def integrity_hash(clients: dict[str, dict[str, Any]]) -> str:

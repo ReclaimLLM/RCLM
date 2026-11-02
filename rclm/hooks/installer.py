@@ -25,11 +25,12 @@ Usage:
     rclm-hooks-install --no-statusline             # skip the Claude Code statusline
     rclm-hooks-install --no-handoff-advisor        # skip Claude handoff suggestions
     rclm-hooks-install --brevity                   # inject brevity instruction at session start (Claude only)
+    rclm-hooks-install --start-brief               # inject local layout card at session start (Claude only)
 
 --with-mcp, --read-cache, --loop-breaker, --compress, --statusline, --handoff-advisor, and
---dlp are on by default; pass the --no-<flag> form to opt out. --context-pack, --shadow-mode,
---brevity, and --image-lifecycle are off by default; pass the flag to opt in. Credentials and preferences are
-stored in ~/.reclaimllm/config.json and reused on subsequent runs.
+--dlp are on by default; pass the --no-<flag> form to opt out. --context-pack, --start-brief,
+--shadow-mode, --brevity, and --image-lifecycle are off by default; pass the flag to opt in.
+Credentials and preferences are stored in ~/.reclaimllm/config.json and reused on subsequent runs.
 """
 
 from __future__ import annotations
@@ -293,7 +294,7 @@ Subsequent installs without --api-key reuse the saved config.""",
     parser.add_argument(
         "--antigravity",
         action="store_true",
-        help="Install hooks for Antigravity (capture-only)",
+        help="Install hooks for Antigravity (capture, DLP, egress)",
     )
     parser.add_argument(
         "--copilot",
@@ -430,6 +431,15 @@ Subsequent installs without --api-key reuse the saved config.""",
         help=(
             "Enable session-start context pack (Claude only, requires --with-mcp credentials): "
             "inject highlights from recent ReclaimLLM sessions in this project at session start"
+        ),
+    )
+    parser.add_argument(
+        "--start-brief",
+        action="store_true",
+        help=(
+            "Enable the session-start layout card (Claude only, local-only, no network call): "
+            "inject top-level directories, sibling repos, and the latest migration number "
+            "at session start"
         ),
     )
     parser.add_argument(
@@ -1109,6 +1119,7 @@ def main() -> None:
         args.statusline if args.statusline is not None else saved.get("statusline", True)
     )
     context_pack_enabled = args.context_pack or saved.get("context_pack", False)
+    start_brief_enabled = args.start_brief or saved.get("start_brief", False)
     handoff_advisor_enabled = (
         args.handoff_advisor
         if args.handoff_advisor is not None
@@ -1149,6 +1160,7 @@ def main() -> None:
         "read_cache": read_cache_enabled,
         "statusline": statusline_enabled,
         "context_pack": context_pack_enabled,
+        "start_brief": start_brief_enabled,
         "handoff_advisor": handoff_advisor_enabled,
         TOKEN_THRESHOLD_KEY: handoff_advisor_token_threshold,
         TOOL_CALL_THRESHOLD_KEY: handoff_advisor_tool_call_threshold,

@@ -51,3 +51,23 @@ def test_not_present_when_no_config_dirs(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: home)
     status = integrity.collect_client_status(cwd=cwd)
     assert status["cursor"]["status"] == "not_present"
+
+
+def test_start_brief_installed_when_flag_on(tmp_path: Path, monkeypatch):
+    home = tmp_path / "home"
+    cwd = tmp_path / "repo"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    status = integrity.collect_client_status(cwd=cwd, cfg={"start_brief": True})["start_brief"]
+    assert status["status"] == "installed"
+
+
+def test_start_brief_disabled_when_flag_off_or_absent(tmp_path: Path, monkeypatch):
+    home = tmp_path / "home"
+    cwd = tmp_path / "repo"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    status = integrity.collect_client_status(cwd=cwd, cfg={})["start_brief"]
+    assert status["status"] == "disabled"

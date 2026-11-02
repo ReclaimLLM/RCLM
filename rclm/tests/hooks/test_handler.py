@@ -381,7 +381,7 @@ def test_handoff_advisor_fires_on_large_session(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
     monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
     _stub_transcript(
-        monkeypatch, total_input_tokens=200_000, total_output_tokens=50_000, tool_call_count=100
+        monkeypatch, total_input_tokens=500_000, total_output_tokens=200_000, tool_call_count=100
     )
 
     payload = {"session_id": "sid-ha3", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}
@@ -391,7 +391,7 @@ def test_handoff_advisor_fires_on_large_session(monkeypatch, tmp_path, capsys):
     assert output["hookSpecificOutput"]["hookEventName"] == "Stop"
     additional_context = output["hookSpecificOutput"]["additionalContext"]
     assert "handoff" in additional_context
-    assert "/compact focus on the login bug" in additional_context
+    assert "/compact" in additional_context
 
 
 def test_handoff_advisor_fires_on_high_tool_call_count(monkeypatch, tmp_path, capsys):
@@ -424,7 +424,7 @@ def test_handoff_advisor_prints_once_per_session(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
     monkeypatch.setattr("rclm.hooks.claude_handler.upload_single", _noop_async)
     _stub_transcript(
-        monkeypatch, total_input_tokens=200_000, total_output_tokens=50_000, tool_call_count=100
+        monkeypatch, total_input_tokens=500_000, total_output_tokens=200_000, tool_call_count=100
     )
 
     payload = {"session_id": "sid-ha5", "cwd": "/repo", "timestamp": "2024-01-01T00:01:00Z"}

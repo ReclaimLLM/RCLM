@@ -3,6 +3,26 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.1.36] — 2026-11-01
+
+### Added
+- Start Brief: local, opt-in prior-work context injected at session start (layout card — directory structure, sibling repos, latest migration file) and on relevant prompts (ranked "similar past work" brief), across Claude Code, Codex CLI, Cursor Agent, and Antigravity (`rclm/hooks/start_brief.py`, `brief_rank.py`, `brief_cache.py`)
+- Local SQLite+FTS5 cache for the ranked brief, keyed by project and the active API key's identity so two developers sharing a machine never share each other's cached context (`rclm/hooks/_project_key.py`, `brief_cache.py`)
+- `--start-brief` install flag, off by default (same posture as `--context-pack`) (`rclm/hooks/installer.py`)
+- Per-session turn-state tracking for Cursor (prompt captured at `beforeSubmitPrompt`, consumed at the next `postToolUse`) and for Start Brief's own repeat-injection gating (`rclm/hooks/session_store.py`)
+- `collect_client_status()` reports a `start_brief` adoption entry alongside other hook clients, for the coverage dashboard (`rclm/hooks/integrity.py`, `checkin.py`)
+- `ReclaimLLMClient.fetch_brief_pack()`: ETag-aware fetch of the server-side prior-work pack (`rclm/mcp_server.py`)
+
+### Changed
+- `transfer_session` and `handoff` MCP tool descriptions, and the server's top-level tool-selection instructions, rewritten with concrete trigger phrases and explicit cross-referencing, so cross-tool session moves ("move this to Cursor") route to `transfer_session` instead of being absorbed by `handoff` (`rclm/mcp_server.py`)
+- Handoff advisor's size threshold raised 4x, from 160,000 to 640,000 tokens, and its Stop-hook message shortened (`rclm/hooks/handoff_advisor.py`, `claude_handler.py`)
+- Antigravity's native tool-argument resolution updated for the renamed `write_file`/`edit_file` tools (previously only recognized the legacy `write_to_file`/`replace_file_content` names and their `TargetFile`/`CodeContent` arguments), affecting file-diff extraction, loop-breaker targeting, and tool-semantics classification (`rclm/hooks/antigravity_transcript.py`, `loop_breaker.py`, `tool_semantics.py`)
+
+### Fixed
+- Two test fixtures using unnecessary `dict()` calls rewritten as literals to satisfy `ruff` C408 (`rclm/tests/hooks/test_brief_rank.py`)
+
+---
+
 ## [v0.1.35] — 2026-10-28
 
 ### Added

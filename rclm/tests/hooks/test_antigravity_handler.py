@@ -12,7 +12,15 @@ import pytest
 
 from rclm import _config
 from rclm._models import HookSessionRecord
-from rclm.hooks import antigravity_handler, bootstrap, brevity, session_store
+from rclm.hooks import (
+    antigravity_handler,
+    bootstrap,
+    brevity,
+    brief_cache,
+    brief_rank,
+    session_store,
+    start_brief,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -257,6 +265,168 @@ def test_pre_invocation_handoff_advisor_triggers_when_threshold_exceeded(monkeyp
     )
     captured2 = json.loads(capsys.readouterr().out)
     assert captured2 == {"injectSteps": []}
+
+
+def test_pre_invocation_injects_layout_card_and_schedules_sync(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_config, "load", lambda: {"start_brief": True})
+    monkeypatch.setattr(
+        start_brief,
+        "build_session_start_context",
+        lambda cwd, cfg: {
+            "text": "[rclm] Layout: server/, frontend/",
+            "card_hash": "h1",
+            "card_tokens": 8,
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(brief_cache, "schedule_sync", lambda cwd: scheduled.append(cwd) or True)
+
+    _run_handler(
+        "PreInvocation",
+        {
+            "conversationId": "ag-sb-1",
+            "workspacePaths": [str(tmp_path)],
+            "invocationNum": 1,
+            "initialNumSteps": 0,
+        },
+        monkeypatch,
+    )
+
+    captured = json.loads(capsys.readouterr().out)
+    messages = [s["ephemeralMessage"] for s in captured["injectSteps"]]
+    assert any("Layout" in m for m in messages)
+    assert scheduled == [str(tmp_path)]
+    events = session_store.read_events("ag-sb-1")
+    assert any(ev.get("event_type") == "StartBriefInjected" for ev in events)
+
+
+def test_pre_invocation_skips_layout_card_when_disabled(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_config, "load", lambda: {"start_brief": False})
+    called = []
+    monkeypatch.setattr(
+        start_brief, "build_session_start_context", lambda cwd, cfg: called.append(1) or None
+    )
+
+    _run_handler(
+        "PreInvocation",
+        {"conversationId": "ag-sb-off", "workspacePaths": [str(tmp_path)], "invocationNum": 1},
+        monkeypatch,
+    )
+
+    assert not called
+    captured = json.loads(capsys.readouterr().out)
+    assert captured == {"injectSteps": []}
+
+
+def test_pre_invocation_injects_ranked_brief_from_last_user_input(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_config, "load", lambda: {"start_brief": True})
+    received = {}
+
+    def fake_rank(cwd, session_id, prompt, cfg, *, prior_events):
+        received["cwd"] = cwd
+        received["prompt"] = prompt
+        received["prior_events"] = prior_events
+        return {"text": "[rclm] Similar past work: fixed the login bug"}
+
+    monkeypatch.setattr(brief_rank, "build_prompt_context", fake_rank)
+
+    _run_handler(
+        "PreInvocation",
+        {
+            "conversationId": "ag-rank-1",
+            "workspacePaths": [str(tmp_path)],
+            "invocationNum": 2,
+            "lastUserInput": "fix the login bug",
+        },
+        monkeypatch,
+    )
+
+    captured = json.loads(capsys.readouterr().out)
+    messages = [s["ephemeralMessage"] for s in captured["injectSteps"]]
+    assert any("Similar past work" in m for m in messages)
+    assert received["cwd"] == str(tmp_path)
+    assert received["prompt"] == "fix the login bug"
+    # prior_events must not include the prompt this very call just recorded.
+    assert not any(e.get("prompt") == "fix the login bug" for e in received["prior_events"])
+
+    events = session_store.read_events("ag-rank-1")
+    recorded = [e for e in events if e.get("event_type") == "UserPromptSubmit"]
+    assert recorded and recorded[-1]["prompt"] == "fix the login bug"
+
+
+def test_pre_invocation_ranked_brief_fails_open_on_exception(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_config, "load", lambda: {"start_brief": True})
+
+    def boom(*a, **k):
+        raise RuntimeError("rank blew up")
+
+    monkeypatch.setattr(brief_rank, "build_prompt_context", boom)
+
+    _run_handler(
+        "PreInvocation",
+        {
+            "conversationId": "ag-rank-fail",
+            "workspacePaths": [str(tmp_path)],
+            "invocationNum": 2,
+            "lastUserInput": "do the thing",
+        },
+        monkeypatch,
+    )
+
+    captured = json.loads(capsys.readouterr().out)
+    assert captured == {"injectSteps": []}
+
+
+def test_pre_invocation_no_last_user_input_skips_ranking(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_config, "load", lambda: {"start_brief": True})
+    called = []
+    monkeypatch.setattr(
+        brief_rank, "build_prompt_context", lambda *a, **k: called.append(1) or None
+    )
+
+    _run_handler(
+        "PreInvocation",
+        {"conversationId": "ag-no-input", "workspacePaths": [str(tmp_path)], "invocationNum": 2},
+        monkeypatch,
+    )
+
+    assert not called
+
+
+def test_resolve_real_cwd_trusts_existing_payload_path(tmp_path):
+    assert antigravity_handler._resolve_real_cwd([str(tmp_path)]) == str(tmp_path)
+
+
+def test_resolve_real_cwd_falls_back_when_payload_path_is_sandbox_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr("os.getcwd", lambda: str(tmp_path))
+    aliased = "/home-dir/Desktop/RCLM/does-not-exist-on-this-fs"
+
+    assert antigravity_handler._resolve_real_cwd([aliased]) == str(tmp_path)
+
+
+def test_pre_invocation_uses_real_cwd_not_sandbox_alias_for_ranking(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(_config, "load", lambda: {"start_brief": True})
+    monkeypatch.setattr("os.getcwd", lambda: str(tmp_path))
+    received = {}
+
+    def fake_rank(cwd, session_id, prompt, cfg, *, prior_events):
+        received["cwd"] = cwd
+        return None
+
+    monkeypatch.setattr(brief_rank, "build_prompt_context", fake_rank)
+
+    _run_handler(
+        "PreInvocation",
+        {
+            "conversationId": "ag-alias-1",
+            "workspacePaths": ["/home-dir/Desktop/RCLM/does-not-exist-on-this-fs"],
+            "invocationNum": 2,
+            "lastUserInput": "hello",
+        },
+        monkeypatch,
+    )
+
+    assert received["cwd"] == str(tmp_path)
 
 
 def test_post_invocation_records_event(monkeypatch, capsys):

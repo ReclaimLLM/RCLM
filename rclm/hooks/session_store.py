@@ -157,6 +157,44 @@ def write_result_delta_state(session_id: str, state: dict) -> None:
     _atomic_private_write(_result_delta_path(session_id), json.dumps(state, separators=(",", ":")))
 
 
+def _start_brief_path(session_id: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.startbrief.json"
+
+
+def read_start_brief_state(session_id: str) -> dict:
+    try:
+        data = json.loads(_start_brief_path(session_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_start_brief_state(session_id: str, state: dict) -> None:
+    """Atomically persist the last-injected ranked-brief file set, for turn gating."""
+    _atomic_private_write(_start_brief_path(session_id), json.dumps(state, separators=(",", ":")))
+
+
+def _cursor_turn_path(session_id: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.cursorturn.json"
+
+
+def read_cursor_turn_state(session_id: str) -> dict:
+    try:
+        data = json.loads(_cursor_turn_path(session_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_cursor_turn_state(session_id: str, state: dict) -> None:
+    """Atomically persist the prompt captured at Cursor's beforeSubmitPrompt, for
+    consumption at the next postToolUse (Cursor's beforeSubmitPrompt cannot inject
+    additional_context itself -- see rclm.hooks.cursor_handler). Deliberately a
+    separate sidecar from start_brief's own turn-gating state above: this tracks
+    "has this turn's prompt been consumed yet", not "what was last injected"."""
+    _atomic_private_write(_cursor_turn_path(session_id), json.dumps(state, separators=(",", ":")))
+
+
 def write_hook_health(session_id: str, record: dict) -> None:
     """Atomically persist one metadata-only hook-health record and bound history."""
     directory = _hook_health_dir()
@@ -195,6 +233,8 @@ def prune_stale_sidecars(*, max_age_s: int = _ORPHANED_SIDECAR_MAX_AGE_S) -> Non
         "*.mechanisms.json",
         "*.imageeviction.json",
         "*.resultdelta.json",
+        "*.startbrief.json",
+        "*.cursorturn.json",
         "*.marker",
     ):
         for path in _SESSIONS_DIR.glob(pattern):

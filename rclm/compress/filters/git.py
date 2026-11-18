@@ -101,9 +101,8 @@ def _filter_diff(output: str) -> str:
             elif hunk_lines == max_hunk_lines + 1:
                 result.append(f"  ... ({_count_remaining_hunk_lines(lines, line)} more lines)")
         # Context lines
-        elif line.startswith(" "):
-            if hunk_lines <= max_hunk_lines:
-                result.append(line)
+        elif line.startswith(" ") and hunk_lines <= max_hunk_lines:
+            result.append(line)
 
     return "\n".join(result)
 
@@ -140,9 +139,8 @@ def _filter_log(output: str) -> str:
                 commits.append(f"{current_hash[:7]} {current_msg.strip()}")
             current_hash = line[7:].strip()
             current_msg = ""
-        elif line.startswith("    "):
-            if not current_msg:
-                current_msg = line.strip()
+        elif line.startswith("    ") and not current_msg:
+            current_msg = line.strip()
 
     if current_hash:
         commits.append(f"{current_hash[:7]} {current_msg.strip()}")

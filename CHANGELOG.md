@@ -3,17 +3,25 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [v0.1.37] — 2026-11-18
 
 ### Added
 - `repeated_line_collapse` and `blob_placeholder` residual minifiers for non-file tool output: 5+ prose-like log lines differing only in numbers fold to the first, and long base64/hex runs become a size-and-digest placeholder; tables, CSV and key/value lines are never folded, and file reads and failed commands are skipped (`rclm/compress/filters/minify.py`, `rclm/hooks/tool_result_transform.py`)
 - `cross_session_outline` (Claude): a Read starting at line 1 of a large file (300+ lines, 200+ returned) whose content hash matches a read from an earlier session of the same project is replaced by a symbol outline with real line numbers; later reads of that file in the session are recorded as negative savings, so the figure is net. Defaults to observe, is not switched on by `force_compression_enforcement`, and is set with `cross_session_outline: off|observe|enforce` locally or in org `compression_modes` (`rclm/hooks/cross_session_outline.py`, `rclm/_config.py`)
 - Mechanism savings rollups carry `applied_tokens_saved` (the enforced part) next to `tokens_saved_estimate` (enforced + observe), so dashboards can separate savings that reached the model from potential (`rclm/hooks/_analytics.py`)
+- `authored_reads`: a read-back that repeats 6+ contiguous lines the model just wrote via Edit/Write is elided to a one-line marker, with bounded per-session state (`rclm/hooks/authored_reads.py`, `rclm/hooks/claude_handler.py`)
+- Codex `wait` (async-job poll) results are treated as shell-like output, so test-runner and compaction filters apply to them (`rclm/hooks/tool_semantics.py`)
+- Device check-in caches the server-approved `rclm` version as `approved_rclm_version` (`rclm/hooks/checkin.py`)
+- `RCLM_AUTO_UPDATE=false` disables PyPI checks and detached session-end updates, e.g. for air-gapped installs (`rclm/hooks/updater.py`, `README.md`)
+- Replay engine models authored-read elision and cross-session outline so token-savings replays match live behaviour (`rclm/replay/engine.py`, `rclm/replay/read_request.py`)
 
 ### Fixed
 - Claude Code PostToolUse replacements now keep the structured `tool_response` shape (Read `file.content`, Bash `stdout`). Claude Code silently ignored the plain-string `updatedToolOutput` rclm emitted, so DLP redaction of Read/Bash output for non-env files never reached the model, and stateful-delta, compaction and dedupe savings were recorded as applied without taking effect (`rclm/hooks/claude_handler.py`)
 
 ### Changed
+- `rclm-update` installs the server-approved version exactly (`pip install rclm==X`) instead of advancing past the server compatibility window (`rclm/update.py`, `rclm/hooks/updater.py`)
+- Frontend and backend URLs can be overridden with `RECLAIMLLM_FRONTEND_URL` / `FRONTEND_URL` and `RECLAIMLLM_SERVER_URL` (`rclm/auth.py`)
+- Simplified nested conditionals in the git diff and log filters, no behaviour change (`rclm/compress/filters/git.py`)
 - Claude native Read range-cache hits are now enforced (previously measurement-only), replacing an unchanged re-read with an "unchanged since turn N" notice (`rclm/hooks/claude_handler.py`)
 - Context-reference state (read cache, result delta, dedupe) resets when the Claude transcript records a compaction boundary, and is kept per subagent, so a cache notice never points at content outside the model's current context (`rclm/hooks/claude_handler.py`, `session_store.py`, `rclm/compress/read_cache_cli.py`)
 

@@ -132,6 +132,9 @@ async def async_checkin(
             issued = parsed.get("device_api_key")
             if isinstance(issued, str) and issued.strip():
                 _config.patch(device_api_key=issued.strip())
+            approved = parsed.get("approved_rclm_version")
+            if isinstance(approved, str) and approved.strip():
+                _config.patch(approved_rclm_version=approved.strip())
             _remember(fingerprint)
             return parsed
     except (aiohttp.ClientError, OSError, TimeoutError) as exc:

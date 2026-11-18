@@ -8,6 +8,40 @@ from rclm import _config
 from rclm.hooks import updater
 
 
+def test_update_check_can_be_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.setenv("RCLM_AUTO_UPDATE", "false")
+    monkeypatch.setattr(
+        updater, "_fetch_pypi_latest", lambda: (_ for _ in ()).throw(AssertionError())
+    )
+
+    assert updater.check_for_update(force=True) is None
+    assert updater.schedule_session_end_update() is False
+
+
+def test_server_approved_version_bypasses_pypi(tmp_path, monkeypatch):
+    monkeypatch.setattr(_config, "CONFIG_PATH", tmp_path / "config.json")
+    _config.patch(approved_rclm_version="2.4.0")
+    monkeypatch.setattr(updater, "installed_version", lambda: "2.3.0")
+    monkeypatch.setattr(
+        updater, "_fetch_pypi_latest", lambda: (_ for _ in ()).throw(AssertionError())
+    )
+
+    assert updater.check_for_update(force=True) == "2.4.0"
+
+
+def test_apply_update_pins_selected_version(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda command: calls.append(command) or type("Result", (), {"returncode": 0})(),
+    )
+
+    assert updater.apply_update("2.4.0") is True
+    assert calls == [[updater.sys.executable, "-m", "pip", "install", "--upgrade", "rclm==2.4.0"]]
+
+
 def test_schedule_starts_detached_child_once(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     monkeypatch.setattr(_config, "CONFIG_PATH", config_path)

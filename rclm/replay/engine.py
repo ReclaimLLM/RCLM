@@ -27,25 +27,37 @@ not inferred after the fact from the tool name.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-from rclm.hooks import dedupe, image_lifecycle
+from rclm.hooks import authored_reads, dedupe, image_lifecycle
 from rclm.hooks.read_cache import process_read
+from rclm.hooks.recallable_artifacts import HANDLE_PREFIX, ArtifactProvenance, build_stub
 from rclm.hooks.result_delta import process_delta
 from rclm.hooks.tool_result_transform import compact_tool_result, extract_tool_text_envelope
-from rclm.hooks.tool_semantics import supports_result_compaction
+from rclm.hooks.tool_semantics import (
+    normalized_tool_name,
+    supports_result_compaction,
+    tool_family,
+)
 from rclm.replay.read_request import build_antigravity_view_request, build_read_request
 from rclm.replay.tokenizer import count_tokens
 
-Mechanism = Literal["range_cache", "shell_compaction", "stateful_delta", "hash_dedupe"]
+Mechanism = Literal[
+    "range_cache", "shell_compaction", "stateful_delta", "hash_dedupe", "authored_read"
+]
 ALL_MECHANISMS: tuple[Mechanism, ...] = (
     "range_cache",
     "shell_compaction",
     "stateful_delta",
     "hash_dedupe",
 )
+# Opt-in: measured separately so the published combined figure keeps meaning
+# "mechanisms that ship in the hooks today".
+EXPERIMENTAL_MECHANISMS: tuple[Mechanism, ...] = ("authored_read",)
 
 _READ_ATTEMPT_TOOL_NAMES = frozenset(
     {
@@ -170,6 +182,95 @@ def _is_image(tool_response: object) -> bool:
     return False
 
 
+# Claude's plain Write/MultiEdit are not in the shared "edit" family (which is
+# deliberately limited to tools with a compaction adapter), but they mutate
+# files all the same.
+_EXTRA_EDIT_NAMES = frozenset({"write", "multiedit", "notebookedit"})
+
+
+def _is_edit_call(tool_name: str) -> bool:
+    return tool_family(tool_name) == "edit" or normalized_tool_name(tool_name) in _EXTRA_EDIT_NAMES
+
+
+def _split_read(
+    tool_name: str,
+    tool_input: dict,
+    original_text: str,
+    built: tuple,
+) -> tuple | None:
+    """Return (request, numbered/plain block, header prefix, trailing remainder)."""
+    request, trailing = built
+    prefix = ""
+    antigravity = (
+        build_antigravity_view_request(tool_input, original_text)
+        if tool_name.lower() in {"view_file", "read_file"}
+        else None
+    )
+    if tool_name.lower() == "view_file" and antigravity is None:
+        return None
+    if antigravity is not None:
+        return antigravity
+    block = original_text[: len(original_text) - len(trailing)] if trailing else original_text
+    return request, block, prefix, trailing
+
+
+def authored_recall_stub(
+    original_text: str, tool_name: str, path: str, tool_use_id: str | None = None
+) -> str:
+    """The recall stub production appends after persisting the exact read result."""
+    digest = hashlib.sha256(original_text.encode("utf-8", errors="surrogateescape")).hexdigest()
+    return build_stub(
+        f"{HANDLE_PREFIX}{digest}",
+        len(original_text),
+        ArtifactProvenance("unknown", tool_name, tool_use_id, path).bounded(),
+    )
+
+
+def _try_authored_read(
+    index: int,
+    tool_name: str,
+    tool_input: object,
+    original_text: str,
+    authored_state: dict,
+    turn: int,
+    captured_metadata: object = None,
+    tool_use_id: str | None = None,
+) -> tuple[ToolCallReplay | None, dict]:
+    if tool_name.lower() not in _READ_ATTEMPT_TOOL_NAMES or not isinstance(tool_input, dict):
+        return None, authored_state
+    built = build_read_request(tool_name, tool_input, original_text, captured_metadata)
+    parts = _split_read(tool_name, tool_input, original_text, built) if built else None
+    if parts is None:
+        return None, authored_state
+    request, block, prefix, trailing = parts
+    first = block.split("\n", 1)[0]
+    numbered = re.match(rf"^\s*{request.start_line}(?:→|\t|: ?)", first) is not None
+    decision = authored_reads.elide_authored_runs(
+        authored_state, request.path, block, numbered=numbered, turn=turn
+    )
+    if decision.replacement is None:
+        return None, decision.state
+    # Production persists the exact read result and appends a recall handle
+    # (context_memory.make_text_recallable), so a compacted-away reference stays
+    # recoverable. Count that stub, and keep the elision only if it still saves.
+    stub = authored_recall_stub(original_text, tool_name, request.path, tool_use_id)
+    compressed_text = prefix + decision.replacement.rstrip("\n") + "\n" + stub + "\n" + trailing
+    if len(compressed_text) >= len(original_text):
+        return None, decision.state
+    return (
+        ToolCallReplay(
+            index=index,
+            tool_name=tool_name,
+            classification="shaped",
+            mechanism="authored_read",
+            original_tokens=count_tokens(original_text),
+            compressed_tokens=count_tokens(compressed_text),
+            is_reachable=True,
+        ),
+        decision.state,
+    )
+
+
 def _try_range_cache(
     index: int,
     tool_name: str,
@@ -212,15 +313,10 @@ def _try_range_cache(
             )
         return None, None, read_state
 
-    request, trailing = built
-    prefix = ""
-    if tool_name.lower() == "view_file":
-        antigravity = build_antigravity_view_request(tool_input, original_text)
-        if antigravity is None:
-            return None, None, read_state
-        request, block, prefix, trailing = antigravity
-    else:
-        block = original_text[: len(original_text) - len(trailing)] if trailing else original_text
+    parts = _split_read(tool_name, tool_input, original_text, built)
+    if parts is None:
+        return None, None, read_state
+    request, block, prefix, trailing = parts
     decision = process_read(request, block, read_state, turn=turn)
     read_state = decision.state
     original_tokens = count_tokens(original_text)
@@ -377,10 +473,15 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
     read_state: dict = {}
     delta_state: dict = {}
     dedupe_state: dict = {}
+    authored_state: dict = {}
 
     for index, tool_call in enumerate(blob.get("tool_calls") or []):
         tool_name = tool_call.get("tool_name") or ""
         tool_input = tool_call.get("tool_input")
+        if _is_edit_call(tool_name) and (written := authored_reads.authored_text(tool_input)):
+            authored_state = authored_reads.record_authored(
+                authored_state, written[0], written[1], turn=index + 1
+            )
         tool_response = tool_call.get("tool_result")
         extra_fields = tool_call.get("extra_fields")
         captured_read_request = (
@@ -420,6 +521,19 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
                 turn,
                 captured_read_request,
             )
+
+        if record is None and "authored_read" in mechanisms:
+            authored_record, authored_state = _try_authored_read(
+                index,
+                tool_name,
+                tool_input,
+                original_text,
+                authored_state,
+                turn,
+                captured_read_request,
+            )
+            if authored_record is not None:
+                record = authored_record
 
         if record is None and "stateful_delta" in mechanisms:
             delta_record, delta_state = _try_stateful_delta(
@@ -468,6 +582,7 @@ def replay_blob(blob: dict, mechanisms: tuple[Mechanism, ...] = ALL_MECHANISMS) 
 
 __all__ = [
     "ALL_MECHANISMS",
+    "EXPERIMENTAL_MECHANISMS",
     "Mechanism",
     "ReplayResult",
     "ToolCallReplay",

@@ -48,6 +48,12 @@ class EffectiveHookPolicy:
         }
 
 
+def _local_outline_mode(cfg: dict) -> str:
+    """Local cross-session outline setting: off, observe (default) or enforce."""
+    value = cfg.get("cross_session_outline", "observe")
+    return value if value in _POLICY_MODES else "observe"
+
+
 def effective_hook_policy(
     cfg: dict | None = None, *, provider: str | None = None
 ) -> EffectiveHookPolicy:
@@ -71,16 +77,22 @@ def effective_hook_policy(
         "test_filter": bool(compression["enabled"] and compression["test_filter"]),
         "range_cache": bool(cfg.get("read_cache", False)),
         "image_downscale": bool(cfg.get("image_lifecycle", False)),
+        "cross_session_outline": _local_outline_mode(cfg) != "off",
     }
+    # Lossy mechanisms that must be opted into explicitly: they default to
+    # observe and are not switched on by force_compression_enforcement.
+    explicit_enforce = {"cross_session_outline": _local_outline_mode(cfg)}
     mechanisms: dict[str, dict[str, object]] = {}
     unsupported = {
         # Current Codex hooks support PreToolUse.updatedInput and model-visible
         # PostToolUse feedback replacement. Binary image replacement still has
         # no supported non-text contract.
-        "codex": {"image_downscale"},
-        "cursor": {"image_downscale"},
-        "gemini": {"exec_compaction", "test_filter", "image_downscale"},
-        "copilot": {"image_downscale"},
+        # The cross-session outline replaces native Read output, which only the
+        # Claude handler wires up today.
+        "codex": {"image_downscale", "cross_session_outline"},
+        "cursor": {"image_downscale", "cross_session_outline"},
+        "gemini": {"exec_compaction", "test_filter", "image_downscale", "cross_session_outline"},
+        "copilot": {"image_downscale", "cross_session_outline"},
     }.get(provider or "", set())
     for name, enabled in local_enabled.items():
         supported = name not in unsupported
@@ -91,6 +103,8 @@ def effective_hook_policy(
             mode = "off"
         elif not supported:
             mode = "observe"
+        elif name in explicit_enforce:
+            mode = configured_mode or ("observe" if legacy_shadow else explicit_enforce[name])
         elif force:
             mode = "enforce"
         elif configured_mode:

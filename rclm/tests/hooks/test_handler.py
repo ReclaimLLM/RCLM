@@ -892,7 +892,22 @@ def test_read_cache_miss_falls_through_to_shell_compaction(monkeypatch, tmp_path
     assert "40 lines omitted" in output["hookSpecificOutput"]["updatedToolOutput"]
 
 
-def test_read_cache_unchanged_reread_records_unenforced_potential(monkeypatch, tmp_path, capsys):
+def _native_read_response(target, content):
+    """Claude Code's structured native Read tool_response."""
+    lines = content.count("\n")
+    return {
+        "type": "text",
+        "file": {
+            "filePath": str(target),
+            "content": content,
+            "numLines": lines,
+            "startLine": 1,
+            "totalLines": lines,
+        },
+    }
+
+
+def test_read_cache_unchanged_reread_replaces_native_read_output(monkeypatch, tmp_path, capsys):
     from rclm import _config
     from rclm.hooks import session_store
 
@@ -905,22 +920,28 @@ def test_read_cache_unchanged_reread_records_unenforced_potential(monkeypatch, t
     content = _long_lines()
     target.write_text(content)
     payload = _read_payload("sid-rc3", target, content)
-    _run_handler("PostToolUse", payload, monkeypatch)
-    capsys.readouterr()
-
+    payload["tool_response"] = _native_read_response(target, content)
     _run_handler("PostToolUse", payload, monkeypatch)
     assert capsys.readouterr().out == ""
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    updated = output["hookSpecificOutput"]["updatedToolOutput"]
+    assert updated["type"] == "text"
+    assert updated["file"]["filePath"] == str(target)
+    assert updated["file"]["content"] == "[RCLM] Lines 1-80 of a.py unchanged since turn 1.\n"
 
     events = session_store.read_events("sid-rc3")
     saving_events = [e for e in events if e.get("event_type") == "MechanismSaving"]
     assert len(saving_events) == 1
     assert saving_events[0]["mechanism"] == "range_cache"
-    assert saving_events[0]["applied"] is False
+    assert saving_events[0]["applied"] is True
     assert saving_events[0]["measurement_kind"] == "measured"
     assert saving_events[0]["file_path"] == "a.py"
     transformations = [e for e in events if e.get("event_type") == "ToolTransformation"]
     assert transformations[-1]["compression_strategy"] == "range_cache"
-    assert transformations[-1]["applied"] is False
+    assert transformations[-1]["applied"] is True
     assert (
         transformations[-1]["raw_token_estimate"] > transformations[-1]["compressed_token_estimate"]
     )
@@ -1029,7 +1050,7 @@ def test_read_cache_and_dlp_compose_without_exposing_secret(monkeypatch, tmp_pat
     output = json.loads(capsys.readouterr().out)
     replacement = output["hookSpecificOutput"]["updatedToolOutput"]
     assert "secret-token" not in replacement
-    assert "[RCLM] Lines 1-80" not in replacement
+    assert "[RCLM] Lines 1-80 of a.py unchanged since turn 1." in replacement
 
 
 def test_read_cache_edit_invalidates_before_reread(monkeypatch, tmp_path, capsys):
@@ -1180,6 +1201,134 @@ def test_post_tool_use_dlp_output_matches_claude_schema(monkeypatch, tmp_path, c
     event = session_store.read_events("sid-dlp")[-1]
     assert event["tool_response"] == "token=[REDACTED:TOKEN]"
     assert "secret-token" not in json.dumps(event)
+
+
+# Fake credential shaped like a GitHub PAT so the real detector fires.
+_FAKE_GITHUB_TOKEN = "ghp_" + "Xq7Lm2Rv9Tz4Kp8Wn3Bc6Hd1Fs5Jg0Ya2Uea"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input", "tool_response", "field"),
+    [
+        (
+            "Read",
+            {"file_path": "/repo/settings_module.py"},
+            {
+                "type": "text",
+                "file": {
+                    "filePath": "/repo/settings_module.py",
+                    "content": f'GITHUB_TOKEN = "{_FAKE_GITHUB_TOKEN}"\nTIMEOUT = 30\n',
+                    "numLines": 2,
+                    "startLine": 1,
+                    "totalLines": 2,
+                },
+            },
+            ("file", "content"),
+        ),
+        (
+            "Bash",
+            {"command": "cat settings_module.py"},
+            {
+                "stdout": f'GITHUB_TOKEN = "{_FAKE_GITHUB_TOKEN}"\n',
+                "stderr": "",
+                "interrupted": False,
+            },
+            ("stdout",),
+        ),
+    ],
+)
+def test_post_tool_use_dlp_keeps_structured_claude_response_shape(
+    monkeypatch, tmp_path, capsys, tool_name, tool_input, tool_response, field
+):
+    """Claude Code drops string replacements for Read/Bash, which leaked secrets."""
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr("rclm._config.load", lambda: {"dlp": True})
+    # DLP learns the value from the workspace env file, as in a real project.
+    (tmp_path / ".env").write_text(f"GITHUB_TOKEN={_FAKE_GITHUB_TOKEN}\n")
+    payload = {
+        "session_id": f"sid-dlp-{tool_name}",
+        "cwd": str(tmp_path),
+        "hook_event_name": "PostToolUse",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "tool_response": tool_response,
+        "tool_use_id": f"toolu-{tool_name}",
+    }
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+
+    output = json.loads(capsys.readouterr().out)
+    validate(instance=output, schema=CLAUDE_POST_TOOL_USE_OUTPUT_SCHEMA)
+    updated = output["hookSpecificOutput"]["updatedToolOutput"]
+    assert isinstance(updated, dict)
+    assert set(updated) == set(tool_response)
+    value = updated
+    for key in field:
+        value = value[key]
+    assert "[REDACTED:" in value
+    assert _FAKE_GITHUB_TOKEN not in json.dumps(output)
+    assert _FAKE_GITHUB_TOKEN not in json.dumps(session_store.read_events(payload["session_id"]))
+
+
+def test_read_cache_resets_after_claude_compaction(monkeypatch, tmp_path, capsys):
+    """After compaction the earlier read is gone from context, so serve it in full."""
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    target = tmp_path / "a.py"
+    content = _long_lines()
+    target.write_text(content)
+    transcript_path = tmp_path / "transcript.jsonl"
+    transcript_path.write_text(json.dumps({"type": "user", "message": "compact_boundary"}) + "\n")
+    payload = _read_payload("sid-compact", target, content)
+    payload["tool_response"] = _native_read_response(target, content)
+    payload["transcript_path"] = str(transcript_path)
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+    _run_handler("PostToolUse", payload, monkeypatch)
+    # A mention of the word in ordinary content is not a boundary.
+    assert "unchanged since turn 1" in capsys.readouterr().out
+
+    with transcript_path.open("a") as handle:
+        handle.write(json.dumps({"type": "system", "subtype": "compact_boundary"}) + "\n")
+    _run_handler("PostToolUse", payload, monkeypatch)
+    assert capsys.readouterr().out == ""
+
+    _run_handler("PostToolUse", payload, monkeypatch)
+    assert "unchanged since turn" in capsys.readouterr().out
+
+
+def test_read_cache_isolates_subagent_context(monkeypatch, tmp_path, capsys):
+    """A subagent never saw the parent's reads, so it must not get a cache stub."""
+    from rclm import _config
+    from rclm.hooks import session_store
+
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"read_cache": True}))
+    monkeypatch.setattr(_config, "CONFIG_PATH", config_path)
+    target = tmp_path / "a.py"
+    content = _long_lines()
+    target.write_text(content)
+    parent = _read_payload("sid-agents", target, content)
+    parent["tool_response"] = _native_read_response(target, content)
+    subagent = dict(parent, agent_id="agent/one", tool_use_id="tool-subagent")
+
+    _run_handler("PostToolUse", parent, monkeypatch)
+    _run_handler("PostToolUse", subagent, monkeypatch)
+    assert capsys.readouterr().out == ""
+
+    _run_handler("PostToolUse", subagent, monkeypatch)
+    assert "unchanged since turn" in capsys.readouterr().out
+
+    session_store.cleanup("sid-agents")
+    assert not list((tmp_path / "sessions").glob("sid-agents.agent-*"))
 
 
 # ---------------------------------------------------------------------------
@@ -1555,7 +1704,8 @@ def test_read_cache_survives_stop_until_session_end(monkeypatch, tmp_path, capsy
     assert session_store.read_read_cache_state("sid-cross-turn").get("files")
 
     _run_handler("PostToolUse", payload, monkeypatch)
-    assert capsys.readouterr().out == ""
+    output = json.loads(capsys.readouterr().out)
+    assert "unchanged since turn 1" in output["hookSpecificOutput"]["updatedToolOutput"]
 
     _run_handler("SessionEnd", {"session_id": "sid-cross-turn"}, monkeypatch)
     assert session_store.read_read_cache_state("sid-cross-turn") == {}
@@ -1627,7 +1777,13 @@ def test_read_cache_extracts_structured_claude_bash_response(monkeypatch, tmp_pa
     capsys.readouterr()
 
     _run_handler("PostToolUse", payload, monkeypatch)
-    assert capsys.readouterr().out == ""
+    output = json.loads(capsys.readouterr().out)
+    # Claude ignores a string replacement for structured results; keep the shape.
+    assert output["hookSpecificOutput"]["updatedToolOutput"] == {
+        "stdout": "[RCLM] Lines 1-80 of source.py unchanged since turn 1.\n",
+        "stderr": "",
+        "interrupted": False,
+    }
 
 
 def test_read_cache_wraps_exact_bash_reads_during_pre_tool_use(monkeypatch, tmp_path, capsys):

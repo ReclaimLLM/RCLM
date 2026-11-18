@@ -16,12 +16,18 @@ from typing import TypeAlias
 
 from rclm.compress.filters.lossless import MECHANISM as LOSSLESS_SEARCH_PATH_MECHANISM
 from rclm.compress.filters.lossless import compact_search_and_paths
+from rclm.compress.filters.minify import minify
 from rclm.compress.filters.shell import filter_generic
 from rclm.compress.runner import apply_filter
 from rclm.hooks import image_lifecycle
 from rclm.hooks._analytics import estimate_tokens, mechanism_saving_event
 from rclm.hooks.compress import is_compressible_command
-from rclm.hooks.tool_semantics import command_text, normalized_tool_name, tool_family
+from rclm.hooks.tool_semantics import (
+    command_text,
+    is_poll_tool,
+    normalized_tool_name,
+    tool_family,
+)
 
 _PathPart: TypeAlias = str | int
 _MAX_JSON_PARSE_CHARS = 2_000_000
@@ -45,6 +51,10 @@ _DIFF_HUNK = re.compile(
     r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@",
     re.MULTILINE,
 )
+
+
+# Shell commands that print file content; their output is treated like a Read.
+_SHELL_FILE_PRINT_RE = re.compile(r"^\s*(?:cat|head|tail|nl|bat|less|more|sed\s+-n)\b")
 
 
 @dataclass(frozen=True)
@@ -145,11 +155,57 @@ def compact_tool_result(
     tool_input: object,
     tool_response: object,
 ) -> TransformDecision | None:
-    """Compact one recognized successful textual tool result.
+    """Compact one successful textual tool result.
 
-    Unknown commands, failures, images, malformed structured output, and
-    already-small results pass through unchanged.
+    Recognized commands and native tools get their dedicated filters first;
+    residual minifiers then fold repeated lines and encoded blobs in any
+    non-file output. Failures, images and malformed output pass through.
     """
+    decision = _compact_recognized_result(tool_name, tool_input, tool_response)
+    if not _minify_eligible(tool_name, tool_input, tool_response):
+        return decision
+    envelope = extract_tool_text_envelope(tool_name, tool_response)
+    if envelope is None:
+        return decision
+    steps = minify(decision.compressed_text if decision else envelope.text)
+    if not steps:
+        return decision
+    savings_steps = (*(decision.savings_steps if decision else ()),) + tuple(
+        SavingsStep(mechanism, before, after) for mechanism, before, after in steps
+    )
+    return (
+        decision_from_replacement(
+            envelope,
+            steps[-1][2],
+            mechanism=decision.mechanism if decision else steps[0][0],
+            savings_steps=savings_steps,
+        )
+        or decision
+    )
+
+
+def _minify_eligible(tool_name: str, tool_input: object, tool_response: object) -> bool:
+    """Minifiers are lossy, so keep them away from file content and failures."""
+    if (
+        not isinstance(tool_input, dict)
+        or _is_error_result(tool_response)
+        or _has_oversized_content_list(tool_response)
+        or image_lifecycle.find_image(tool_response) is not None
+        or _exit_code(tool_response) not in (None, 0)
+    ):
+        return False
+    if tool_family(tool_name) in {"read", "edit"}:
+        return False
+    command = command_text(tool_input)
+    return not (isinstance(command, str) and _SHELL_FILE_PRINT_RE.match(command))
+
+
+def _compact_recognized_result(
+    tool_name: str,
+    tool_input: object,
+    tool_response: object,
+) -> TransformDecision | None:
+    """Apply command-aware and native-tool filters to a recognized result."""
     if (
         not isinstance(tool_input, dict)
         or _is_error_result(tool_response)
@@ -315,7 +371,11 @@ def extract_tool_text_envelope(tool_name: str, value: object) -> TextEnvelope | 
     envelope = extract_text_envelope(value)
     if envelope is not None:
         return envelope
-    if tool_family(tool_name) != "shell" or not isinstance(value, list) or not value:
+    if (
+        (tool_family(tool_name) != "shell" and not is_poll_tool(tool_name))
+        or not isinstance(value, list)
+        or not value
+    ):
         return None
     if not all(
         isinstance(block, dict)
@@ -393,6 +453,17 @@ def _compact_known_native_tool(
     if normalized == "run_command":
         replacement = _compact_antigravity_command(tool_input, text)
         return (replacement, "H3_exec_compaction") if replacement is not None else None
+    if is_poll_tool(tool_name):
+        # Same two-step policy as a finished Codex ``exec``: runner-aware test
+        # filtering when the output is recognisably a test run, otherwise the
+        # generic repeat-collapse and head/tail cap.
+        replacement = _compact_polled_test_output(text)
+        if replacement is not None:
+            return replacement, "H3_exec_compaction"
+        if text.startswith("Script completed\n"):
+            generic = filter_generic(text)
+            return (generic, "provider_output_shaping") if generic is not None else None
+        return None
     if normalized == "exec" and text.startswith(("Script completed\n", "Chunk ID:")):
         replacement = filter_generic(text)
         return (replacement, "provider_output_shaping") if replacement is not None else None
@@ -404,6 +475,35 @@ def _compact_known_native_tool(
         replacement = _compact_edit_receipt(normalized, tool_input, text)
         return (replacement, "edit_receipt") if replacement is not None else None
     return None
+
+
+# Poll results carry no command, so the runner is recognised from its own
+# summary lines. Each sniff is paired with the command string the shared test
+# filters key on; anything unrecognised passes through untouched.
+_POLL_TEST_SNIFFS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("pytest", re.compile(r"^=+ .*\b(?:passed|failed|errors?)\b.* =+$", re.MULTILINE)),
+    ("npx jest", re.compile(r"^(?:Test Suites|Tests):\s+\d+", re.MULTILINE)),
+    ("go test", re.compile(r"^(?:ok|FAIL)\s+\S+\s+[\d.]+s\b", re.MULTILINE)),
+)
+_POLL_OUTPUT_MARKER = "Output:\n"
+
+
+def _compact_polled_test_output(text: str) -> str | None:
+    """Apply the shared test-runner filters to a finished async job's output."""
+    if not text.startswith("Script completed\n"):
+        return None
+    marker = text.find(_POLL_OUTPUT_MARKER)
+    if marker < 0:
+        return None
+    split = marker + len(_POLL_OUTPUT_MARKER)
+    head, body = text[:split], text[split:]
+    command = next((cmd for cmd, sniff in _POLL_TEST_SNIFFS if sniff.search(body)), None)
+    if command is None:
+        return None
+    result = apply_filter(command, body, "")
+    if result.mechanism is None or len(result.text) >= len(body):
+        return None
+    return head + result.text
 
 
 def _strip_antigravity_timing(text: str) -> str:

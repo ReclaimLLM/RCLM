@@ -8,6 +8,7 @@ from rclm.hooks._analytics import (
     estimate_image_tokens,
     estimate_tokens,
     mechanism_saving_event,
+    merge_mechanism_savings,
 )
 
 # ---------------------------------------------------------------------------
@@ -185,12 +186,14 @@ class TestAggregateMechanismSavings:
             "applied_count": 2,
             "shadow_count": 0,
             "tokens_saved_estimate": 1500,
+            "applied_tokens_saved": 1500,
             "measurement_kind": "estimated",
         }
         assert result["H3_exec_compaction"] == {
             "applied_count": 1,
             "shadow_count": 0,
             "tokens_saved_estimate": 200,
+            "applied_tokens_saved": 200,
             "measurement_kind": "estimated",
         }
 
@@ -216,6 +219,7 @@ class TestAggregateMechanismSavings:
             "applied_count": 2,
             "shadow_count": 0,
             "tokens_saved_estimate": 150,
+            "applied_tokens_saved": 150,
             "measurement_kind": "measured",
             "files": {
                 "src/api.py": {
@@ -236,6 +240,7 @@ class TestAggregateMechanismSavings:
         assert result["H4_loop_breaker"]["applied_count"] == 1
         assert result["H4_loop_breaker"]["shadow_count"] == 1
         assert result["H4_loop_breaker"]["tokens_saved_estimate"] == 200
+        assert result["H4_loop_breaker"]["applied_tokens_saved"] == 100
 
     def test_unknown_mechanism_field_defaults(self):
         events = [{"event_type": "MechanismSaving", "applied": True, "tokens_saved_estimate": 5}]
@@ -258,3 +263,31 @@ class TestAggregateMechanismSavings:
         assert result is not None
         assert "modeled_cost_estimate" not in result["image_eviction"]
         assert result["image_eviction"]["tokens_saved_estimate"] == 0
+
+
+class TestMergeMechanismSavings:
+    def test_merge_keeps_enforced_and_potential_apart(self):
+        first = aggregate_mechanism_savings(
+            [
+                mechanism_saving_event("range_cache", applied=True, tokens_saved_estimate=300),
+                mechanism_saving_event("range_cache", applied=False, tokens_saved_estimate=50),
+            ]
+        )
+        second = aggregate_mechanism_savings(
+            [mechanism_saving_event("range_cache", applied=True, tokens_saved_estimate=20)]
+        )
+        merged = merge_mechanism_savings(first, second)
+        assert merged["range_cache"]["tokens_saved_estimate"] == 370
+        assert merged["range_cache"]["applied_tokens_saved"] == 320
+
+    def test_merge_infers_enforced_part_of_legacy_rollups(self):
+        legacy_enforced = {
+            "exec_compaction": {"applied_count": 2, "shadow_count": 0, "tokens_saved_estimate": 90}
+        }
+        legacy_mixed = {
+            "exec_compaction": {"applied_count": 1, "shadow_count": 1, "tokens_saved_estimate": 40}
+        }
+        merged = merge_mechanism_savings(legacy_enforced, legacy_mixed)
+        # A mixed legacy bucket cannot be split, so it counts only as potential.
+        assert merged["exec_compaction"]["applied_tokens_saved"] == 90
+        assert merged["exec_compaction"]["tokens_saved_estimate"] == 130

@@ -30,6 +30,7 @@ from rclm.hooks import (
     brief_cache,
     brief_rank,
     context_memory,
+    cross_session_outline,
     dedupe,
     dlp,
     egress_guard,
@@ -253,20 +254,26 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
         except Exception:
             logger.exception("DLP input inspection failed; passing through unrelated tool input")
 
+    state_id = _context_state_id(session_id, payload)
+    try:
+        _reset_context_state_after_compaction(state_id, payload)
+    except Exception:
+        logger.exception("compaction check failed; continuing with existing cache state")
+
     read_offset: int | None = None
     if policy.enabled("range_cache"):
         try:
-            read_state = session_store.read_read_cache_state(session_id)
+            read_state = session_store.read_read_cache_state(state_id)
             if tool_name in {"Write", "Edit", "NotebookEdit"}:
                 read_state = read_cache.invalidate_tool_path(
                     read_state, tool_name, effective_input, cwd=cwd
                 )
-                session_store.write_read_cache_state(session_id, read_state)
+                session_store.write_read_cache_state(state_id, read_state)
             elif tool_name == "Read" and not policy.shadow_for("range_cache"):
                 read_offset, read_state = read_cache.next_unseen_offset(
                     effective_input, read_state, cwd=cwd
                 )
-                session_store.write_read_cache_state(session_id, read_state)
+                session_store.write_read_cache_state(state_id, read_state)
             elif tool_name == "Bash":
                 command = effective_input.get("command", "")
                 shell = effective_input.get("shell") or ("posix" if os.name == "posix" else os.name)
@@ -283,8 +290,14 @@ def _handle_pre_tool_use(session_id: str, payload: dict) -> None:
                     and "|" not in command
                     and not command.lstrip().startswith("rclm-read-cache ")
                 ):
+                    state_env = (
+                        f"RCLM_READ_CACHE_STATE_ID={shlex.quote(state_id)} "
+                        if state_id != session_id
+                        else ""
+                    )
                     effective_input["command"] = (
-                        f"CLAUDE_SESSION_ID={shlex.quote(session_id)} rclm-read-cache {command}"
+                        f"CLAUDE_SESSION_ID={shlex.quote(session_id)} {state_env}"
+                        f"rclm-read-cache {command}"
                     )
                     changed = True
                     hook_output.update(
@@ -372,6 +385,89 @@ def _response_text(tool_response: object) -> str:
     return str(tool_response or "")
 
 
+def _claude_tool_output(replacement: object, tool_response: object) -> object:
+    """Shape a text replacement the way Claude Code accepts it.
+
+    Claude Code silently ignores a plain-string updatedToolOutput for structured
+    results such as Read (`file.content`) and Bash (`stdout`/`stderr`); it only
+    honours an object with the original response shape (verified E2E on 2.1.311).
+    """
+    if not isinstance(replacement, str) or not isinstance(tool_response, dict):
+        return replacement
+    shaped = dict(tool_response)
+    file_result = shaped.get("file")
+    if isinstance(file_result, dict) and isinstance(file_result.get("content"), str):
+        shaped["file"] = {**file_result, "content": replacement}
+        return shaped
+    if isinstance(shaped.get("stdout"), str) or isinstance(shaped.get("stderr"), str):
+        # _response_text() joins stdout+stderr, so the replacement covers both.
+        shaped["stdout"] = replacement
+        shaped["stderr"] = ""
+        return shaped
+    if isinstance(shaped.get("content"), str):
+        shaped["content"] = replacement
+        return shaped
+    return replacement
+
+
+def _context_state_id(session_id: str, payload: dict) -> str:
+    """Key state whose replacements refer back to results already in context.
+
+    A subagent has its own context window, so a stub such as "Lines 1-80
+    unchanged since turn 3" is only valid against results that agent saw.
+    """
+    agent_id = payload.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id:
+        return session_id
+    safe_agent_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in agent_id)
+    return f"{session_id}.agent-{safe_agent_id[:64]}"
+
+
+def _is_compact_boundary(line: bytes) -> bool:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return False
+    return (
+        isinstance(entry, dict)
+        and entry.get("type") == "system"
+        and entry.get("subtype") == "compact_boundary"
+    )
+
+
+def _reset_context_state_after_compaction(state_id: str, payload: dict) -> None:
+    """Drop context-reference state once Claude compacts the transcript.
+
+    Compaction summarises earlier tool results away, so cache stubs and deltas
+    pointing at them would leave the model without the content. Only transcript
+    bytes appended since the previous check are scanned.
+    """
+    transcript_path = payload.get("agent_transcript_path") or payload.get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return
+    offset = session_store.read_transcript_cursor(state_id)
+    try:
+        with open(Path(transcript_path).expanduser(), "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if offset > size:  # transcript replaced; rescan from the start
+                offset = 0
+            handle.seek(offset)
+            chunk = handle.read(size - offset)
+    except OSError:
+        return
+    complete = chunk.rfind(b"\n") + 1
+    if complete == 0:
+        return
+    compacted = any(
+        _is_compact_boundary(line)
+        for line in chunk[:complete].splitlines()
+        if b"compact_boundary" in line
+    )
+    session_store.write_transcript_cursor(state_id, offset + complete)
+    if compacted:
+        session_store.reset_context_reference_state(state_id)
+
+
 def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
@@ -384,7 +480,12 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     cfg = _config.load()
     policy = _config.effective_hook_policy(cfg, provider="claude")
     cwd = _resolve_cwd(session_id, payload)
-    dlp_replacement: str | None = None
+    state_id = _context_state_id(session_id, payload)
+    try:
+        _reset_context_state_after_compaction(state_id, payload)
+    except Exception:
+        logger.exception("compaction check failed; continuing with existing cache state")
+    dlp_replacement: object | None = None
     captured_response = tool_response
     is_image_result = (
         policy.enabled("image_downscale") and image_lifecycle.find_image(tool_response) is not None
@@ -402,7 +503,8 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 redacted_value = dlp.maybe_redact_value(tool_response, cwd, redact_all=redact_all)
                 if redacted_value is not None:
                     captured_response = redacted_value
-                    dlp_replacement = _response_text(redacted_value)
+                    # Keep the structured shape: Claude ignores a string replacement here.
+                    dlp_replacement = redacted_value
         except dlp.DLPRedactionError as exc:
             if dlp.input_may_read_env(tool_name, tool_input):
                 dlp_replacement = f"[rclm DLP] Output withheld: {exc}"
@@ -426,7 +528,10 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         if wrapped_event is not None
         else None
     )
-    if policy.enabled("range_cache") and request is None and tool_name in {"Read", "Bash"}:
+    needs_read_request = policy.enabled("range_cache") or (
+        tool_name == "Read" and policy.enabled("cross_session_outline")
+    )
+    if needs_read_request and request is None and tool_name in {"Read", "Bash"}:
         if tool_name == "Read":
             request = read_cache.native_read_request(tool_input, cwd=cwd)
         elif not range_claimed:
@@ -544,27 +649,61 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
         hook_output["updatedToolOutput"] = dlp_replacement
         context_notes.append("[rclm DLP] Secrets were redacted from the tool response.")
 
-    if policy.enabled("range_cache") and tool_name in {"Read", "Bash"}:
+    outline_claimed = False
+    if (
+        policy.enabled("cross_session_outline")
+        and tool_name == "Read"
+        and request is not None
+        and dlp_replacement is None
+    ):
+        try:
+            outline = cross_session_outline.apply_outline(
+                request,
+                effective_text,
+                session_id=session_id,
+                state_id=state_id,
+                cwd=cwd,
+                shadow=policy.shadow_for("cross_session_outline"),
+            )
+            for event in outline.events:
+                session_store.append_event(session_id, event)
+            replacement = outline.replacement
+            if replacement is not None and _config.dlp_enabled(cfg):
+                replacement = dlp.maybe_redact_output(tool_name, replacement, cwd) or replacement
+            if replacement is not None:
+                effective_text = replacement
+                hook_output["updatedToolOutput"] = replacement
+                # The model never saw these lines, so the range cache must not
+                # record them as delivered.
+                outline_claimed = True
+                range_claimed = True
+        except Exception:
+            logger.exception("cross-session outline failed; passing through tool result")
+
+    if policy.enabled("range_cache") and tool_name in {"Read", "Bash"} and not outline_claimed:
         try:
             if request is not None:
-                state = session_store.read_read_cache_state(session_id)
+                state = session_store.read_read_cache_state(state_id)
                 turn = (
                     sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
                 )
+                # Wrapped Bash reads were already served by rclm-read-cache before
+                # Claude received the result; only measure them here.
+                shadow = wrapped_event is not None or policy.shadow_for("range_cache")
                 application = read_cache.apply_range_cache(
                     request,
                     effective_text,
                     state,
                     turn=turn,
                     tool_use_id=tool_use_id,
-                    # Claude 2.1.205 ignores PostToolUse.updatedToolOutput.
-                    # Track conservative potential here; Bash enforcement occurs
-                    # in rclm-read-cache before Claude receives the tool result.
-                    shadow=True,
+                    shadow=shadow,
                 )
-                session_store.write_read_cache_state(session_id, application.state)
+                session_store.write_read_cache_state(state_id, application.state)
                 for event in application.events:
                     session_store.append_event(session_id, event)
+                if application.replacement is not None and not shadow:
+                    effective_text = application.replacement
+                    hook_output["updatedToolOutput"] = application.replacement
                 # A first-seen range updates H1 state but leaves the result
                 # unchanged. Let compaction/dedupe inspect that unchanged text;
                 # only a real cache-hit replacement claims precedence.
@@ -576,9 +715,9 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     if policy.enabled("exec_compaction") and not range_claimed:
         shadow = policy.shadow_for("exec_compaction")
         try:
-            state = session_store.read_result_delta_state(session_id)
+            state = session_store.read_result_delta_state(state_id)
             delta = result_delta.process_delta(tool_name, tool_input, effective_text, state)
-            session_store.write_result_delta_state(session_id, delta.state)
+            session_store.write_result_delta_state(state_id, delta.state)
             if delta.replacement is not None:
                 replacement = delta.replacement
                 if not shadow:
@@ -659,7 +798,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
     ):
         shadow = policy.shadow_for("hash_dedupe")
         try:
-            state = session_store.read_dedupe_state(session_id)
+            state = session_store.read_dedupe_state(state_id)
             turn = sum(1 for event in prior_events if event.get("event_type") == "PostToolUse") + 1
             replacement, state, match = dedupe.maybe_dedupe(
                 effective_text,
@@ -669,7 +808,7 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
                 cwd=cwd,
                 min_chars=int(compression["min_dedupe_chars"]),
             )
-            session_store.write_dedupe_state(session_id, state)
+            session_store.write_dedupe_state(state_id, state)
             if replacement and match:
                 raw_tokens = estimate_tokens(effective_text)
                 compressed_tokens = estimate_tokens(replacement)
@@ -719,6 +858,12 @@ def _handle_post_tool_use(session_id: str, payload: dict) -> None:
 
     if context_notes:
         hook_output["additionalContext"] = " ".join(context_notes)
+
+    if "updatedToolOutput" in hook_output:
+        # Shape from the DLP-scrubbed response so no unreplaced field leaks a secret.
+        hook_output["updatedToolOutput"] = _claude_tool_output(
+            hook_output["updatedToolOutput"], captured_response
+        )
 
     if len(hook_output) > 1:
         print(json.dumps({"hookSpecificOutput": hook_output}))

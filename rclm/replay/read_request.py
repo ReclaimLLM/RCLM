@@ -27,11 +27,16 @@ import re
 from rclm.hooks.read_cache import FileMetadata, ReadRequest, deserialize_read_request
 from rclm.hooks.tool_semantics import command_text
 
-_NUMBERED_LINE = re.compile(r"^\s*(\d+)→(.*)$")
+# Claude Code numbers Read output as ``N→text`` (older) or ``N<TAB>text`` (newer).
+_NUMBERED_LINE = re.compile(r"^\s*(\d+)(?:→|\t)(.*)$")
 _ANTIGRAVITY_NUMBERED_LINE = re.compile(r"^(\d+):(?: (.*))?$")
 _ANTIGRAVITY_FILE_PATH = re.compile(r"^File Path: `(?:file://)?(?P<path>.+)`$")
 _ANTIGRAVITY_TOTAL_LINES = re.compile(r"^Total Lines: (?P<count>\d+)$")
 _ANTIGRAVITY_SHOWING = re.compile(r"^Showing lines (?P<start>\d+) to (?P<end>\d+)$")
+# ``read_file`` variant: no File Path/Total Lines lines, a compact "A-B of T" header.
+_ANTIGRAVITY_READ_SHOWING = re.compile(
+    r"^Showing lines (?P<start>\d+)-(?P<end>\d+) of (?P<total>\d+)$"
+)
 _SED_RANGE = re.compile(r"^(?P<start>[1-9]\d*)(?:,(?P<end>[1-9]\d*))?p$")
 _AWK_RANGE = re.compile(r"^\s*NR\s*>=\s*(?P<start>[1-9]\d*)\s*&&\s*NR\s*<=\s*(?P<end>[1-9]\d*)\s*$")
 _HEAD_N = re.compile(r"(?:^|\s)-(?:n\s*)?(\d+)(?:\s|$)")
@@ -98,7 +103,7 @@ def build_antigravity_view_request(
     if split is None:
         return None
     prefix, block, suffix = split
-    path = tool_input.get("AbsolutePath")
+    path = tool_input.get("AbsolutePath") or tool_input.get("Path")
     if not isinstance(path, str) or not path:
         return None
 
@@ -127,6 +132,20 @@ def build_antigravity_view_request(
         ),
         None,
     )
+    if showing is None:
+        compact = next(
+            (
+                match
+                for line in prefix_lines
+                if (match := _ANTIGRAVITY_READ_SHOWING.fullmatch(line)) is not None
+            ),
+            None,
+        )
+        if compact is not None:
+            showing = (int(compact.group("start")), int(compact.group("end")))
+            total_lines = int(compact.group("total"))
+            # read_file's header never repeats the path; the input is the only source.
+            captured_path = path
     block_lines = block.splitlines()
     matches = [_ANTIGRAVITY_NUMBERED_LINE.fullmatch(line) for line in block_lines]
     if (
@@ -331,6 +350,9 @@ def build_read_request(
         request, _block, _prefix, suffix = built
         return request, suffix
     if name in {"read_file", "read_text_file"}:
+        antigravity = build_antigravity_view_request(tool_input, content)
+        if antigravity is not None:
+            return antigravity[0], antigravity[3]
         return build_plain_native_read_request(tool_input, content)
     if name in _NATIVE_READ_TOOL_NAMES:
         return build_native_read_request(tool_input, content)

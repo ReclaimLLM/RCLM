@@ -7,6 +7,7 @@ and referenced by `rclm-mcp` (mcp_server.py) for its auth-required error text.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import select
 import sys
@@ -19,8 +20,12 @@ import aiohttp
 
 from rclm._http import create_tcp_connector
 
-DEFAULT_FRONTEND_URL = "https://reclaimllm.com"
-DEFAULT_BACKEND_SERVER_URL = "https://api.reclaimllm.com"
+DEFAULT_FRONTEND_URL = os.environ.get(
+    "RECLAIMLLM_FRONTEND_URL", os.environ.get("FRONTEND_URL", "https://reclaimllm.com")
+).rstrip("/")
+DEFAULT_BACKEND_SERVER_URL = os.environ.get(
+    "RECLAIMLLM_SERVER_URL", "https://api.reclaimllm.com"
+).rstrip("/")
 SETUP_URL = DEFAULT_FRONTEND_URL + "/settings#api_key"
 
 AUTH_REQUIRED_MESSAGE = (

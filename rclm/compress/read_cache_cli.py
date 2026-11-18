@@ -47,8 +47,10 @@ def main() -> None:
 
     output = result.stdout + result.stderr
     session_id = os.environ.get("CLAUDE_SESSION_ID")
+    # Subagents keep separate cache state because they have their own context.
+    state_id = os.environ.get("RCLM_READ_CACHE_STATE_ID") or session_id
 
-    if session_id:
+    if session_id and state_id:
         try:
             policy = _config.effective_hook_policy()
             if not policy.enabled("range_cache"):
@@ -56,7 +58,7 @@ def main() -> None:
                 sys.exit(result.returncode)
             request = read_cache.parse_shell_read(command, cwd=os.getcwd(), shell="posix")
             if request is not None:
-                state = session_store.read_read_cache_state(session_id)
+                state = session_store.read_read_cache_state(state_id)
                 events = session_store.read_events(session_id)
                 turn = sum(1 for event in events if event.get("event_type") == "PostToolUse") + 1
                 shadow = policy.shadow_for("range_cache")
@@ -68,7 +70,7 @@ def main() -> None:
                     tool_use_id=None,
                     shadow=shadow,
                 )
-                session_store.write_read_cache_state(session_id, application.state)
+                session_store.write_read_cache_state(state_id, application.state)
                 for event in application.events:
                     session_store.append_event(session_id, event)
                 if application.replacement is not None:

@@ -129,3 +129,19 @@ class TestDispatchAndInterop:
         assert block == "1: one\n2: two\n3: three\n"
         assert prefix.startswith("Created At")
         assert suffix == "Trailing note\n"
+
+
+def test_tab_numbered_claude_read_is_resolvable():
+    content = "".join(f"{n}\tline {n}\n" for n in range(1, 21))
+    built = build_read_request("Read", {"file_path": "/a.py"}, content)
+    assert built is not None
+    request, trailing = built
+    assert (request.start_line, request.end_line, trailing) == (1, 20, "")
+
+
+def test_antigravity_read_file_header_is_resolvable():
+    content = "Showing lines 3-5 of 9\n3: a\n4: b\n5: c\n"
+    built = build_read_request("read_file", {"Path": "/a.py"}, content)
+    assert built is not None
+    request = built[0]
+    assert (request.start_line, request.end_line, request.metadata.line_count) == (3, 5, 9)

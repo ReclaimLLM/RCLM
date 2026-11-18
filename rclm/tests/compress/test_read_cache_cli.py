@@ -43,6 +43,24 @@ def test_first_read_prints_raw_output(monkeypatch, tmp_path, capsys):
     assert state["files"][str(target)]["spans"] == [{"start": 1, "end": 80, "turn": 1}]
 
 
+def test_subagent_state_id_keeps_cache_separate_from_parent(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
+    _configure_read_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("CLAUDE_SESSION_ID", "sid-cli-agent")
+
+    target = tmp_path / "a.py"
+    content = _content()
+    target.write_text(content)
+    _run(monkeypatch, ["cat", str(target)])
+    capsys.readouterr()
+
+    monkeypatch.setenv("RCLM_READ_CACHE_STATE_ID", "sid-cli-agent.agent-a1")
+    _run(monkeypatch, ["cat", str(target)])
+
+    assert capsys.readouterr().out == content
+    assert session_store.read_read_cache_state("sid-cli-agent.agent-a1")["files"]
+
+
 def test_unchanged_reread_replaced_with_notice(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(session_store, "_SESSIONS_DIR", tmp_path / "sessions")
     _configure_read_cache(monkeypatch, tmp_path)

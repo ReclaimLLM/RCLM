@@ -150,6 +150,11 @@ Every corpus result states its effective scope plus sessions considered vs. elig
 | `rclm-proxy` | Start/setup a LiteLLM proxy for OpenAI-compatible capture. |
 | `rclm-update` | Check for and apply updates to the `rclm` package. |
 
+Set `RCLM_AUTO_UPDATE=false` to disable PyPI checks and detached session-end
+updates, including for air-gapped installs. Device check-in caches the server's
+approved `rclm` version when one is configured, and `rclm-update` installs that
+exact version instead of advancing past the server compatibility window.
+
 ---
 
 ## Advanced Usage

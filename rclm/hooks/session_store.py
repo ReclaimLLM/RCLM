@@ -6,6 +6,7 @@ Claude Code runs hooks sequentially per session, so no file locking is needed.
 from __future__ import annotations
 
 import contextlib
+import glob
 import json
 import logging
 import os
@@ -157,6 +158,62 @@ def write_result_delta_state(session_id: str, state: dict) -> None:
     _atomic_private_write(_result_delta_path(session_id), json.dumps(state, separators=(",", ":")))
 
 
+def atomic_private_write(destination: Path, contents: str) -> None:
+    """Public owner-only atomic write for hook state kept outside session sidecars."""
+    _atomic_private_write(destination, contents)
+
+
+def _outline_path(session_id: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.outline.json"
+
+
+def read_outline_state(session_id: str) -> dict:
+    try:
+        data = json.loads(_outline_path(session_id).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_outline_state(session_id: str, state: dict) -> None:
+    """Persist which files this context has read and which got an outline."""
+    _atomic_private_write(_outline_path(session_id), json.dumps(state, separators=(",", ":")))
+
+
+def _transcript_cursor_path(session_id: str) -> Path:
+    return _SESSIONS_DIR / f"{session_id}.transcriptcursor.json"
+
+
+def read_transcript_cursor(session_id: str) -> int:
+    """Byte offset of the host transcript already scanned for compaction boundaries."""
+    try:
+        data = json.loads(_transcript_cursor_path(session_id).read_text(encoding="utf-8"))
+        offset = data.get("offset") if isinstance(data, dict) else None
+        return offset if isinstance(offset, int) and offset >= 0 else 0
+    except (OSError, json.JSONDecodeError):
+        return 0
+
+
+def write_transcript_cursor(session_id: str, offset: int) -> None:
+    _atomic_private_write(_transcript_cursor_path(session_id), json.dumps({"offset": offset}))
+
+
+def reset_context_reference_state(session_id: str) -> None:
+    """Forget state whose replacements refer back to earlier model-visible results.
+
+    Read-cache stubs, result deltas and dedupe pointers are only valid while the
+    original result is still in the model's context.
+    """
+    for path in (
+        _read_cache_path(session_id),
+        _result_delta_path(session_id),
+        _dedupe_path(session_id),
+        _outline_path(session_id),
+    ):
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+
+
 def _start_brief_path(session_id: str) -> Path:
     return _SESSIONS_DIR / f"{session_id}.startbrief.json"
 
@@ -233,6 +290,8 @@ def prune_stale_sidecars(*, max_age_s: int = _ORPHANED_SIDECAR_MAX_AGE_S) -> Non
         "*.mechanisms.json",
         "*.imageeviction.json",
         "*.resultdelta.json",
+        "*.transcriptcursor.json",
+        "*.outline.json",
         "*.startbrief.json",
         "*.cursorturn.json",
         "*.marker",
@@ -293,3 +352,11 @@ def cleanup(session_id: str) -> None:
         _image_eviction_path(session_id).unlink()
     with contextlib.suppress(FileNotFoundError):
         _result_delta_path(session_id).unlink()
+    with contextlib.suppress(FileNotFoundError):
+        _transcript_cursor_path(session_id).unlink()
+    with contextlib.suppress(FileNotFoundError):
+        _outline_path(session_id).unlink()
+    # Subagent contexts keep their own reference state (see claude_handler).
+    for path in _SESSIONS_DIR.glob(f"{glob.escape(session_id)}.agent-*"):
+        with contextlib.suppress(OSError):
+            path.unlink()

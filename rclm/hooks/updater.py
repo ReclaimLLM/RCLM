@@ -31,6 +31,13 @@ _SESSION_END_UPDATE_LOCK_NAME = "session-end-update.lock"
 _SESSION_END_UPDATE_LOG_NAME = "session-end-update.log"
 
 
+def _auto_updates_enabled(cfg: dict) -> bool:
+    env_value = os.environ.get("RCLM_AUTO_UPDATE")
+    if env_value is not None:
+        return env_value.strip().lower() not in {"0", "false", "no", "off"}
+    return cfg.get("auto_update_enabled", True) is not False
+
+
 def installed_version() -> str:
     """Return the currently installed rclm version, or '0.0.0' if undetectable."""
     try:
@@ -80,8 +87,15 @@ def check_for_update(force: bool = False) -> str | None:
     """
     try:
         cfg = _config.load()
+        if not _auto_updates_enabled(cfg):
+            return None
         now = datetime.now(timezone.utc)
         current = installed_version()
+
+        approved = cfg.get("approved_rclm_version")
+        if isinstance(approved, str) and approved.strip():
+            candidate = approved.strip()
+            return candidate if _is_newer(candidate, current) else None
 
         if not force:
             last_check_raw = cfg.get("last_update_check")
@@ -106,14 +120,15 @@ def check_for_update(force: bool = False) -> str | None:
         return None
 
 
-def apply_update() -> bool:
-    """Run ``pip install --upgrade rclm`` in the active Python environment.
+def apply_update(version: str | None = None) -> bool:
+    """Install the selected rclm version in the active Python environment.
 
     Uses sys.executable so it targets the correct interpreter regardless of
     virtualenv or system Python. Returns True on success.
     """
+    package = f"rclm=={version}" if version else "rclm"
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "rclm"],
+        [sys.executable, "-m", "pip", "install", "--upgrade", package],
     )
     return result.returncode == 0
 
@@ -147,6 +162,8 @@ def schedule_session_end_update() -> bool:
     """
     try:
         cfg = _config.load()
+        if not _auto_updates_enabled(cfg):
+            return False
         now = datetime.now(timezone.utc)
         if _session_end_attempt_is_recent(cfg, now):
             return False

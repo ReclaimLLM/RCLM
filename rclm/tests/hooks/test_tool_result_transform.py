@@ -310,3 +310,42 @@ def test_antigravity_failed_command_passes_through() -> None:
         "The command exited with code 1.\nOutput:\n" + _large_output()
     )
     assert compact_tool_result("run_command", {"CommandLine": "pytest"}, content) is None
+
+
+def _wait_blocks(body: str) -> list[dict]:
+    return [
+        {"type": "input_text", "text": "Script completed\nWall time 0.0 seconds\nOutput:\n"},
+        {"type": "input_text", "text": body},
+    ]
+
+
+def test_wait_poll_compacts_pytest_output_and_keeps_failures() -> None:
+    passed = "." * 60 + "F" + "\n"
+    failure = "=== FAILURES ===\n___ test_x ___\nE   assert 1 == 2\n"
+    summary = "=== 1 failed, 60 passed in 1.2s ===\n"
+    noisy = "tests/test_a.py::test_ok PASSED\n" * 400
+    body = noisy + passed + failure + summary
+
+    decision = compact_tool_result("wait", {"cell_id": "7"}, _wait_blocks(body))
+
+    assert decision is not None
+    assert decision.mechanism == "H3_exec_compaction"
+    assert decision.compressed_text.startswith("Script completed\nWall time 0.0 seconds\nOutput:\n")
+    assert "E   assert 1 == 2" in decision.compressed_text
+    assert len(decision.compressed_text) < len(body) // 2
+
+
+def test_wait_poll_uses_generic_shaping_for_unrecognised_output() -> None:
+    body = "progress line\n" * 2000
+
+    decision = compact_tool_result("wait", {"cell_id": "7"}, _wait_blocks(body))
+
+    assert decision is not None
+    assert decision.mechanism == "provider_output_shaping"
+    assert len(decision.compressed_text) < len(body)
+
+
+def test_wait_poll_leaves_incomplete_scripts_and_small_output_untouched() -> None:
+    running = [{"type": "input_text", "text": "Script running\nOutput:\n" + "x\n" * 5000}]
+    assert compact_tool_result("wait", {"cell_id": "7"}, running) is None
+    assert compact_tool_result("wait", {"cell_id": "7"}, _wait_blocks("ok\n")) is None

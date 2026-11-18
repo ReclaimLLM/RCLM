@@ -170,8 +170,10 @@ def mechanism_saving_event(
 def aggregate_mechanism_savings(events: list[dict]) -> dict | None:
     """Aggregate MechanismSaving events from session JSONL into a per-mechanism summary.
 
-    Returns {mechanism: {applied_count, shadow_count, tokens_saved_estimate}} or None
-    if the session has no MechanismSaving events at all.
+    Returns {mechanism: {applied_count, shadow_count, tokens_saved_estimate,
+    applied_tokens_saved}} or None if the session has no MechanismSaving events.
+    ``tokens_saved_estimate`` covers enforced and shadow measurements together;
+    ``applied_tokens_saved`` is the part that actually changed model input.
     """
     savings_events = [e for e in events if e.get("event_type") == "MechanismSaving"]
     if not savings_events:
@@ -187,13 +189,16 @@ def aggregate_mechanism_savings(events: list[dict]) -> dict | None:
                 "applied_count": 0,
                 "shadow_count": 0,
                 "tokens_saved_estimate": 0,
+                "applied_tokens_saved": 0,
             },
         )
+        saved = int(ev.get("tokens_saved_estimate") or 0)
         if ev.get("applied"):
             bucket["applied_count"] += 1
+            bucket["applied_tokens_saved"] += saved
         else:
             bucket["shadow_count"] += 1
-        bucket["tokens_saved_estimate"] += int(ev.get("tokens_saved_estimate") or 0)
+        bucket["tokens_saved_estimate"] += saved
         file_path = ev.get("file_path")
         if isinstance(file_path, str) and file_path:
             files = bucket.setdefault("files", {})
@@ -205,6 +210,19 @@ def aggregate_mechanism_savings(events: list[dict]) -> dict | None:
             file_bucket["tokens_saved_estimate"] += int(ev.get("tokens_saved_estimate") or 0)
 
     return summary
+
+
+def applied_tokens_saved(value: dict) -> int:
+    """Enforced part of a rollup bucket, inferring it for pre-split rollups.
+
+    Older rollups only carried the combined total; it is attributable when every
+    event had the same mode, and otherwise counted as potential (conservative).
+    """
+    if "applied_tokens_saved" in value:
+        return int(value.get("applied_tokens_saved") or 0)
+    if int(value.get("shadow_count") or 0) == 0:
+        return int(value.get("tokens_saved_estimate") or 0)
+    return 0
 
 
 def merge_mechanism_savings(
@@ -235,11 +253,15 @@ def merge_mechanism_savings(
                     "applied_count": 0,
                     "shadow_count": 0,
                     "tokens_saved_estimate": 0,
+                    "applied_tokens_saved": 0,
                 }
                 merged[mechanism] = bucket
             bucket["applied_count"] += int(value.get("applied_count") or 0)
             bucket["shadow_count"] += int(value.get("shadow_count") or 0)
             bucket["tokens_saved_estimate"] += int(value.get("tokens_saved_estimate") or 0)
+            bucket["applied_tokens_saved"] = int(bucket.get("applied_tokens_saved") or 0) + (
+                applied_tokens_saved(value)
+            )
             if bucket.get("measurement_kind") != kind:
                 bucket["measurement_kind"] = "estimated"
 

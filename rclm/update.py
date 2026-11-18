@@ -123,7 +123,7 @@ def main() -> None:
 
     print()
     print("Upgrading rclm...")
-    success = apply_update()
+    success = apply_update(latest)
 
     if not success:
         print(

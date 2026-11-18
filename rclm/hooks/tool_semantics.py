@@ -28,6 +28,9 @@ _EDIT_NAMES = frozenset(
     }
 )
 _LISTING_NAMES = frozenset({"find_by_name", "list_dir", "list_directory"})
+# Codex's async-job poll: its result is the finished cell's stdout, so it can
+# carry the same test-runner output a shell tool would.
+_POLL_NAMES = frozenset({"wait"})
 
 
 def normalized_tool_name(tool_name: str) -> str:
@@ -49,6 +52,11 @@ def tool_family(tool_name: str) -> ToolFamily | None:
     if name in _LISTING_NAMES:
         return "listing"
     return None
+
+
+def is_poll_tool(tool_name: str) -> bool:
+    """Whether this tool returns the output of an earlier async job."""
+    return normalized_tool_name(tool_name) in _POLL_NAMES
 
 
 def command_text(tool_input: object) -> str | None:
@@ -102,18 +110,24 @@ def semantic_target(tool_name: str, tool_input: object) -> str | None:
 def supports_result_compaction(tool_name: str) -> bool:
     """Whether the shared transform has an explicit adapter for this name."""
     normalized = normalized_tool_name(tool_name)
-    return tool_family(tool_name) in {"shell", "search", "edit", "listing"} or normalized in {
-        "view_file",
-        "browser_snapshot",
-        "browser_accessibility_snapshot",
-        "execute_sql",
-    }
+    return (
+        tool_family(tool_name) in {"shell", "search", "edit", "listing"}
+        or normalized
+        in {
+            "view_file",
+            "browser_snapshot",
+            "browser_accessibility_snapshot",
+            "execute_sql",
+        }
+        or is_poll_tool(tool_name)
+    )
 
 
 __all__ = [
     "ToolFamily",
     "command_text",
     "file_path",
+    "is_poll_tool",
     "normalized_tool_name",
     "semantic_target",
     "supports_result_compaction",
